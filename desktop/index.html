@@ -7,240 +7,285 @@
     <link rel="preconnect" href="https://fonts.googleapis.com" />
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
     <link
-      href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600;700&display=swap"
+      href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=Rajdhani:wght@500;600;700&display=swap"
       rel="stylesheet"
     />
     <link rel="stylesheet" href="/src/styles.css" />
   </head>
   <body>
-    <div class="bg-grid" aria-hidden="true"></div>
-    <div id="app" class="shell">
-      <header class="top">
-        <div>
-          <p class="brand">Group Msg Monitor</p>
-          <h1>QQ 群消息监控</h1>
+    <div class="app-bg" aria-hidden="true"></div>
+    <div id="app" class="app">
+      <aside class="sidebar">
+        <div class="sidebar-brand">
+          <span class="brand-mark" aria-hidden="true"></span>
+          <div>
+            <p class="brand-kicker">Group Msg</p>
+            <h1 class="brand-title">群消息监控</h1>
+          </div>
         </div>
-        <div class="status-bar" id="status-bar">
-          <span class="pill" data-key="napcat">NapCat</span>
-          <span class="pill" data-key="onebot">OneBot</span>
-          <span class="pill" data-key="monitor">监控</span>
+
+        <nav class="nav" role="tablist" aria-label="主导航">
+          <button class="nav-item active" data-tab="live" type="button">
+            <span class="nav-icon" aria-hidden="true">◉</span>
+            <span class="nav-label">实时监控</span>
+          </button>
+          <button class="nav-item" data-tab="monitored" type="button">
+            <span class="nav-icon" aria-hidden="true">★</span>
+            <span class="nav-label">监控中</span>
+          </button>
+          <button class="nav-item" data-tab="groups" type="button">
+            <span class="nav-icon" aria-hidden="true">☰</span>
+            <span class="nav-label">群列表</span>
+          </button>
+          <button class="nav-item" data-tab="settings" type="button">
+            <span class="nav-icon" aria-hidden="true">⚙</span>
+            <span class="nav-label">总配置</span>
+          </button>
+        </nav>
+
+        <div class="sidebar-foot">
+          <div class="status-stack" id="status-bar">
+            <span class="pill" data-key="napcat">NapCat</span>
+            <span class="pill" data-key="onebot">OneBot</span>
+            <span class="pill" data-key="monitor">监控</span>
+          </div>
         </div>
-      </header>
+      </aside>
 
-      <nav class="tabs" role="tablist">
-        <button class="tab active" data-tab="live" type="button">实时监控</button>
-        <button class="tab" data-tab="groups" type="button">群列表</button>
-        <button class="tab" data-tab="settings" type="button">总配置</button>
-      </nav>
+      <main class="main">
+        <p id="toast" class="toast" hidden></p>
 
-      <p id="toast" class="toast" hidden></p>
-
-      <!-- 实时监控 -->
-      <section id="view-live" class="view active">
-        <div class="panel">
-          <div class="panel-head row-between">
+        <!-- 实时监控 -->
+        <section id="view-live" class="view active">
+          <header class="page-head">
             <div>
               <h2>全部群消息流</h2>
-              <p>滚动展示已落库消息（约 2.5s 刷新）</p>
+              <p>滚动展示已落库消息 · 约 2.5s 刷新</p>
             </div>
-            <div class="row">
-              <button id="btn-start-monitor" class="btn primary" type="button">启动监控服务</button>
+            <div class="row actions">
+              <button id="btn-start-monitor" class="btn primary" type="button">启动监控</button>
               <button id="btn-stop-monitor" class="btn danger" type="button">停止</button>
               <button id="btn-start-napcat" class="btn" type="button">启动 NapCat</button>
             </div>
+          </header>
+          <div class="panel fill">
+            <div id="live-messages" class="messages tall"></div>
           </div>
-          <div id="live-messages" class="messages tall"></div>
-        </div>
-      </section>
+        </section>
 
-      <!-- 群列表 / 群详情 -->
-      <section id="view-groups" class="view">
-        <div id="groups-master" class="panel">
-          <div class="panel-head row-between">
+        <!-- 监控中 -->
+        <section id="view-monitored" class="view">
+          <header class="page-head">
             <div>
-              <h2>群列表</h2>
-              <p>手动刷新；可选最近消息序 / 字母序，并支持搜索</p>
+              <h2>监控中的群</h2>
+              <p>已启用监控的群 · 展示各群最新 LLM 报告</p>
             </div>
-            <div class="row">
-              <select id="groups-sort">
-                <option value="recent">最近接收消息</option>
-                <option value="alpha">字母 / 名称</option>
-              </select>
-              <input id="groups-q" type="search" placeholder="搜索群名 / 群号" />
-              <button id="btn-refresh-groups" class="btn primary" type="button">刷新列表</button>
-              <button id="btn-pull-onebot-groups" class="btn" type="button">从 OneBot 拉取</button>
+            <div class="row actions">
+              <button id="btn-refresh-monitored" class="btn primary" type="button">刷新</button>
+              <button id="btn-goto-groups" class="btn" type="button">去群列表</button>
+            </div>
+          </header>
+          <div id="monitored-stats" class="stats-row"></div>
+          <div class="panel fill">
+            <div id="monitored-list" class="groups-list"></div>
+          </div>
+        </section>
+
+        <!-- 群列表 / 群详情 -->
+        <section id="view-groups" class="view">
+          <div id="groups-master" class="stack fill">
+            <header class="page-head">
+              <div>
+                <h2>群列表</h2>
+                <p>手动刷新 · 支持排序与搜索</p>
+              </div>
+              <div class="row actions toolbar">
+                <select id="groups-sort">
+                  <option value="recent">最近接收消息</option>
+                  <option value="alpha">字母 / 名称</option>
+                </select>
+                <input id="groups-q" type="search" placeholder="搜索群名 / 群号" />
+                <button id="btn-refresh-groups" class="btn primary" type="button">刷新</button>
+                <button id="btn-pull-onebot-groups" class="btn" type="button">从 OneBot 拉取</button>
+              </div>
+            </header>
+            <div class="panel fill">
+              <div id="groups-list" class="groups-list"></div>
             </div>
           </div>
-          <div id="groups-list" class="groups-list"></div>
-        </div>
 
-        <div id="group-detail" class="panel detail hidden">
-          <div class="panel-head row-between">
-            <div>
-              <button id="btn-back-groups" class="btn ghost" type="button">← 返回列表</button>
-              <h2 id="detail-title">群配置</h2>
-              <p id="detail-sub"></p>
-            </div>
-            <div class="row">
-              <button id="btn-save-group" class="btn primary" type="button">保存本群配置</button>
-              <button id="btn-pull-history" class="btn" type="button">拉取历史消息</button>
-              <button id="btn-run-llm" class="btn" type="button">立即执行 LLM 分析</button>
-            </div>
-          </div>
+          <div id="group-detail" class="stack fill detail hidden">
+            <header class="page-head">
+              <div>
+                <button id="btn-back-groups" class="btn ghost back" type="button">← 返回列表</button>
+                <h2 id="detail-title">群配置</h2>
+                <p id="detail-sub"></p>
+              </div>
+              <div class="row actions">
+                <button id="btn-save-group" class="btn primary" type="button">保存本群配置</button>
+                <button id="btn-pull-history" class="btn" type="button">拉取历史</button>
+                <button id="btn-run-llm" class="btn" type="button">立即 LLM 分析</button>
+              </div>
+            </header>
 
-          <div class="detail-grid">
-            <div>
-              <h3>基础配置</h3>
-              <label class="check"><input id="g-enabled" type="checkbox" /> 启用监控此群</label>
-              <label class="check"><input id="g-log-all" type="checkbox" /> 记录全部消息</label>
-              <label class="check"><input id="g-storage" type="checkbox" /> SQLite 落库</label>
-              <label>
-                群名称（展示用）
-                <input id="g-name" />
-              </label>
+            <div class="detail-grid fill">
+              <div class="panel scroll">
+                <h3>基础配置</h3>
+                <label class="check"><input id="g-enabled" type="checkbox" /> 启用监控此群</label>
+                <label class="check"><input id="g-log-all" type="checkbox" /> 记录全部消息</label>
+                <label class="check"><input id="g-storage" type="checkbox" /> SQLite 落库</label>
+                <label>
+                  群名称（展示用）
+                  <input id="g-name" />
+                </label>
 
-              <h3>监控配置 · 关键词检测</h3>
-              <label class="check"><input id="g-kw-enabled" type="checkbox" /> 启用关键词模式</label>
-              <label>
-                关键词（逗号分隔）
-                <input id="g-keywords" placeholder="报警,紧急" />
-              </label>
-              <label class="check"><input id="g-kw-alert" type="checkbox" /> 命中后 Webhook 告警</label>
-              <label>
-                Webhook URL
-                <input id="g-kw-webhook" />
-              </label>
+                <h3>关键词检测</h3>
+                <label class="check"><input id="g-kw-enabled" type="checkbox" /> 启用关键词模式</label>
+                <label>
+                  关键词（逗号分隔）
+                  <input id="g-keywords" placeholder="报警,紧急" />
+                </label>
+                <label class="check"><input id="g-kw-alert" type="checkbox" /> 命中后 Webhook 告警</label>
+                <label>
+                  Webhook URL
+                  <input id="g-kw-webhook" />
+                </label>
 
-              <h3>监控配置 · LLM 检测</h3>
-              <label class="check"><input id="g-llm-enabled" type="checkbox" /> 启用定时 LLM 分析</label>
-              <label>
-                Provider
-                <select id="g-llm-provider"></select>
-              </label>
-              <label>
-                模型（可覆盖全局默认）
-                <div class="model-setting-row">
-                  <select id="g-llm-model">
-                    <option value="">先点右侧刷新获取模型</option>
-                  </select>
-                  <button id="btn-refresh-group-models" class="refresh-models-btn" type="button" title="从 API 拉取模型">⟳</button>
+                <h3>LLM 检测</h3>
+                <label class="check"><input id="g-llm-enabled" type="checkbox" /> 启用定时 LLM 分析</label>
+                <label>
+                  Provider
+                  <select id="g-llm-provider"></select>
+                </label>
+                <label>
+                  模型（可覆盖全局默认）
+                  <div class="model-setting-row">
+                    <select id="g-llm-model">
+                      <option value="">先点右侧刷新获取模型</option>
+                    </select>
+                    <button id="btn-refresh-group-models" class="refresh-models-btn" type="button" title="从 API 拉取模型">⟳</button>
+                  </div>
+                </label>
+                <label>
+                  执行间隔（分钟）
+                  <input id="g-llm-every" type="number" min="1" step="1" />
+                  <span class="field-hint">需保持「启动监控」运行；定时任务由监控进程调度。</span>
+                </label>
+                <label>
+                  分析窗口（分钟）
+                  <input id="g-llm-window" type="number" min="1" step="1" />
+                  <span class="field-hint">只分析「最近 N 分钟」内消息。</span>
+                </label>
+                <label>
+                  最少消息数（少于此则跳过定时任务）
+                  <input id="g-llm-min" type="number" min="1" step="1" />
+                  <span class="field-hint">短窗口请设为 1；设太大可能导致定时一直跳过。</span>
+                </label>
+                <label>
+                  监控提示词
+                  <textarea id="g-llm-prompt" rows="6"></textarea>
+                </label>
+              </div>
+
+              <div class="detail-side">
+                <div class="panel scroll">
+                  <h3>本群最近消息</h3>
+                  <p class="field-hint">默认只收实时推送；漏收时可点「拉取历史」补齐。</p>
+                  <div id="detail-messages" class="messages"></div>
                 </div>
-              </label>
-              <label>
-                执行间隔（分钟）
-                <input id="g-llm-every" type="number" min="1" step="1" />
-                <span class="field-hint">需保持「启动监控」运行；定时任务由监控进程调度。</span>
-              </label>
-              <label>
-                分析窗口（分钟）
-                <input id="g-llm-window" type="number" min="1" step="1" />
-                <span class="field-hint">只分析「最近 N 分钟」内消息。1 分钟窗口适合「这一分钟说了什么」。</span>
-              </label>
-              <label>
-                最少消息数（少于此则跳过定时任务）
-                <input id="g-llm-min" type="number" min="1" step="1" />
-                <span class="field-hint">短窗口请设为 1；设太大（如 8）会导致定时一直跳过、看不到报告。</span>
-              </label>
-              <label>
-                监控提示词
-                <textarea id="g-llm-prompt" rows="6"></textarea>
-              </label>
-            </div>
-
-            <div>
-              <h3>本群最近消息</h3>
-              <p class="field-hint">默认只收实时推送；漏收时可点「拉取历史消息」从 OneBot 补齐最近记录。</p>
-              <div id="detail-messages" class="messages"></div>
-              <h3>LLM 报告</h3>
-              <div id="detail-reports" class="reports"></div>
+                <div class="panel scroll">
+                  <h3>LLM 报告</h3>
+                  <div id="detail-reports" class="reports"></div>
+                </div>
+              </div>
             </div>
           </div>
-        </div>
-      </section>
+        </section>
 
-      <!-- 总配置 -->
-      <section id="view-settings" class="view">
-        <div class="panel settings-panel-wrap">
-          <div class="panel-head row-between">
+        <!-- 总配置 -->
+        <section id="view-settings" class="view">
+          <header class="page-head">
             <div>
               <h2>总配置</h2>
-              <p>参考常用代理列表交互：点选激活、表单添加/编辑、拉取模型列表</p>
+              <p>点选激活代理 · 表单添加/编辑 · 拉取模型列表</p>
             </div>
             <button id="btn-save-settings" class="btn primary" type="button">保存总配置</button>
-          </div>
+          </header>
 
-          <div class="settings-tabs" id="settings-tabs">
-            <button class="settings-tab active" type="button" data-stab="onebot">OneBot</button>
-            <button class="settings-tab" type="button" data-stab="llm">语言模型</button>
-          </div>
-
-          <div id="stab-onebot" class="settings-body">
-            <div class="setting-item">
-              <label>OneBot WS 地址</label>
-              <input id="s-ws" placeholder="ws://127.0.0.1:3001" />
-            </div>
-            <div class="setting-item">
-              <label>Access Token</label>
-              <input id="s-token" type="password" placeholder="与 NapCat 一致" />
-            </div>
-            <div class="setting-item">
-              <button id="btn-test-onebot" class="btn ghost" type="button">测试 OneBot 连通性</button>
-              <div id="onebot-test-result" class="test-result" hidden></div>
-            </div>
-          </div>
-
-          <div id="stab-llm" class="settings-body hidden">
-            <div class="setting-item">
-              <label>代理 (Provider)</label>
-              <p class="settings-desc">点击条目切换默认代理；悬停可编辑/删除。群监控可再单独覆盖。</p>
-              <div id="provider-list" class="provider-list"></div>
-              <button id="btn-add-provider" class="provider-add-btn" type="button">＋ 添加代理</button>
+          <div class="panel settings-panel-wrap fill scroll">
+            <div class="settings-tabs" id="settings-tabs">
+              <button class="settings-tab active" type="button" data-stab="onebot">OneBot</button>
+              <button class="settings-tab" type="button" data-stab="llm">语言模型</button>
             </div>
 
-            <div id="provider-form" class="provider-form hidden">
-              <div class="provider-form-header">
-                <span id="provider-form-title">添加代理</span>
-                <button id="btn-close-provider-form" class="provider-form-close" type="button">✕</button>
+            <div id="stab-onebot" class="settings-body">
+              <div class="setting-item">
+                <label>OneBot WS 地址</label>
+                <input id="s-ws" placeholder="ws://127.0.0.1:3001" />
               </div>
-              <select id="pf-preset" class="provider-form-select">
-                <option value="openai">OpenAI</option>
-                <option value="deepseek">DeepSeek</option>
-                <option value="siliconflow">SiliconFlow</option>
-                <option value="opencode">OpenCode 本地</option>
-                <option value="cursor">Cursor SDK</option>
-                <option value="custom">自定义 OpenAI Compatible</option>
-              </select>
-              <input id="pf-name" class="provider-form-input" placeholder="代理名称" />
-              <input id="pf-url" class="provider-form-input" placeholder="API Base URL（如 https://api.xxx.com/v1）" />
-              <input id="pf-key" class="provider-form-input" type="password" placeholder="API Key（Cursor 填 CURSOR_API_KEY）" />
-              <input id="pf-model" class="provider-form-input" placeholder="默认模型（如 gpt-4.1-mini）" />
-              <div class="provider-form-actions">
-                <button id="btn-save-provider" class="provider-form-save" type="button">保存</button>
-                <button id="btn-cancel-provider" class="provider-form-cancel" type="button">取消</button>
+              <div class="setting-item">
+                <label>Access Token</label>
+                <input id="s-token" type="password" placeholder="与 NapCat 一致" />
+              </div>
+              <div class="setting-item">
+                <button id="btn-test-onebot" class="btn ghost" type="button">测试 OneBot 连通性</button>
+                <div id="onebot-test-result" class="test-result" hidden></div>
               </div>
             </div>
 
-            <div class="setting-item">
-              <label>默认模型</label>
-              <p class="settings-desc">点击刷新拉取当前活跃代理的模型列表，再下拉选择。</p>
-              <div class="model-setting-row">
-                <select id="s-default-model">
-                  <option value="">先点右侧刷新获取模型</option>
+            <div id="stab-llm" class="settings-body hidden">
+              <div class="setting-item">
+                <label>代理 (Provider)</label>
+                <p class="settings-desc">点击条目切换默认代理；悬停可编辑/删除。群监控可再单独覆盖。</p>
+                <div id="provider-list" class="provider-list"></div>
+                <button id="btn-add-provider" class="provider-add-btn" type="button">＋ 添加代理</button>
+              </div>
+
+              <div id="provider-form" class="provider-form hidden">
+                <div class="provider-form-header">
+                  <span id="provider-form-title">添加代理</span>
+                  <button id="btn-close-provider-form" class="provider-form-close" type="button">✕</button>
+                </div>
+                <select id="pf-preset" class="provider-form-select">
+                  <option value="openai">OpenAI</option>
+                  <option value="deepseek">DeepSeek</option>
+                  <option value="siliconflow">SiliconFlow</option>
+                  <option value="opencode">OpenCode 本地</option>
+                  <option value="cursor">Cursor SDK</option>
+                  <option value="custom">自定义 OpenAI Compatible</option>
                 </select>
-                <button id="btn-refresh-models" class="refresh-models-btn" type="button" title="从 API 拉取模型">⟳</button>
+                <input id="pf-name" class="provider-form-input" placeholder="代理名称" />
+                <input id="pf-url" class="provider-form-input" placeholder="API Base URL（如 https://api.xxx.com/v1）" />
+                <input id="pf-key" class="provider-form-input" type="password" placeholder="API Key（Cursor 填 CURSOR_API_KEY）" />
+                <input id="pf-model" class="provider-form-input" placeholder="默认模型（如 gpt-4.1-mini）" />
+                <div class="provider-form-actions">
+                  <button id="btn-save-provider" class="provider-form-save" type="button">保存</button>
+                  <button id="btn-cancel-provider" class="provider-form-cancel" type="button">取消</button>
+                </div>
               </div>
-            </div>
-            <div class="setting-item">
-              <label>连通性测试</label>
-              <p class="settings-desc">对当前活跃代理做 /models 探测；若已选默认模型，再发一条最小 chat。</p>
-              <div class="test-actions">
-                <button id="btn-test-provider" class="btn ghost" type="button">测试 LLM 连通性</button>
+
+              <div class="setting-item">
+                <label>默认模型</label>
+                <p class="settings-desc">点击刷新拉取当前活跃代理的模型列表，再下拉选择。</p>
+                <div class="model-setting-row">
+                  <select id="s-default-model">
+                    <option value="">先点右侧刷新获取模型</option>
+                  </select>
+                  <button id="btn-refresh-models" class="refresh-models-btn" type="button" title="从 API 拉取模型">⟳</button>
+                </div>
               </div>
-              <div id="llm-test-result" class="test-result" hidden></div>
+              <div class="setting-item">
+                <label>连通性测试</label>
+                <p class="settings-desc">对当前活跃代理做 /models 探测；若已选默认模型，再发一条最小 chat。</p>
+                <div class="test-actions">
+                  <button id="btn-test-provider" class="btn ghost" type="button">测试 LLM 连通性</button>
+                </div>
+                <div id="llm-test-result" class="test-result" hidden></div>
+              </div>
             </div>
           </div>
-        </div>
-      </section>
+        </section>
+      </main>
     </div>
     <script type="module" src="/src/main.ts"></script>
   </body>

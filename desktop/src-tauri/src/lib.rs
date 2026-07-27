@@ -35,7 +35,7 @@ fn python_exe() -> PathBuf {
 fn port_open(host: &str, port: u16) -> bool {
     TcpStream::connect_timeout(
         &format!("{host}:{port}").parse().unwrap(),
-        Duration::from_millis(400),
+        Duration::from_millis(80),
     )
     .is_ok()
 }
@@ -183,12 +183,115 @@ fn api_list_groups(sort: String, q: String) -> Result<Value, String> {
 
 #[tauri::command]
 fn api_recent_messages(group_id: Option<String>, limit: i64) -> Result<Value, String> {
-    let lim = limit.to_string();
-    if let Some(gid) = group_id.filter(|s| !s.is_empty()) {
-        py_api_json(&["recent-messages", "--group-id", &gid, "--limit", &lim])
-    } else {
-        py_api_json(&["recent-messages", "--limit", &lim])
+    // 热路径：Rust 直读 SQLite，避免每次轮询拉起 Python
+    recent_messages_from_db(group_id, limit)
+}
+
+fn messages_db_path() -> PathBuf {
+    project_root().join("data").join("messages.db")
+}
+
+fn recent_messages_from_db(group_id: Option<String>, limit: i64) -> Result<Value, String> {
+    use rusqlite::Connection;
+
+    let path = messages_db_path();
+    if !path.exists() {
+        return Ok(Value::Array(vec![]));
     }
+    let lim = limit.clamp(1, 200);
+    let conn = Connection::open(&path).map_err(|e| format!("打开 messages.db 失败: {e}"))?;
+
+    let mut rows_out: Vec<Value> = Vec::new();
+
+    let mut push_row = |id: i64,
+                        group_id: String,
+                        user_id: String,
+                        sender_name: String,
+                        content: String,
+                        event_time: Option<i64>,
+                        created_at: String| {
+        rows_out.push(serde_json::json!({
+            "id": id,
+            "groupId": group_id,
+            "groupName": "",
+            "userId": user_id,
+            "senderName": sender_name,
+            "content": content,
+            "eventTime": event_time,
+            "createdAt": created_at,
+        }));
+    };
+
+    if let Some(gid) = group_id.filter(|s| !s.is_empty()) {
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, group_id, COALESCE(user_id,''), COALESCE(sender_name,''),
+                        COALESCE(content,''), event_time, COALESCE(created_at,'')
+                 FROM messages WHERE group_id=? ORDER BY id DESC LIMIT ?",
+            )
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map(rusqlite::params![gid, lim], |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, String>(3)?,
+                    r.get::<_, String>(4)?,
+                    r.get::<_, Option<i64>>(5)?,
+                    r.get::<_, String>(6)?,
+                ))
+            })
+            .map_err(|e| e.to_string())?;
+        for row in rows {
+            let (id, group_id, user_id, sender_name, content, event_time, created_at) =
+                row.map_err(|e| e.to_string())?;
+            push_row(
+                id,
+                group_id,
+                user_id,
+                sender_name,
+                content,
+                event_time,
+                created_at,
+            );
+        }
+    } else {
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, group_id, COALESCE(user_id,''), COALESCE(sender_name,''),
+                        COALESCE(content,''), event_time, COALESCE(created_at,'')
+                 FROM messages ORDER BY id DESC LIMIT ?",
+            )
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map(rusqlite::params![lim], |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, String>(3)?,
+                    r.get::<_, String>(4)?,
+                    r.get::<_, Option<i64>>(5)?,
+                    r.get::<_, String>(6)?,
+                ))
+            })
+            .map_err(|e| e.to_string())?;
+        for row in rows {
+            let (id, group_id, user_id, sender_name, content, event_time, created_at) =
+                row.map_err(|e| e.to_string())?;
+            push_row(
+                id,
+                group_id,
+                user_id,
+                sender_name,
+                content,
+                event_time,
+                created_at,
+            );
+        }
+    }
+    Ok(Value::Array(rows_out))
 }
 
 #[tauri::command]

@@ -1,4 +1,8 @@
 import { invoke } from "@tauri-apps/api/core";
+import { getCurrentWindow } from "@tauri-apps/api/window";
+import { openUrl } from "@tauri-apps/plugin-opener";
+import gsap from "gsap";
+import { formatTime, renderMsgHtml } from "./cq";
 
 type StatusInfo = {
   napcatInstalled: boolean;
@@ -15,11 +19,14 @@ type GroupItem = {
   msgCount: number;
   keywordEnabled: boolean;
   llmEnabled: boolean;
+  memberCount?: number | null;
+  maxMemberCount?: number | null;
 };
 
 type MessageRow = {
   id: number;
   groupId: string;
+  groupName?: string;
   userId: string;
   senderName: string;
   content: string;
@@ -126,14 +133,58 @@ let settingsCache: AppSettings | null = null;
 let editingProviderId: string | null = null;
 let settingsModelOptions: { id: string }[] = [];
 let groupModelOptions: { id: string }[] = [];
+let toastTimer = 0;
+let reduceMotion = false;
+let groupNameMap = new Map<string, string>();
+let groupsCache: GroupItem[] = [];
+let liveScrollQuietUntil = 0;
+let tickInFlight = false;
+let statusTick = 0;
+
+function motionOk() {
+  return !reduceMotion;
+}
+
+function rememberGroupNames(groups: GroupItem[]) {
+  for (const g of groups) {
+    if (g.groupName) groupNameMap.set(g.groupId, g.groupName);
+  }
+}
+
+function groupDisplayName(groupId: string, fallbackName?: string | null) {
+  return (fallbackName || groupNameMap.get(groupId) || "").trim() || "(未命名群)";
+}
 
 function toast(msg: string, err = false) {
   const el = $("toast");
   el.hidden = false;
   el.textContent = msg;
   el.classList.toggle("err", err);
-  window.setTimeout(() => {
-    el.hidden = true;
+  window.clearTimeout(toastTimer);
+  gsap.killTweensOf(el);
+  if (motionOk()) {
+    gsap.fromTo(
+      el,
+      { autoAlpha: 0, y: 16 },
+      { autoAlpha: 1, y: 0, duration: 0.28, ease: "power2.out" },
+    );
+  } else {
+    gsap.set(el, { autoAlpha: 1, y: 0 });
+  }
+  toastTimer = window.setTimeout(() => {
+    if (motionOk()) {
+      gsap.to(el, {
+        autoAlpha: 0,
+        y: 10,
+        duration: 0.2,
+        ease: "power2.in",
+        onComplete: () => {
+          el.hidden = true;
+        },
+      });
+    } else {
+      el.hidden = true;
+    }
   }, 4200);
 }
 
@@ -148,17 +199,31 @@ function escapeHtml(s: string) {
 function setPill(key: string, on: boolean, label: string) {
   const el = document.querySelector(`.pill[data-key="${key}"]`) as HTMLElement;
   if (!el) return;
+  const next = `${label}${on ? " · 在线" : " · 离线"}`;
+  const wasOn = el.classList.contains("on");
+  if (el.textContent === next && wasOn === on) return;
   el.classList.toggle("on", on);
   el.classList.toggle("off", !on);
-  el.textContent = `${label}${on ? " · 在线" : " · 离线"}`;
+  el.textContent = next;
+}
+
+function animateViewEnter(view: HTMLElement) {
+  if (!motionOk()) return;
+  gsap.fromTo(
+    view,
+    { autoAlpha: 0.35, y: 10 },
+    { autoAlpha: 1, y: 0, duration: 0.32, ease: "power2.out" },
+  );
 }
 
 function switchTab(name: string) {
-  document.querySelectorAll(".tab").forEach((t) => {
+  document.querySelectorAll(".nav-item").forEach((t) => {
     t.classList.toggle("active", (t as HTMLElement).dataset.tab === name);
   });
   document.querySelectorAll(".view").forEach((v) => {
-    v.classList.toggle("active", v.id === `view-${name}`);
+    const active = v.id === `view-${name}`;
+    v.classList.toggle("active", active);
+    if (active) animateViewEnter(v as HTMLElement);
   });
   if (name === "groups") {
     $("groups-master").classList.remove("hidden");
@@ -182,30 +247,98 @@ async function refreshStatus() {
   setPill("monitor", s.monitorRunning, "监控");
 }
 
-function renderMessages(boxId: string, rows: MessageRow[]) {
+function messageArticleHtml(
+  m: MessageRow,
+  opts?: { hideGroup?: boolean },
+): string {
+  const when = formatTime(m.createdAt, m.eventTime);
+  const gName = groupDisplayName(m.groupId, m.groupName);
+  const hideGroup = !!opts?.hideGroup;
+  const groupBlock = hideGroup
+    ? ""
+    : `<div class="msg-group">
+        <span class="msg-group-name">${escapeHtml(gName)}</span>
+        <span class="msg-group-id">${escapeHtml(m.groupId)}</span>
+      </div>`;
+  return `<article class="msg" data-id="${m.id}">
+    <div class="msg-head">
+      ${groupBlock}
+      <div class="msg-meta">
+        <span class="msg-sender">${escapeHtml(m.senderName || m.userId || "未知")}</span>
+        <span class="msg-time">${escapeHtml(when)}</span>
+        <span class="msg-id">#${m.id}</span>
+      </div>
+    </div>
+    <div class="body">${renderMsgHtml(m.content || "")}</div>
+  </article>`;
+}
+
+function idsFingerprint(rows: MessageRow[]): string {
+  return rows.map((r) => r.id).join(",");
+}
+
+function renderMessages(
+  boxId: string,
+  rows: MessageRow[],
+  opts?: { hideGroup?: boolean },
+) {
   const box = $(boxId);
   if (!rows.length) {
+    if (box.dataset.fp === "__empty__") return;
+    box.dataset.fp = "__empty__";
     box.innerHTML = `<div class="empty">暂无消息</div>`;
     return;
   }
-  box.innerHTML = rows
-    .map((m) => {
-      const when = m.createdAt || (m.eventTime ? String(m.eventTime) : "-");
-      return `<article class="msg">
-        <div class="who">#${m.id} · 群 ${escapeHtml(m.groupId)} · ${escapeHtml(
-          m.senderName || m.userId,
-        )} · ${escapeHtml(when)}</div>
-        <div class="body">${escapeHtml(m.content)}</div>
-      </article>`;
-    })
-    .join("");
+
+  const fp = idsFingerprint(rows);
+  const prevFp = box.dataset.fp || "";
+  if (prevFp === fp) return;
+
+  // 增量：仅在列表头部插入新消息（ORDER BY id DESC）
+  if (prevFp && prevFp !== "__empty__") {
+    const prevIds = prevFp.split(",").filter(Boolean);
+    const newIds = rows.map((r) => String(r.id));
+    const oldHead = prevIds[0];
+    const cut = oldHead ? newIds.indexOf(oldHead) : -1;
+    if (
+      cut > 0 &&
+      newIds.length >= prevIds.length &&
+      newIds.slice(cut).join(",") === prevIds.join(",")
+    ) {
+      const atTop = box.scrollTop < 48;
+      const prevHeight = box.scrollHeight;
+      const html = rows
+        .slice(0, cut)
+        .map((m) => messageArticleHtml(m, opts))
+        .join("");
+      box.insertAdjacentHTML("afterbegin", html);
+      // 裁掉尾部多余节点，保持与数据条数一致
+      while (box.children.length > rows.length) {
+        box.lastElementChild?.remove();
+      }
+      box.dataset.fp = fp;
+      if (!atTop) {
+        box.scrollTop += box.scrollHeight - prevHeight;
+      }
+      return;
+    }
+  }
+
+  const scrollTop = box.scrollTop;
+  box.innerHTML = rows.map((m) => messageArticleHtml(m, opts)).join("");
+  box.dataset.fp = fp;
+  box.scrollTop = scrollTop;
 }
 
 async function refreshLive() {
+  if (Date.now() < liveScrollQuietUntil) return;
   const rows = await invoke<MessageRow[]>("api_recent_messages", {
     groupId: null,
-    limit: 80,
+    limit: 40,
   });
+  for (const m of rows) {
+    if (m.groupName) groupNameMap.set(m.groupId, m.groupName);
+  }
   renderMessages("live-messages", rows);
 }
 
@@ -213,20 +346,23 @@ async function refreshGroups() {
   const sort = $<HTMLSelectElement>("groups-sort").value;
   const q = $<HTMLInputElement>("groups-q").value.trim();
   const res = await invoke<{ groups: GroupItem[] }>("api_list_groups", { sort, q });
+  groupsCache = res.groups || [];
+  rememberGroupNames(groupsCache);
   const box = $("groups-list");
-  if (!res.groups.length) {
+  if (!groupsCache.length) {
     box.innerHTML = `<div class="empty">暂无群。可先启动监控收消息，或点「从 OneBot 拉取」。</div>`;
     return;
   }
-  box.innerHTML = res.groups
+  box.innerHTML = groupsCache
     .map((g) => {
       const last = g.lastTime
         ? new Date(g.lastTime * 1000).toLocaleString()
         : "暂无消息";
+      const name = groupDisplayName(g.groupId, g.groupName);
       return `<button class="group-item" type="button" data-id="${escapeHtml(g.groupId)}">
         <div>
-          <div class="name">${escapeHtml(g.groupName || "(未命名群)")}</div>
-          <div class="meta">${escapeHtml(g.groupId)} · 最近 ${escapeHtml(last)} · ${g.msgCount} 条</div>
+          <div class="name">${escapeHtml(name)}</div>
+          <div class="meta">群号 ${escapeHtml(g.groupId)} · 最近 ${escapeHtml(last)} · ${g.msgCount} 条</div>
         </div>
         <div class="badges">
           <span class="badge ${g.enabled ? "on" : ""}">${g.enabled ? "监控中" : "未启用"}</span>
@@ -238,6 +374,90 @@ async function refreshGroups() {
     .join("");
   box.querySelectorAll<HTMLButtonElement>(".group-item").forEach((btn) => {
     btn.onclick = () => openGroup(btn.dataset.id || "");
+  });
+}
+
+async function refreshMonitored() {
+  const [res, reports] = await Promise.all([
+    invoke<{ groups: GroupItem[] }>("api_list_groups", { sort: "recent", q: "" }),
+    invoke<ReportRow[]>("api_list_reports", { groupId: null, limit: 200 }).catch(
+      () => [] as ReportRow[],
+    ),
+  ]);
+  groupsCache = res.groups || [];
+  rememberGroupNames(groupsCache);
+  const enabled = groupsCache.filter((g) => g.enabled);
+  const llm = enabled.filter((g) => g.llmEnabled).length;
+  const totalMsg = enabled.reduce((n, g) => n + (g.msgCount || 0), 0);
+
+  // 每个群取最新一条报告（list 已按 id DESC）
+  const latestByGroup = new Map<string, ReportRow>();
+  for (const r of reports || []) {
+    if (!r.groupId || latestByGroup.has(r.groupId)) continue;
+    latestByGroup.set(r.groupId, r);
+  }
+  const withReport = enabled.filter((g) => latestByGroup.has(g.groupId)).length;
+
+  $("monitored-stats").innerHTML = `
+    <div class="stat-card"><div class="stat-num">${enabled.length}</div><div class="stat-label">监控中</div></div>
+    <div class="stat-card"><div class="stat-num">${totalMsg}</div><div class="stat-label">累计消息</div></div>
+    <div class="stat-card"><div class="stat-num">${llm}</div><div class="stat-label">LLM 开启</div></div>
+    <div class="stat-card"><div class="stat-num">${withReport}</div><div class="stat-label">已有报告</div></div>
+  `;
+
+  const box = $("monitored-list");
+  if (!enabled.length) {
+    box.innerHTML = `<div class="empty">暂无启用监控的群。到「群列表」打开群配置并勾选「启用监控此群」。</div>`;
+    return;
+  }
+  box.innerHTML = enabled
+    .map((g) => {
+      const last = g.lastTime
+        ? new Date(g.lastTime * 1000).toLocaleString()
+        : "暂无消息";
+      const name = groupDisplayName(g.groupId, g.groupName);
+      const report = latestByGroup.get(g.groupId);
+      const risk = (report?.riskMax || "none").toLowerCase();
+      const skipped = (report?.headline || "").includes("[定时跳过]");
+      const body = (report?.reportMd || "").trim();
+      const snippet =
+        body.length > 280 ? body.slice(0, 280).trimEnd() + "…" : body;
+      const llmBlock = report
+        ? `<div class="monitored-llm ${risk === "high" ? "high" : ""} ${skipped ? "skipped" : ""}">
+            <div class="monitored-llm-head">
+              <span class="monitored-llm-title">${escapeHtml(report.headline || "(无标题)")}</span>
+              <span class="monitored-llm-meta">${escapeHtml(report.createdAt || "")} · 风险 ${escapeHtml(
+                report.riskMax || "-",
+              )} · ${report.msgCount ?? "-"} 条</span>
+            </div>
+            <div class="monitored-llm-body">${
+              snippet ? escapeHtml(snippet) : "<span class='muted'>（无正文）</span>"
+            }</div>
+          </div>`
+        : `<div class="monitored-llm empty-llm">${
+            g.llmEnabled ? "暂无 LLM 报告，可在群详情中「立即 LLM 分析」" : "未开启 LLM 检测"
+          }</div>`;
+      return `<button class="monitored-card" type="button" data-id="${escapeHtml(g.groupId)}">
+        <div class="monitored-card-top">
+          <div>
+            <div class="name">${escapeHtml(name)}</div>
+            <div class="meta">群号 ${escapeHtml(g.groupId)} · 最近 ${escapeHtml(last)} · ${g.msgCount} 条</div>
+          </div>
+          <div class="badges">
+            <span class="badge on">监控中</span>
+            <span class="badge ${g.keywordEnabled ? "on" : ""}">关键词</span>
+            <span class="badge ${g.llmEnabled ? "on" : ""}">LLM</span>
+          </div>
+        </div>
+        ${llmBlock}
+      </button>`;
+    })
+    .join("");
+  box.querySelectorAll<HTMLButtonElement>(".monitored-card").forEach((btn) => {
+    btn.onclick = async () => {
+      switchTab("groups");
+      await openGroup(btn.dataset.id || "");
+    };
   });
 }
 
@@ -594,7 +814,10 @@ async function openGroup(groupId: string) {
   const cfg = await invoke<GroupConfig>("api_get_group", { groupId });
   $("groups-master").classList.add("hidden");
   $("group-detail").classList.remove("hidden");
-  $("detail-title").textContent = cfg.groupName || groupId;
+  animateViewEnter($("group-detail"));
+  const displayName = groupDisplayName(groupId, cfg.groupName);
+  if (cfg.groupName) groupNameMap.set(groupId, cfg.groupName);
+  $("detail-title").textContent = displayName;
   $("detail-sub").textContent = `群号 ${groupId}`;
 
   $<HTMLInputElement>("g-enabled").checked = !!cfg.enabled;
@@ -624,7 +847,9 @@ async function openGroup(groupId: string) {
   $<HTMLTextAreaElement>("g-llm-prompt").value = cfg.llmMonitor?.prompt || "";
 
   const msgs = await invoke<MessageRow[]>("api_recent_messages", { groupId, limit: 40 });
-  renderMessages("detail-messages", msgs);
+  const detailBox = $("detail-messages");
+  detailBox.dataset.fp = "";
+  renderMessages("detail-messages", msgs, { hideGroup: true });
   const reports = await invoke<ReportRow[]>("api_list_reports", { groupId, limit: 10 });
   const box = $("detail-reports");
   if (!reports.length) {
@@ -691,25 +916,55 @@ async function loadSettingsView() {
 }
 
 async function tick() {
+  if (tickInFlight) return;
+  tickInFlight = true;
   try {
-    await refreshStatus();
+    // 状态检测含 TCP，降频到约每 2 次
+    statusTick += 1;
+    if (statusTick % 2 === 1) {
+      await refreshStatus();
+    }
     if ($("view-live").classList.contains("active")) {
       await refreshLive();
     }
   } catch (e) {
     console.error(e);
+  } finally {
+    tickInFlight = false;
   }
 }
 
 window.addEventListener("DOMContentLoaded", async () => {
-  document.querySelectorAll(".tab").forEach((btn) => {
+  reduceMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+
+  document.querySelectorAll(".nav-item").forEach((btn) => {
     (btn as HTMLButtonElement).onclick = () => {
       const name = (btn as HTMLElement).dataset.tab || "live";
       switchTab(name);
       if (name === "groups") refreshGroups().catch((e) => toast(String(e), true));
+      if (name === "monitored") refreshMonitored().catch((e) => toast(String(e), true));
       if (name === "settings") loadSettingsView().catch((e) => toast(String(e), true));
     };
   });
+
+  document.addEventListener("click", (ev) => {
+    const t = ev.target as HTMLElement | null;
+    const a = t?.closest?.("a[data-ext-url]") as HTMLAnchorElement | null;
+    if (!a) return;
+    ev.preventDefault();
+    const url = a.dataset.extUrl || a.href;
+    if (!url) return;
+    openUrl(url).catch((e) => toast(String(e), true));
+  });
+
+  const liveBox = $("live-messages");
+  liveBox.addEventListener(
+    "scroll",
+    () => {
+      liveScrollQuietUntil = Date.now() + 1800;
+    },
+    { passive: true },
+  );
 
   document.querySelectorAll(".settings-tab").forEach((btn) => {
     (btn as HTMLButtonElement).onclick = () => {
@@ -743,6 +998,12 @@ window.addEventListener("DOMContentLoaded", async () => {
 
   $("btn-refresh-groups").onclick = () =>
     refreshGroups().catch((e) => toast(String(e), true));
+  $("btn-refresh-monitored").onclick = () =>
+    refreshMonitored().catch((e) => toast(String(e), true));
+  $("btn-goto-groups").onclick = () => {
+    switchTab("groups");
+    refreshGroups().catch((e) => toast(String(e), true));
+  };
   $("groups-sort").onchange = () => refreshGroups().catch((e) => toast(String(e), true));
   $("groups-q").onkeydown = (ev) => {
     if (ev.key === "Enter") refreshGroups().catch((e) => toast(String(e), true));
@@ -758,6 +1019,7 @@ window.addEventListener("DOMContentLoaded", async () => {
   $("btn-back-groups").onclick = () => {
     $("group-detail").classList.add("hidden");
     $("groups-master").classList.remove("hidden");
+    animateViewEnter($("groups-master"));
     currentGroupId = null;
     refreshGroups().catch(() => undefined);
   };
@@ -856,6 +1118,30 @@ window.addEventListener("DOMContentLoaded", async () => {
   } catch {
     /* ignore */
   }
+
+  try {
+    const res = await invoke<{ groups: GroupItem[] }>("api_list_groups", {
+      sort: "recent",
+      q: "",
+    });
+    groupsCache = res.groups || [];
+    rememberGroupNames(groupsCache);
+  } catch {
+    /* ignore */
+  }
+
+  if (motionOk()) {
+    gsap.from(".sidebar", { x: -18, autoAlpha: 0, duration: 0.4, ease: "power2.out" });
+    gsap.from(".main", { y: 12, autoAlpha: 0, duration: 0.4, delay: 0.06, ease: "power2.out" });
+  }
+
   await tick();
-  window.setInterval(tick, 2500);
+  window.setInterval(tick, 4000);
+
+  try {
+    await getCurrentWindow().show();
+    await getCurrentWindow().setFocus();
+  } catch {
+    /* browser preview */
+  }
 });

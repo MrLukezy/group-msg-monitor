@@ -117,12 +117,31 @@ def cmd_list_groups(sort: str, q: str) -> None:
     out({"groups": items})
 
 
+def _group_name_map() -> dict[str, str]:
+    names: dict[str, str] = {}
+    for c in list_group_configs():
+        if c.group_name:
+            names[str(c.group_id)] = c.group_name
+    cache = ROOT / "data" / "groups_cache.json"
+    if cache.exists():
+        try:
+            cached = json.loads(cache.read_text(encoding="utf-8"))
+            for g in cached.get("groups") or []:
+                gid = str(g.get("group_id"))
+                if gid and not names.get(gid):
+                    names[gid] = g.get("group_name") or ""
+        except Exception:
+            pass
+    return names
+
+
 def cmd_recent_messages(group_id: str | None, limit: int) -> None:
     path = sqlite_path()
     if not path.exists():
         out([])
         return
     lim = max(1, min(limit, 200))
+    names = _group_name_map()
     with db_connect() as conn:
         if group_id:
             rows = conn.execute(
@@ -153,6 +172,7 @@ def cmd_recent_messages(group_id: str | None, limit: int) -> None:
             {
                 "id": r["id"],
                 "groupId": r["group_id"],
+                "groupName": names.get(str(r["group_id"]), ""),
                 "userId": r["user_id"],
                 "senderName": r["sender_name"],
                 "content": r["content"],
