@@ -1,0 +1,23 @@
+onebot:
+  ws_url: "ws://127.0.0.1:3001"
+  access_token: "CHANGE_ME_TO_A_STRONG_RANDOM_TOKEN"
+
+monitor:
+  group_ids:
+    - "123456789"          # 目标群，字符串更稳妥
+  keywords:                # 可选：关键词告警
+    - "报警"
+    - "紧急"
+  log_all: true            # 是否记录该群全部消息
+
+storage:
+  enabled: true
+  sqlite_path: "./data/messages.db"
+
+alert:
+  enabled: false
+  webhook_url: ""          # 飞书/钉钉/自建等
+
+logging:
+  level: "INFO"
+  dir: "./logs"

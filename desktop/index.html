@@ -1,0 +1,134 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>QQ 群消息监控</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600;700&display=swap"
+      rel="stylesheet"
+    />
+    <link rel="stylesheet" href="/src/styles.css" />
+  </head>
+  <body>
+    <div class="bg-grid" aria-hidden="true"></div>
+    <div id="app" class="shell">
+      <header class="top">
+        <div>
+          <p class="brand">Group Msg Monitor</p>
+          <h1>QQ 群消息实时监控</h1>
+        </div>
+        <div class="top-actions">
+          <button id="btn-refresh" class="btn ghost" type="button">刷新状态</button>
+        </div>
+      </header>
+
+      <section class="status-bar" id="status-bar">
+        <span class="pill" data-key="napcat">NapCat</span>
+        <span class="pill" data-key="webui">WebUI</span>
+        <span class="pill" data-key="onebot">OneBot WS</span>
+        <span class="pill" data-key="monitor">监控服务</span>
+      </section>
+
+      <main class="grid">
+        <section class="panel login-panel">
+          <div class="panel-head">
+            <h2>登录二维码</h2>
+            <p>不再依赖命令行 ASCII，直接显示 NapCat 生成的 PNG</p>
+          </div>
+          <div class="qr-wrap">
+            <img id="qr-image" alt="登录二维码" hidden />
+            <div id="qr-empty" class="qr-empty">等待二维码…</div>
+          </div>
+          <p id="qr-hint" class="hint">先启动 NapCat，二维码会自动出现在这里</p>
+          <p id="qr-meta" class="meta"></p>
+          <div class="row">
+            <button id="btn-start-napcat" class="btn primary" type="button">启动 NapCat</button>
+            <button id="btn-refresh-qr" class="btn" type="button">刷新二维码</button>
+            <button id="btn-open-qr-folder" class="btn ghost" type="button">打开图片目录</button>
+            <button id="btn-open-webui" class="btn ghost" type="button">打开 WebUI</button>
+          </div>
+          <div id="qr-url-box" class="url-box" hidden>
+            <label>解码 URL（备用）</label>
+            <textarea id="qr-url" readonly rows="2"></textarea>
+            <button id="btn-copy-url" class="btn ghost" type="button">复制 URL</button>
+          </div>
+        </section>
+
+        <section class="panel config-panel">
+          <div class="panel-head">
+            <h2>监控配置</h2>
+            <p>写入项目根目录 <code>.env</code>，并同步 OneBot Token</p>
+          </div>
+          <form id="config-form" class="form">
+            <label>
+              目标群号（逗号分隔）
+              <input id="cfg-groups" name="groups" placeholder="123456789" />
+            </label>
+            <label>
+              OneBot Access Token
+              <input id="cfg-token" name="token" />
+            </label>
+            <label>
+              OneBot WS 地址
+              <input id="cfg-ws" name="ws" />
+            </label>
+            <label>
+              关键词告警（逗号分隔）
+              <input id="cfg-keywords" name="keywords" placeholder="报警,紧急" />
+            </label>
+            <label>
+              Webhook URL
+              <input id="cfg-webhook" name="webhook" placeholder="可选" />
+            </label>
+            <div class="checks">
+              <label class="check"><input id="cfg-log-all" type="checkbox" /> 记录全部消息</label>
+              <label class="check"><input id="cfg-storage" type="checkbox" /> SQLite 落库</label>
+              <label class="check"><input id="cfg-alert" type="checkbox" /> 开启关键词告警</label>
+            </div>
+            <div class="row">
+              <button class="btn primary" type="submit">保存配置</button>
+              <button id="btn-start-monitor" class="btn" type="button">启动监控</button>
+              <button id="btn-stop-monitor" class="btn danger" type="button">停止监控</button>
+            </div>
+          </form>
+          <p id="action-toast" class="toast" hidden></p>
+        </section>
+
+        <section class="panel groups-panel">
+          <div class="panel-head">
+            <h2>我的群列表</h2>
+            <p id="groups-login">登录后可从 OneBot 拉取当前账号的群</p>
+          </div>
+          <div class="row groups-toolbar">
+            <button id="btn-load-groups" class="btn primary" type="button">拉取群列表</button>
+            <button id="btn-apply-groups" class="btn" type="button">将勾选写入监控群号</button>
+            <input id="groups-filter" type="search" placeholder="搜索群名 / 群号" />
+          </div>
+          <div id="groups-list" class="groups-list">
+            <div class="empty">点击「拉取群列表」加载（需 NapCat 已登录且 OneBot WS 在线）</div>
+          </div>
+        </section>
+
+        <section class="panel messages-panel">
+          <div class="panel-head">
+            <h2>最近消息</h2>
+            <p>来自 SQLite，登录并启动监控后可见</p>
+          </div>
+          <div id="messages" class="messages"></div>
+        </section>
+
+        <section class="panel logs-panel">
+          <div class="panel-head">
+            <h2>监控日志</h2>
+            <p><code>logs/monitor.log</code> 尾部</p>
+          </div>
+          <pre id="logs" class="logs"></pre>
+        </section>
+      </main>
+    </div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>
