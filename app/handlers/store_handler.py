@@ -46,13 +46,17 @@ class StoreHandler:
         logger.info("SQLite 已就绪: %s", self.sqlite_path)
 
     async def handle(self, event: GroupMessageEvent) -> None:
+        await self.handle_upsert(event)
+
+    async def handle_upsert(self, event: GroupMessageEvent) -> bool:
+        """写入消息；返回 True 表示新插入，False 表示已存在或失败。"""
         import json
 
         message_id = "" if event.message_id is None else str(event.message_id)
         payload = event.model_dump(mode="json")
         try:
             with self._connect() as conn:
-                conn.execute(
+                cur = conn.execute(
                     """
                     INSERT OR IGNORE INTO messages
                     (message_id, group_id, user_id, sender_name, content, raw_json, event_time)
@@ -68,5 +72,7 @@ class StoreHandler:
                         event.time,
                     ),
                 )
+                return cur.rowcount > 0
         except sqlite3.Error:
             logger.exception("SQLite 写入失败 message_id=%s", message_id)
+            return False

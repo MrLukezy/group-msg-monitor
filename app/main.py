@@ -4,18 +4,29 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import signal
 import sys
+import time
 from logging.handlers import RotatingFileHandler
 from typing import Any
 
 from app.config import Settings, load_settings
-from app.filters import is_allowed_group, matched_keywords
+from app.filters import matched_keywords
 from app.handlers.alert_handler import AlertHandler
 from app.handlers.log_handler import LogHandler
 from app.handlers.store_handler import StoreHandler
+from app.history_sync import pull_enabled_groups_history
+from app.llm.service import run_group_summary
 from app.models import try_parse_group_message
-from app.onebot_client import OneBotClient
+from app.onebot_client import OneBotClient, build_ws_url
+from app.settings_store import (
+    ROOT_DIR,
+    enabled_group_ids,
+    list_group_configs,
+    load_app_settings,
+    load_group_config,
+)
 
 
 def setup_logging(settings: Settings) -> None:
@@ -31,7 +42,6 @@ def setup_logging(settings: Settings) -> None:
         "%(asctime)s | %(levelname)-7s | %(name)s | %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
     )
-
     console = logging.StreamHandler(sys.stdout)
     console.setFormatter(fmt)
     root.addHandler(console)
@@ -46,6 +56,67 @@ def setup_logging(settings: Settings) -> None:
     root.addHandler(file_handler)
 
 
+def acquire_singleton_lock() -> Any:
+    """确保同时只有一个监控进程。"""
+    import atexit
+
+    lock_path = ROOT_DIR / "data" / "monitor.lock"
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    fh = open(lock_path, "a+", encoding="utf-8")
+    try:
+        # Windows msvcrt.locking 要求文件至少有对应字节
+        if fh.tell() == 0:
+            fh.write("0")
+            fh.flush()
+        fh.seek(0)
+        if sys.platform == "win32":
+            import msvcrt
+
+            try:
+                msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
+            except OSError as e:
+                fh.close()
+                raise SystemExit("监控服务已在运行（检测到 monitor.lock）") from e
+        else:
+            import fcntl
+
+            try:
+                fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError as e:
+                fh.close()
+                raise SystemExit("监控服务已在运行（检测到 monitor.lock）") from e
+        fh.seek(0)
+        fh.truncate()
+        fh.write(str(os.getpid()))
+        fh.flush()
+    except SystemExit:
+        raise
+    except Exception:
+        fh.close()
+        raise
+
+    def _release() -> None:
+        try:
+            if sys.platform == "win32":
+                import msvcrt
+
+                fh.seek(0)
+                msvcrt.locking(fh.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+        except Exception:
+            pass
+        try:
+            fh.close()
+        except Exception:
+            pass
+
+    atexit.register(_release)
+    return fh
+
+
 class MonitorApp:
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
@@ -53,9 +124,8 @@ class MonitorApp:
         self.store_handler = (
             StoreHandler(settings.sqlite_path) if settings.storage_enabled else None
         )
-        self.alert_handler = (
-            AlertHandler(settings.alert_webhook_url) if settings.alert_enabled else None
-        )
+        self._alert_cache: dict[str, AlertHandler] = {}
+        self._llm_last_run: dict[str, float] = {}
         self.client = OneBotClient(
             ws_url=settings.onebot_ws_url,
             access_token=settings.onebot_access_token,
@@ -64,48 +134,98 @@ class MonitorApp:
             reconnect_max_delay=settings.reconnect_max_delay,
         )
 
+    def _allowed(self) -> set[str]:
+        ids = enabled_group_ids()
+        if ids:
+            return ids
+        return self.settings.allowed_groups
+
     async def on_event(self, raw: dict[str, Any]) -> None:
         event = try_parse_group_message(raw)
         if event is None:
             return
-        if not is_allowed_group(event, self.settings.allowed_groups):
-            logging.getLogger(__name__).debug(
-                "忽略非白名单群: %s", event.group_id_str
-            )
+        allowed = self._allowed()
+        if event.group_id_str not in allowed:
+            logging.getLogger(__name__).debug("忽略非监控群: %s", event.group_id_str)
             return
 
-        if self.settings.monitor_log_all:
+        gcfg = load_group_config(event.group_id_str)
+        if not gcfg.enabled:
+            return
+
+        if gcfg.basic.log_all:
             await self.log_handler.handle(event)
-            if self.store_handler is not None:
+            if gcfg.basic.storage_enabled and self.store_handler is not None:
                 await self.store_handler.handle(event)
 
-        keywords = matched_keywords(event, self.settings.monitor_keywords)
-        if keywords and self.alert_handler is not None:
-            if not self.settings.monitor_log_all:
-                # 仅告警模式时，命中关键词也写一条日志，便于排查
-                await self.log_handler.handle(event)
-            await self.alert_handler.handle(event, keywords)
+        km = gcfg.keyword_monitor
+        if km.enabled and km.keywords:
+            hits = matched_keywords(event, km.keywords)
+            if hits:
+                if not gcfg.basic.log_all:
+                    await self.log_handler.handle(event)
+                if km.alert_enabled and km.webhook_url:
+                    alert = self._alert_cache.get(km.webhook_url)
+                    if alert is None:
+                        alert = AlertHandler(km.webhook_url)
+                        self._alert_cache[km.webhook_url] = alert
+                    await alert.handle(event, hits)
+
+    async def llm_scheduler_loop(self) -> None:
+        logger = logging.getLogger(__name__)
+        while True:
+            try:
+                for cfg in list_group_configs():
+                    if not cfg.enabled or not cfg.llm_monitor.enabled:
+                        continue
+                    # 允许 1 分钟级调度；配置非法时回退到 60
+                    every = int(cfg.llm_monitor.every_minutes or 60)
+                    every = max(1, every)
+                    last = self._llm_last_run.get(cfg.group_id, 0)
+                    if time.time() - last < every * 60:
+                        continue
+                    self._llm_last_run[cfg.group_id] = time.time()
+                    try:
+                        result = await run_group_summary(cfg.group_id, job_type="schedule")
+                        logger.info(
+                            "LLM 定时总结 group=%s status=%s msg=%s reason=%s",
+                            cfg.group_id,
+                            result.get("status"),
+                            result.get("msg_count"),
+                            result.get("reason") or "",
+                        )
+                    except Exception:
+                        logger.exception("LLM 定时总结失败 group=%s", cfg.group_id)
+            except Exception:
+                logger.exception("LLM scheduler 异常")
+            await asyncio.sleep(15)
 
     async def run(self) -> None:
         logger = logging.getLogger(__name__)
-        if not self.settings.allowed_groups:
-            logger.error("未配置 MONITOR_GROUP_IDS / monitor.group_ids，退出")
-            return
-        if not self.settings.onebot_access_token or self.settings.onebot_access_token.startswith(
-            "CHANGE_ME"
-        ):
-            logger.warning(
-                "Access Token 未修改为强随机串，存在安全风险；请尽快在 .env / config.yaml 中更换"
-            )
+        allowed = self._allowed()
+        if not allowed:
+            logger.warning("当前无启用监控群；可在桌面端群列表中启用")
 
-        logger.info(
-            "监控启动 | groups=%s | storage=%s | alert=%s | ws=%s",
-            sorted(self.settings.allowed_groups),
-            self.settings.storage_enabled,
-            self.settings.alert_enabled,
-            self.settings.onebot_ws_url,
+        app_settings = load_app_settings()
+        ws = app_settings.onebot_ws_url or self.settings.onebot_ws_url
+        token = app_settings.onebot_access_token or self.settings.onebot_access_token
+        self.client.ws_url = build_ws_url(ws, token)
+        self.client.access_token = token
+
+        logger.info("监控启动 | groups=%s | ws=%s", sorted(allowed), ws)
+
+        async def _bootstrap_history() -> None:
+            try:
+                result = await pull_enabled_groups_history(count=80)
+                logger.info("启动补拉历史完成: %s", result)
+            except Exception:
+                logger.exception("启动补拉历史失败")
+
+        await asyncio.gather(
+            self.client.run_forever(),
+            self.llm_scheduler_loop(),
+            _bootstrap_history(),
         )
-        await self.client.run_forever()
 
 
 async def _amain() -> None:
@@ -113,20 +233,18 @@ async def _amain() -> None:
     setup_logging(settings)
     app = MonitorApp(settings)
 
-    loop = asyncio.get_running_loop()
-
     def _request_stop() -> None:
         logging.getLogger(__name__).info("收到停止信号，正在退出…")
         app.client.stop()
 
     if sys.platform == "win32":
-        # Windows 下 SIGTERM 可能不可用；用 CTRL_C 即可
         signal.signal(signal.SIGINT, lambda *_: _request_stop())
         try:
             signal.signal(signal.SIGTERM, lambda *_: _request_stop())
         except (AttributeError, ValueError, OSError):
             pass
     else:
+        loop = asyncio.get_running_loop()
         for sig in (signal.SIGINT, signal.SIGTERM):
             loop.add_signal_handler(sig, _request_stop)
 
@@ -135,6 +253,7 @@ async def _amain() -> None:
 
 def main() -> None:
     try:
+        acquire_singleton_lock()
         asyncio.run(_amain())
     except KeyboardInterrupt:
         pass

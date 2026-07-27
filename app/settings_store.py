@@ -1,0 +1,192 @@
+"""全局与分群配置存储（JSON 文件）。"""
+
+from __future__ import annotations
+
+import json
+from pathlib import Path
+from typing import Any
+
+from pydantic import BaseModel, Field
+
+ROOT_DIR = Path(__file__).resolve().parent.parent
+DATA_DIR = ROOT_DIR / "data"
+SETTINGS_PATH = DATA_DIR / "app_settings.json"
+GROUP_DIR = DATA_DIR / "group_configs"
+
+
+class LlmProvider(BaseModel):
+    id: str
+    name: str
+    type: str = "openai_compatible"  # openai_compatible | opencode | cursor
+    base_url: str = ""
+    api_key: str = ""
+    default_model: str = ""
+
+
+class LlmGlobalSettings(BaseModel):
+    providers: list[LlmProvider] = Field(default_factory=list)
+    active_provider_id: str = ""
+
+
+class AppSettings(BaseModel):
+    onebot_ws_url: str = "ws://127.0.0.1:3001"
+    onebot_access_token: str = ""
+    llm: LlmGlobalSettings = Field(default_factory=LlmGlobalSettings)
+
+
+class GroupBasicConfig(BaseModel):
+    log_all: bool = True
+    storage_enabled: bool = True
+
+
+class KeywordMonitorConfig(BaseModel):
+    enabled: bool = True
+    keywords: list[str] = Field(default_factory=list)
+    alert_enabled: bool = False
+    webhook_url: str = ""
+
+
+class LlmMonitorConfig(BaseModel):
+    enabled: bool = False
+    provider_id: str = ""
+    model: str = ""
+    prompt: str = (
+        "你是群聊监控分析助手。请基于给定聊天记录输出中文 JSON："
+        "headline, topics, key_points, risks, action_items, sentiment。"
+        "禁止编造；不确定请写「记录不足」。risks 需带原文 evidence。"
+    )
+    every_minutes: int = 60
+    window_minutes: int = 60
+    min_messages: int = 8
+
+
+class GroupConfig(BaseModel):
+    group_id: str
+    group_name: str = ""
+    enabled: bool = False
+    basic: GroupBasicConfig = Field(default_factory=GroupBasicConfig)
+    keyword_monitor: KeywordMonitorConfig = Field(default_factory=KeywordMonitorConfig)
+    llm_monitor: LlmMonitorConfig = Field(default_factory=LlmMonitorConfig)
+
+
+def _ensure_dirs() -> None:
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    GROUP_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def default_app_settings() -> AppSettings:
+    return AppSettings(
+        llm=LlmGlobalSettings(
+            providers=[
+                LlmProvider(
+                    id="openai_compatible",
+                    name="OpenAI Compatible",
+                    type="openai_compatible",
+                    base_url="https://api.openai.com/v1",
+                    default_model="gpt-4.1-mini",
+                ),
+                LlmProvider(
+                    id="opencode",
+                    name="OpenCode SDK / Server",
+                    type="opencode",
+                    base_url="http://127.0.0.1:4096",
+                    default_model="",
+                ),
+                LlmProvider(
+                    id="cursor",
+                    name="Cursor SDK",
+                    type="cursor",
+                    base_url="",
+                    default_model="composer-2.5",
+                ),
+            ],
+            active_provider_id="openai_compatible",
+        )
+    )
+
+
+def load_app_settings() -> AppSettings:
+    _ensure_dirs()
+    if not SETTINGS_PATH.exists():
+        settings = default_app_settings()
+        # 尝试从 .env 迁移 OneBot
+        env_path = ROOT_DIR / ".env"
+        if env_path.exists():
+            for line in env_path.read_text(encoding="utf-8").splitlines():
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                k, v = line.split("=", 1)
+                k, v = k.strip(), v.strip().strip('"')
+                if k == "ONEBOT_WS_URL":
+                    settings.onebot_ws_url = v
+                elif k == "ONEBOT_ACCESS_TOKEN":
+                    settings.onebot_access_token = v
+        save_app_settings(settings)
+        return settings
+    data = json.loads(SETTINGS_PATH.read_text(encoding="utf-8"))
+    return AppSettings.model_validate(data)
+
+
+def save_app_settings(settings: AppSettings) -> None:
+    _ensure_dirs()
+    SETTINGS_PATH.write_text(
+        settings.model_dump_json(indent=2),
+        encoding="utf-8",
+    )
+
+
+def group_config_path(group_id: str) -> Path:
+    return GROUP_DIR / f"{group_id}.json"
+
+
+def load_group_config(group_id: str) -> GroupConfig:
+    _ensure_dirs()
+    path = group_config_path(group_id)
+    if not path.exists():
+        return GroupConfig(group_id=str(group_id))
+    return GroupConfig.model_validate(json.loads(path.read_text(encoding="utf-8")))
+
+
+def save_group_config(cfg: GroupConfig) -> None:
+    _ensure_dirs()
+    path = group_config_path(cfg.group_id)
+    path.write_text(cfg.model_dump_json(indent=2), encoding="utf-8")
+
+
+def list_group_configs() -> list[GroupConfig]:
+    _ensure_dirs()
+    out: list[GroupConfig] = []
+    for p in sorted(GROUP_DIR.glob("*.json")):
+        try:
+            out.append(GroupConfig.model_validate(json.loads(p.read_text(encoding="utf-8"))))
+        except Exception:
+            continue
+    return out
+
+
+def enabled_group_ids() -> set[str]:
+    ids = {c.group_id for c in list_group_configs() if c.enabled}
+    if ids:
+        return ids
+    # 兼容旧 .env MONITOR_GROUP_IDS
+    env_path = ROOT_DIR / ".env"
+    if env_path.exists():
+        for line in env_path.read_text(encoding="utf-8").splitlines():
+            if line.strip().startswith("MONITOR_GROUP_IDS="):
+                raw = line.split("=", 1)[1].strip().strip('"')
+                return {x.strip() for x in raw.split(",") if x.strip()}
+    return set()
+
+
+def provider_by_id(settings: AppSettings, provider_id: str) -> LlmProvider | None:
+    for p in settings.llm.providers:
+        if p.id == provider_id:
+            return p
+    if settings.llm.providers:
+        return settings.llm.providers[0]
+    return None
+
+
+def dump_public(obj: BaseModel) -> dict[str, Any]:
+    return obj.model_dump(mode="json")

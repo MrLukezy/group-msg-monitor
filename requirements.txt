@@ -4,3 +4,7 @@ pydantic>=2.5.0
 pydantic-settings>=2.1.0
 PyYAML>=6.0.1
 python-dotenv>=1.0.0
+# 可选：Cursor SDK（provider=cursor 时需要）
+# cursor-sdk
+# 可选：OpenCode 官方 Python 包（当前实现以 HTTP 为主）
+# opencode-ai

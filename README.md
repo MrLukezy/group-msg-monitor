@@ -24,7 +24,13 @@ npm install
 npm run tauri dev
 ```
 
-界面可：启动 NapCat、显示 `cache/qrcode.png` 二维码、编辑 `.env`、启停监控、查看消息与日志。
+界面分页签：
+
+1. **实时监控**：全群消息滚动；启停监控服务 / NapCat  
+2. **群列表**：手动刷新；最近消息序 / 名称序 / 搜索；点选进入该群配置（基础 + 关键词 + LLM）  
+3. **总配置**：OneBot 与 LLM Provider（OpenAI 兼容 / OpenCode / Cursor SDK）
+
+群详情支持：自定义 LLM 提示词、执行间隔、模型覆盖、**立即执行 LLM 分析**。
 
 ### 1. 安装依赖（命令行模式）
 

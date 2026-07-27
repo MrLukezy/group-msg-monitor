@@ -10,8 +10,13 @@ __pycache__/
 .ruff_cache/
 data/*.db
 data/*.db-*
+data/app_settings.json
+data/group_configs/
+data/groups_cache.json
+data/monitor.lock
 logs/*.log
 logs/*.log.*
+logs/*.txt
 *.log
 .idea/
 .vscode/
