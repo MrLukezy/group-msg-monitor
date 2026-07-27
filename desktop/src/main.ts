@@ -1,5 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
-import { getCurrentWindow } from "@tauri-apps/api/window";
+import { getCurrentWindow, LogicalSize } from "@tauri-apps/api/window";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import gsap from "gsap";
 import { formatTime, renderMsgHtml } from "./cq";
@@ -50,6 +50,10 @@ type AppSettings = {
   llm: {
     providers: LlmProvider[];
     activeProviderId: string;
+  };
+  ui?: {
+    compactModeEnabled?: boolean;
+    theme?: string;
   };
 };
 
@@ -130,6 +134,24 @@ const PROVIDER_PRESETS: Record<
   },
 };
 
+const THEMES: {
+  id: string;
+  name: string;
+  swatches: [string, string, string];
+}[] = [
+  { id: "midnight", name: "午夜青金", swatches: ["#080b12", "#2dd4bf", "#f0b429"] },
+  { id: "daylight", name: "日光纸感", swatches: ["#f4f1ea", "#c45c26", "#2a6f6a"] },
+  { id: "ocean", name: "深海青蓝", swatches: ["#07151f", "#38bdf8", "#22d3ee"] },
+  { id: "forest", name: "林间翠绿", swatches: ["#0c1410", "#4ade80", "#86efac"] },
+  { id: "rose", name: "蔷薇暗粉", swatches: ["#160b12", "#f472b6", "#fb7185"] },
+  { id: "graphite", name: "石墨灰阶", swatches: ["#121212", "#e5e5e5", "#a3a3a3"] },
+];
+
+const READ_IDS_KEY = "gmm_read_report_ids";
+const LAST_TIP_ID_KEY = "gmm_last_tip_report_id";
+const NORMAL_SIZE = { width: 1280, height: 820 };
+const COMPACT_SIZE = { width: 420, height: 168 };
+
 const $ = <T extends HTMLElement>(id: string) => document.getElementById(id) as T;
 
 let currentGroupId: string | null = null;
@@ -146,6 +168,10 @@ let tickInFlight = false;
 let statusTick = 0;
 let monitoredSelectedGroupId: string | null = null;
 let monitoredReportsCache: ReportRow[] = [];
+let isCompactView = false;
+let selectedTheme = "midnight";
+let lastTipReportId = Number(localStorage.getItem(LAST_TIP_ID_KEY) || "0");
+let unreadCount = 0;
 
 function motionOk() {
   return !reduceMotion;
@@ -202,6 +228,199 @@ function escapeHtml(s: string) {
     .replace(/"/g, "&quot;");
 }
 
+function loadReadIds(): Set<number> {
+  try {
+    const raw = JSON.parse(localStorage.getItem(READ_IDS_KEY) || "[]");
+    if (!Array.isArray(raw)) return new Set();
+    return new Set(raw.map((x) => Number(x)).filter((n) => Number.isFinite(n)));
+  } catch {
+    return new Set();
+  }
+}
+
+function saveReadIds(ids: Set<number>) {
+  const arr = Array.from(ids).sort((a, b) => b - a).slice(0, 800);
+  localStorage.setItem(READ_IDS_KEY, JSON.stringify(arr));
+}
+
+function markReportRead(id: number) {
+  if (!id) return;
+  const ids = loadReadIds();
+  if (ids.has(id)) return;
+  ids.add(id);
+  saveReadIds(ids);
+  refreshUnreadBadge().catch(() => undefined);
+}
+
+async function clearAllUnread() {
+  const reports = await invoke<ReportRow[]>("api_list_reports", {
+    groupId: null,
+    limit: 200,
+  }).catch(() => [] as ReportRow[]);
+  const enabledIds = new Set(
+    groupsCache.filter((g) => g.enabled && !g.blocked).map((g) => g.groupId),
+  );
+  const ids = loadReadIds();
+  let added = 0;
+  for (const r of reports || []) {
+    if (!r.id || isSkippedReport(r)) continue;
+    if (enabledIds.size && !enabledIds.has(r.groupId)) continue;
+    if (!ids.has(r.id)) {
+      ids.add(r.id);
+      added += 1;
+    }
+  }
+  saveReadIds(ids);
+  await refreshUnreadBadge();
+  if (added > 0) toast(`已清除 ${added} 条未读`);
+  else toast("暂无未读");
+}
+
+function isSkippedReport(r: ReportRow): boolean {
+  return (r.headline || "").includes("[定时跳过]") || (r.headline || "").includes("[跳过]");
+}
+
+function applyTheme(themeId: string) {
+  const id = THEMES.some((t) => t.id === themeId) ? themeId : "midnight";
+  selectedTheme = id;
+  document.body.setAttribute("data-theme", id);
+  document.documentElement.setAttribute("data-theme", id);
+  renderThemePicker();
+}
+
+function renderThemePicker() {
+  const box = document.getElementById("theme-picker");
+  if (!box) return;
+  box.innerHTML = THEMES.map((t) => {
+    const active = t.id === selectedTheme ? "active" : "";
+    return `<button class="theme-card ${active}" type="button" data-theme-id="${t.id}">
+      <div class="theme-swatches">
+        <span style="background:${t.swatches[0]}"></span>
+        <span style="background:${t.swatches[1]}"></span>
+        <span style="background:${t.swatches[2]}"></span>
+      </div>
+      <div class="theme-card-name">${escapeHtml(t.name)}</div>
+    </button>`;
+  }).join("");
+  box.querySelectorAll<HTMLButtonElement>(".theme-card").forEach((btn) => {
+    btn.onclick = () => applyTheme(btn.dataset.themeId || "midnight");
+  });
+}
+
+function compactModeEnabled(): boolean {
+  return !!settingsCache?.ui?.compactModeEnabled || $<HTMLInputElement>("s-compact-mode")?.checked;
+}
+
+function pushTipBubble(title: string, meta: string, target: "stack" | "compact" = "stack") {
+  const host =
+    target === "compact" ? $("compact-tips") : ($("tip-stack") as HTMLElement);
+  if (!host) return;
+  const el = document.createElement("div");
+  el.className = "tip-bubble";
+  el.innerHTML = `<div class="tip-title">${escapeHtml(title)}</div><div class="tip-meta">${escapeHtml(meta)}</div>`;
+  host.prepend(el);
+  while (host.children.length > 5) host.lastElementChild?.remove();
+  window.setTimeout(() => el.remove(), 12000);
+}
+
+async function enterCompactView() {
+  if (isCompactView) return;
+  isCompactView = true;
+  document.body.classList.add("is-compact");
+  $("compact-view").classList.remove("hidden");
+  $("compact-status").textContent = unreadCount
+    ? `未读 LLM 总结 ${unreadCount} 条`
+    : "缩略模式 · 等待新的 LLM 分析";
+  try {
+    const win = getCurrentWindow();
+    await win.setAlwaysOnTop(true);
+    await win.setMinSize(new LogicalSize(360, 120));
+    await win.setSize(new LogicalSize(COMPACT_SIZE.width, COMPACT_SIZE.height));
+  } catch {
+    /* browser preview */
+  }
+}
+
+async function exitCompactView() {
+  if (!isCompactView) return;
+  isCompactView = false;
+  document.body.classList.remove("is-compact");
+  $("compact-view").classList.add("hidden");
+  try {
+    const win = getCurrentWindow();
+    await win.setAlwaysOnTop(false);
+    await win.setMinSize(new LogicalSize(960, 680));
+    await win.setSize(new LogicalSize(NORMAL_SIZE.width, NORMAL_SIZE.height));
+    await win.center();
+  } catch {
+    /* ignore */
+  }
+}
+
+async function refreshUnreadBadge() {
+  const read = loadReadIds();
+  const reports = await invoke<ReportRow[]>("api_list_reports", {
+    groupId: null,
+    limit: 200,
+  }).catch(() => [] as ReportRow[]);
+  const enabledIds = new Set(
+    groupsCache.filter((g) => g.enabled && !g.blocked).map((g) => g.groupId),
+  );
+  const unread = (reports || []).filter(
+    (r) =>
+      r.id &&
+      !read.has(r.id) &&
+      !isSkippedReport(r) &&
+      (!enabledIds.size || enabledIds.has(r.groupId)),
+  );
+  unreadCount = unread.length;
+  const badge = $("monitored-unread-badge");
+  const clearBtn = document.getElementById("btn-clear-unread") as HTMLButtonElement | null;
+  if (badge) {
+    if (unreadCount > 0) {
+      badge.hidden = false;
+      badge.textContent = unreadCount > 99 ? "99+" : String(unreadCount);
+      badge.title = "点击清除全部未读";
+    } else {
+      badge.hidden = true;
+      badge.title = "";
+    }
+  }
+  if (clearBtn) {
+    clearBtn.hidden = unreadCount <= 0;
+  }
+  if (isCompactView) {
+    $("compact-status").textContent = unreadCount
+      ? `未读 LLM 总结 ${unreadCount} 条`
+      : "缩略模式 · 等待新的 LLM 分析";
+  }
+  return unread;
+}
+
+async function pollLlmTipsAndUnread() {
+  const unread = (await refreshUnreadBadge()) || [];
+  if (!unread.length) return;
+  const newest = unread[0];
+  if (!newest?.id || newest.id <= lastTipReportId) return;
+  // 初始化：只记录水位，不刷历史 tips
+  if (lastTipReportId <= 0) {
+    lastTipReportId = newest.id;
+    localStorage.setItem(LAST_TIP_ID_KEY, String(lastTipReportId));
+    return;
+  }
+  const fresh = unread.filter((r) => r.id > lastTipReportId).reverse();
+  lastTipReportId = newest.id;
+  localStorage.setItem(LAST_TIP_ID_KEY, String(lastTipReportId));
+  for (const r of fresh.slice(-3)) {
+    const gname = groupDisplayName(r.groupId);
+    const title = r.headline || "新的 LLM 分析";
+    const meta = `${gname} · ${r.createdAt || ""}`;
+    if (isCompactView) {
+      pushTipBubble(title, meta, "compact");
+    }
+  }
+}
+
 function setPill(key: string, on: boolean, label: string) {
   const el = document.querySelector(`.pill[data-key="${key}"]`) as HTMLElement;
   if (!el) return;
@@ -247,6 +466,7 @@ function switchSettingsTab(name: string) {
   });
   $("stab-onebot").classList.toggle("hidden", name !== "onebot");
   $("stab-llm").classList.toggle("hidden", name !== "llm");
+  $("stab-appearance").classList.toggle("hidden", name !== "appearance");
 }
 
 async function refreshStatus() {
@@ -473,6 +693,7 @@ async function openMonitoredReportDetail(reportId: number) {
     toast("未找到该分析报告", true);
     return;
   }
+  markReportRead(reportId);
   $("monitored-master").classList.add("hidden");
   $("monitored-report-detail").classList.remove("hidden");
   animateViewEnter($("monitored-report-detail"));
@@ -881,9 +1102,14 @@ async function persistSettingsFromForm(): Promise<AppSettings> {
       activeProviderId: settingsCache.llm.activeProviderId,
       providers: settingsCache.llm.providers,
     },
+    ui: {
+      compactModeEnabled: $<HTMLInputElement>("s-compact-mode").checked,
+      theme: selectedTheme,
+    },
   };
   await invoke("api_save_settings", { settings: next });
   settingsCache = next;
+  applyTheme(selectedTheme);
   return next;
 }
 
@@ -1072,6 +1298,8 @@ async function loadSettingsView() {
   settingsCache = await invoke<AppSettings>("api_get_settings");
   $<HTMLInputElement>("s-ws").value = settingsCache.onebotWsUrl || "";
   $<HTMLInputElement>("s-token").value = settingsCache.onebotAccessToken || "";
+  $<HTMLInputElement>("s-compact-mode").checked = !!settingsCache.ui?.compactModeEnabled;
+  applyTheme(settingsCache.ui?.theme || "midnight");
   const active = activeProvider();
   settingsModelOptions = active?.defaultModel ? [{ id: active.defaultModel }] : [];
   fillModelSelect("s-default-model", settingsModelOptions, active?.defaultModel || "");
@@ -1088,7 +1316,10 @@ async function tick() {
     if (statusTick % 2 === 1) {
       await refreshStatus();
     }
-    if ($("view-live").classList.contains("active")) {
+    if (statusTick % 2 === 0) {
+      await pollLlmTipsAndUnread();
+    }
+    if ($("view-live").classList.contains("active") && !isCompactView) {
       await refreshLive();
     }
   } catch (e) {
@@ -1106,10 +1337,50 @@ window.addEventListener("DOMContentLoaded", async () => {
       const name = (btn as HTMLElement).dataset.tab || "live";
       switchTab(name);
       if (name === "groups") refreshGroups().catch((e) => toast(String(e), true));
-      if (name === "monitored") refreshMonitored().catch((e) => toast(String(e), true));
+      if (name === "monitored") {
+        refreshMonitored()
+          .then(() => refreshUnreadBadge())
+          .catch((e) => toast(String(e), true));
+      }
       if (name === "settings") loadSettingsView().catch((e) => toast(String(e), true));
     };
   });
+
+  $("win-min").onclick = async () => {
+    try {
+      if (compactModeEnabled()) {
+        await enterCompactView();
+      } else {
+        await getCurrentWindow().minimize();
+      }
+    } catch (e) {
+      toast(String(e), true);
+    }
+  };
+  $("win-max").onclick = async () => {
+    try {
+      await getCurrentWindow().toggleMaximize();
+    } catch (e) {
+      toast(String(e), true);
+    }
+  };
+  $("win-close").onclick = async () => {
+    try {
+      await getCurrentWindow().close();
+    } catch (e) {
+      toast(String(e), true);
+    }
+  };
+  $("win-close-compact").onclick = async () => {
+    try {
+      await getCurrentWindow().close();
+    } catch (e) {
+      toast(String(e), true);
+    }
+  };
+  $("btn-exit-compact").onclick = () => {
+    exitCompactView().catch((e) => toast(String(e), true));
+  };
 
   document.addEventListener("click", (ev) => {
     const t = ev.target as HTMLElement | null;
@@ -1164,6 +1435,15 @@ window.addEventListener("DOMContentLoaded", async () => {
     refreshGroups().catch((e) => toast(String(e), true));
   $("btn-refresh-monitored").onclick = () =>
     refreshMonitored().catch((e) => toast(String(e), true));
+  $("btn-clear-unread").onclick = (ev) => {
+    ev.stopPropagation();
+    clearAllUnread().catch((e) => toast(String(e), true));
+  };
+  $("monitored-unread-badge").onclick = (ev) => {
+    ev.preventDefault();
+    ev.stopPropagation();
+    clearAllUnread().catch((e) => toast(String(e), true));
+  };
   $("btn-back-monitored-report").onclick = () => {
     showMonitoredMaster();
     animateViewEnter($("monitored-master"));
@@ -1302,8 +1582,10 @@ window.addEventListener("DOMContentLoaded", async () => {
 
   try {
     settingsCache = await invoke<AppSettings>("api_get_settings");
+    applyTheme(settingsCache.ui?.theme || "midnight");
+    $<HTMLInputElement>("s-compact-mode").checked = !!settingsCache.ui?.compactModeEnabled;
   } catch {
-    /* ignore */
+    applyTheme("midnight");
   }
 
   try {
@@ -1317,12 +1599,19 @@ window.addEventListener("DOMContentLoaded", async () => {
     /* ignore */
   }
 
+  try {
+    await getCurrentWindow().setMinSize(new LogicalSize(960, 680));
+  } catch {
+    /* ignore */
+  }
+
   if (motionOk()) {
     gsap.from(".sidebar", { x: -18, autoAlpha: 0, duration: 0.4, ease: "power2.out" });
     gsap.from(".main", { y: 12, autoAlpha: 0, duration: 0.4, delay: 0.06, ease: "power2.out" });
   }
 
   await tick();
+  await refreshUnreadBadge().catch(() => undefined);
   window.setInterval(tick, 4000);
 
   try {

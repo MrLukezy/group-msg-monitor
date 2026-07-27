@@ -12,9 +12,39 @@
     />
     <link rel="stylesheet" href="/src/styles.css" />
   </head>
-  <body>
+  <body data-theme="midnight">
     <div class="app-bg" aria-hidden="true"></div>
-    <div id="app" class="app">
+    <div class="shell">
+      <header class="titlebar" data-tauri-drag-region>
+        <div class="titlebar-left" data-tauri-drag-region>
+          <span class="titlebar-mark" aria-hidden="true"></span>
+          <span class="titlebar-text">群消息监听</span>
+        </div>
+        <div class="titlebar-right">
+          <button id="win-min" class="win-btn" type="button" title="缩小">─</button>
+          <button id="win-max" class="win-btn" type="button" title="最大化">□</button>
+          <button id="win-close" class="win-btn win-close" type="button" title="关闭">✕</button>
+        </div>
+      </header>
+
+      <div id="compact-view" class="compact-view hidden">
+        <div class="compact-main" data-tauri-drag-region>
+          <div class="compact-brand" data-tauri-drag-region>
+            <span class="titlebar-mark" aria-hidden="true"></span>
+            <div>
+              <div class="compact-title">群消息监听 · 缩略</div>
+              <div class="compact-sub" id="compact-status">等待 LLM 分析…</div>
+            </div>
+          </div>
+          <div class="compact-actions">
+            <button id="btn-exit-compact" class="btn primary compact-expand" type="button">展开</button>
+            <button id="win-close-compact" class="win-btn win-close" type="button" title="关闭">✕</button>
+          </div>
+        </div>
+        <div id="compact-tips" class="compact-tips" aria-live="polite"></div>
+      </div>
+
+      <div id="app" class="app">
       <aside class="sidebar">
         <div class="sidebar-brand">
           <span class="brand-mark" aria-hidden="true"></span>
@@ -32,6 +62,7 @@
           <button class="nav-item" data-tab="monitored" type="button">
             <span class="nav-icon" aria-hidden="true">★</span>
             <span class="nav-label">监听中</span>
+            <span id="monitored-unread-badge" class="nav-badge" hidden>0</span>
           </button>
           <button class="nav-item" data-tab="groups" type="button">
             <span class="nav-icon" aria-hidden="true">☰</span>
@@ -82,6 +113,7 @@
                 <p>左侧选择群 · 右侧查看 LLM 分析主题 · 点击主题进入详情</p>
               </div>
               <div class="row actions">
+                <button id="btn-clear-unread" class="btn" type="button" hidden>清除未读</button>
                 <button id="btn-refresh-monitored" class="btn primary" type="button">刷新</button>
                 <button id="btn-goto-groups" class="btn" type="button">去群列表</button>
               </div>
@@ -252,6 +284,7 @@
             <div class="settings-tabs" id="settings-tabs">
               <button class="settings-tab active" type="button" data-stab="onebot">OneBot</button>
               <button class="settings-tab" type="button" data-stab="llm">语言模型</button>
+              <button class="settings-tab" type="button" data-stab="appearance">外观</button>
             </div>
 
             <div id="stab-onebot" class="settings-body">
@@ -319,10 +352,25 @@
                 <div id="llm-test-result" class="test-result" hidden></div>
               </div>
             </div>
+
+            <div id="stab-appearance" class="settings-body hidden">
+              <div class="setting-item">
+                <label>缩略模式</label>
+                <p class="settings-desc">开启后，点标题栏「缩小」会进入置顶缩略窗；LLM 分析完成后以气泡提示。</p>
+                <label class="check"><input id="s-compact-mode" type="checkbox" /> 启用缩略模式</label>
+              </div>
+              <div class="setting-item">
+                <label>皮肤配色</label>
+                <p class="settings-desc">选择一套配色方案，立即预览，保存后持久生效。</p>
+                <div id="theme-picker" class="theme-picker"></div>
+              </div>
+            </div>
           </div>
         </section>
       </main>
+      </div>
     </div>
+    <div id="tip-stack" class="tip-stack" aria-live="polite"></div>
     <script type="module" src="/src/main.ts"></script>
   </body>
 </html>

@@ -196,6 +196,7 @@ def cmd_save_settings(raw: str) -> None:
         "onebot_ws_url": data.get("onebotWsUrl") or data.get("onebot_ws_url"),
         "onebot_access_token": data.get("onebotAccessToken") or data.get("onebot_access_token"),
         "llm": data.get("llm"),
+        "ui": data.get("ui") or {},
     }
     # llm providers camelCase normalize
     llm = mapped.get("llm") or {}
@@ -215,6 +216,18 @@ def cmd_save_settings(raw: str) -> None:
         )
     llm["providers"] = providers
     mapped["llm"] = llm
+
+    ui = mapped.get("ui") or {}
+    if isinstance(ui, dict):
+        mapped["ui"] = {
+            "compact_mode_enabled": bool(
+                ui.get("compactModeEnabled")
+                if "compactModeEnabled" in ui
+                else ui.get("compact_mode_enabled", False)
+            ),
+            "theme": (ui.get("theme") or "midnight").strip() or "midnight",
+        }
+
     settings = AppSettings.model_validate(mapped)
     save_app_settings(settings)
     out({"ok": True})

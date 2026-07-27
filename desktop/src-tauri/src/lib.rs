@@ -584,6 +584,19 @@ fn settings_to_camel(v: Value) -> Value {
             "providers": providers,
         }),
     );
+    let ui = obj.remove("ui").unwrap_or(Value::Object(Default::default()));
+    let mut ui_obj = ui.as_object().cloned().unwrap_or_default();
+    out.insert(
+        "ui".into(),
+        serde_json::json!({
+            "compactModeEnabled": ui_obj
+                .remove("compact_mode_enabled")
+                .unwrap_or(Value::Bool(false)),
+            "theme": ui_obj
+                .remove("theme")
+                .unwrap_or(Value::String("midnight".into())),
+        }),
+    );
     Value::Object(out)
 }
 

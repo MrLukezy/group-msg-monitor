@@ -28,10 +28,18 @@ class LlmGlobalSettings(BaseModel):
     active_provider_id: str = ""
 
 
+class UiSettings(BaseModel):
+    """桌面端外观与交互偏好。"""
+
+    compact_mode_enabled: bool = False  # 开启后点缩小进入缩略窗
+    theme: str = "midnight"  # midnight | daylight | ocean | forest | rose | graphite
+
+
 class AppSettings(BaseModel):
     onebot_ws_url: str = "ws://127.0.0.1:3001"
     onebot_access_token: str = ""
     llm: LlmGlobalSettings = Field(default_factory=LlmGlobalSettings)
+    ui: UiSettings = Field(default_factory=UiSettings)
 
 
 class GroupBasicConfig(BaseModel):
