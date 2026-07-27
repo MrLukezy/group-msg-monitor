@@ -1,6 +1,6 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "群消息监控",
+  "productName": "群消息监听",
   "version": "0.1.0",
   "identifier": "com.groupmsg.monitor",
   "build": {
@@ -13,7 +13,7 @@
     "withGlobalTauri": true,
     "windows": [
       {
-        "title": "QQ 群消息监控",
+        "title": "QQ 群消息监听",
         "width": 1280,
         "height": 820,
         "minWidth": 960,

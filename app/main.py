@@ -144,19 +144,17 @@ class MonitorApp:
         event = try_parse_group_message(raw)
         if event is None:
             return
-        allowed = self._allowed()
-        if event.group_id_str not in allowed:
-            logging.getLogger(__name__).debug("忽略非监控群: %s", event.group_id_str)
-            return
 
         gcfg = load_group_config(event.group_id_str)
-        if not gcfg.enabled:
+
+        # 仅处理已启用监听、且未屏蔽的群
+        if gcfg.blocked or not gcfg.enabled:
             return
 
         if gcfg.basic.log_all:
             await self.log_handler.handle(event)
-            if gcfg.basic.storage_enabled and self.store_handler is not None:
-                await self.store_handler.handle(event)
+        if gcfg.basic.storage_enabled and self.store_handler is not None:
+            await self.store_handler.handle(event)
 
         km = gcfg.keyword_monitor
         if km.enabled and km.keywords:
@@ -176,7 +174,7 @@ class MonitorApp:
         while True:
             try:
                 for cfg in list_group_configs():
-                    if not cfg.enabled or not cfg.llm_monitor.enabled:
+                    if cfg.blocked or not cfg.enabled or not cfg.llm_monitor.enabled:
                         continue
                     # 允许 1 分钟级调度；配置非法时回退到 60
                     every = int(cfg.llm_monitor.every_minutes or 60)
@@ -212,7 +210,11 @@ class MonitorApp:
         self.client.ws_url = build_ws_url(ws, token)
         self.client.access_token = token
 
-        logger.info("监控启动 | groups=%s | ws=%s", sorted(allowed), ws)
+        logger.info(
+            "监听启动 | 启用监听群=%s | ws=%s",
+            sorted(allowed) if allowed else ["(未启用任何群)"],
+            ws,
+        )
 
         async def _bootstrap_history() -> None:
             try:

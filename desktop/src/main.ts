@@ -15,6 +15,7 @@ type GroupItem = {
   groupId: string;
   groupName: string;
   enabled: boolean;
+  blocked?: boolean;
   lastTime?: number | null;
   msgCount: number;
   keywordEnabled: boolean;
@@ -56,6 +57,7 @@ type GroupConfig = {
   groupId: string;
   groupName: string;
   enabled: boolean;
+  blocked?: boolean;
   basic: { logAll: boolean; storageEnabled: boolean };
   keywordMonitor: {
     enabled: boolean;
@@ -82,6 +84,8 @@ type ReportRow = {
   msgCount?: number | null;
   createdAt: string;
   reportMd?: string | null;
+  windowStart?: number | null;
+  windowEnd?: number | null;
 };
 
 const PROVIDER_PRESETS: Record<
@@ -140,6 +144,8 @@ let groupsCache: GroupItem[] = [];
 let liveScrollQuietUntil = 0;
 let tickInFlight = false;
 let statusTick = 0;
+let monitoredSelectedGroupId: string | null = null;
+let monitoredReportsCache: ReportRow[] = [];
 
 function motionOk() {
   return !reduceMotion;
@@ -230,6 +236,9 @@ function switchTab(name: string) {
     $("group-detail").classList.add("hidden");
     currentGroupId = null;
   }
+  if (name === "monitored") {
+    showMonitoredMaster();
+  }
 }
 
 function switchSettingsTab(name: string) {
@@ -244,7 +253,7 @@ async function refreshStatus() {
   const s = await invoke<StatusInfo>("get_status");
   setPill("napcat", s.napcatInstalled && (s.napcatWebuiUp || s.onebotWsUp), "NapCat");
   setPill("onebot", s.onebotWsUp, "OneBot");
-  setPill("monitor", s.monitorRunning, "监控");
+  setPill("monitor", s.monitorRunning, "监听服务");
 }
 
 function messageArticleHtml(
@@ -345,27 +354,38 @@ async function refreshLive() {
 async function refreshGroups() {
   const sort = $<HTMLSelectElement>("groups-sort").value;
   const q = $<HTMLInputElement>("groups-q").value.trim();
+  const showBlocked = $<HTMLInputElement>("groups-show-blocked").checked;
   const res = await invoke<{ groups: GroupItem[] }>("api_list_groups", { sort, q });
   groupsCache = res.groups || [];
   rememberGroupNames(groupsCache);
   const box = $("groups-list");
-  if (!groupsCache.length) {
-    box.innerHTML = `<div class="empty">暂无群。可先启动监控收消息，或点「从 OneBot 拉取」。</div>`;
+  const visible = showBlocked
+    ? groupsCache
+    : groupsCache.filter((g) => !g.blocked);
+  if (!visible.length) {
+    box.innerHTML = `<div class="empty">${
+      groupsCache.some((g) => g.blocked) && !showBlocked
+        ? "当前列表已隐藏屏蔽群。勾选「显示已屏蔽」可查看。"
+        : "暂无群。可先启动监听收消息，或点「从 OneBot 拉取」。"
+    }</div>`;
     return;
   }
-  box.innerHTML = groupsCache
+  box.innerHTML = visible
     .map((g) => {
       const last = g.lastTime
         ? new Date(g.lastTime * 1000).toLocaleString()
         : "暂无消息";
       const name = groupDisplayName(g.groupId, g.groupName);
-      return `<button class="group-item" type="button" data-id="${escapeHtml(g.groupId)}">
+      const statusBadge = g.blocked
+        ? `<span class="badge blocked">已屏蔽</span>`
+        : `<span class="badge ${g.enabled ? "on" : ""}">${g.enabled ? "监听中" : "未启用"}</span>`;
+      return `<button class="group-item ${g.blocked ? "is-blocked" : ""}" type="button" data-id="${escapeHtml(g.groupId)}">
         <div>
           <div class="name">${escapeHtml(name)}</div>
           <div class="meta">群号 ${escapeHtml(g.groupId)} · 最近 ${escapeHtml(last)} · ${g.msgCount} 条</div>
         </div>
         <div class="badges">
-          <span class="badge ${g.enabled ? "on" : ""}">${g.enabled ? "监控中" : "未启用"}</span>
+          ${statusBadge}
           <span class="badge ${g.keywordEnabled ? "on" : ""}">关键词</span>
           <span class="badge ${g.llmEnabled ? "on" : ""}">LLM</span>
         </div>
@@ -377,88 +397,204 @@ async function refreshGroups() {
   });
 }
 
+function showMonitoredMaster() {
+  $("monitored-master").classList.remove("hidden");
+  $("monitored-report-detail").classList.add("hidden");
+}
+
+function formatReportWindow(r: ReportRow): string {
+  const start = r.windowStart
+    ? new Date(r.windowStart * 1000).toLocaleString()
+    : "";
+  const end = r.windowEnd ? new Date(r.windowEnd * 1000).toLocaleString() : "";
+  if (start && end) return `${start} ~ ${end}`;
+  return r.createdAt || "";
+}
+
+function renderMonitoredReportList(reports: ReportRow[]) {
+  const box = $("monitored-report-list");
+  if (!monitoredSelectedGroupId) {
+    box.innerHTML = `<div class="empty">请选择左侧群查看分析主题</div>`;
+    return;
+  }
+  if (!reports.length) {
+    const g = groupsCache.find((x) => x.groupId === monitoredSelectedGroupId);
+    box.innerHTML = `<div class="empty">${
+      g?.llmEnabled
+        ? "暂无 LLM 分析主题，可在群配置中「立即 LLM 分析」"
+        : "该群未开启 LLM 检测"
+    }</div>`;
+    return;
+  }
+  box.innerHTML = reports
+    .map((r) => {
+      const risk = (r.riskMax || "none").toLowerCase();
+      const skipped = (r.headline || "").includes("[定时跳过]");
+      return `<button class="report-title-item ${risk === "high" ? "high" : ""} ${
+        skipped ? "skipped" : ""
+      }" type="button" data-id="${r.id}">
+        <div class="report-title-text">${escapeHtml(r.headline || "(无标题)")}</div>
+        <div class="report-title-meta">${escapeHtml(r.createdAt || "")} · 风险 ${escapeHtml(
+          r.riskMax || "-",
+        )} · ${r.msgCount ?? "-"} 条</div>
+      </button>`;
+    })
+    .join("");
+  box.querySelectorAll<HTMLButtonElement>(".report-title-item").forEach((btn) => {
+    btn.onclick = () => {
+      const id = Number(btn.dataset.id || 0);
+      openMonitoredReportDetail(id).catch((e) => toast(String(e), true));
+    };
+  });
+}
+
+async function selectMonitoredGroup(groupId: string) {
+  monitoredSelectedGroupId = groupId;
+  const g = groupsCache.find((x) => x.groupId === groupId);
+  const name = groupDisplayName(groupId, g?.groupName);
+  $("monitored-reports-title").textContent = `${name} · LLM 主题`;
+  $("monitored-reports-hint").textContent = `群号 ${groupId}`;
+
+  document.querySelectorAll<HTMLButtonElement>("#monitored-group-list .monitored-group-item").forEach((btn) => {
+    btn.classList.toggle("active", btn.dataset.id === groupId);
+  });
+
+  const reports = await invoke<ReportRow[]>("api_list_reports", {
+    groupId,
+    limit: 80,
+  }).catch(() => [] as ReportRow[]);
+  monitoredReportsCache = reports || [];
+  renderMonitoredReportList(monitoredReportsCache);
+}
+
+async function openMonitoredReportDetail(reportId: number) {
+  const report = monitoredReportsCache.find((r) => r.id === reportId);
+  if (!report) {
+    toast("未找到该分析报告", true);
+    return;
+  }
+  $("monitored-master").classList.add("hidden");
+  $("monitored-report-detail").classList.remove("hidden");
+  animateViewEnter($("monitored-report-detail"));
+  $("monitored-report-detail-title").textContent = report.headline || "(无标题)";
+  $("monitored-report-detail-meta").textContent =
+    `${formatReportWindow(report)} · 风险 ${report.riskMax || "-"} · ${report.msgCount ?? "-"} 条消息`;
+  $("monitored-report-detail-body").textContent =
+    (report.reportMd || "").trim() || "（无详细内容）";
+
+  const msgsBox = $("monitored-report-detail-msgs");
+  msgsBox.dataset.fp = "";
+  msgsBox.innerHTML = `<div class="empty">加载相关对话…</div>`;
+  $("monitored-report-msgs-hint").textContent = "分析窗口内的原始消息";
+
+  const start = Number(report.windowStart || 0);
+  const end = Number(report.windowEnd || 0);
+  if (!report.groupId || !start || !end) {
+    msgsBox.innerHTML = `<div class="empty">该报告缺少时间窗口，无法匹配对话</div>`;
+    return;
+  }
+
+  try {
+    const rows = await invoke<MessageRow[]>("api_messages_in_window", {
+      groupId: report.groupId,
+      startTs: start,
+      endTs: end,
+      limit: 500,
+    });
+    $("monitored-report-msgs-hint").textContent =
+      `共 ${rows.length} 条 · ${formatReportWindow(report)}`;
+    if (!rows.length) {
+      msgsBox.innerHTML = `<div class="empty">该时间窗内无落库消息（可能已被清理或分析时回退了其它窗口）</div>`;
+      return;
+    }
+    msgsBox.innerHTML = rows.map((m) => messageArticleHtml(m, { hideGroup: true })).join("");
+    msgsBox.dataset.fp = idsFingerprint(rows);
+    msgsBox.scrollTop = 0;
+  } catch (e) {
+    msgsBox.innerHTML = `<div class="empty">加载对话失败：${escapeHtml(String(e))}</div>`;
+  }
+}
+
 async function refreshMonitored() {
-  const [res, reports] = await Promise.all([
-    invoke<{ groups: GroupItem[] }>("api_list_groups", { sort: "recent", q: "" }),
-    invoke<ReportRow[]>("api_list_reports", { groupId: null, limit: 200 }).catch(
-      () => [] as ReportRow[],
-    ),
-  ]);
+  showMonitoredMaster();
+  const res = await invoke<{ groups: GroupItem[] }>("api_list_groups", {
+    sort: "recent",
+    q: "",
+  });
   groupsCache = res.groups || [];
   rememberGroupNames(groupsCache);
-  const enabled = groupsCache.filter((g) => g.enabled);
+  const enabled = groupsCache.filter((g) => g.enabled && !g.blocked);
   const llm = enabled.filter((g) => g.llmEnabled).length;
   const totalMsg = enabled.reduce((n, g) => n + (g.msgCount || 0), 0);
 
-  // 每个群取最新一条报告（list 已按 id DESC）
-  const latestByGroup = new Map<string, ReportRow>();
-  for (const r of reports || []) {
-    if (!r.groupId || latestByGroup.has(r.groupId)) continue;
-    latestByGroup.set(r.groupId, r);
+  let withReport = 0;
+  if (enabled.length) {
+    const allReports = await invoke<ReportRow[]>("api_list_reports", {
+      groupId: null,
+      limit: 200,
+    }).catch(() => [] as ReportRow[]);
+    const seen = new Set<string>();
+    for (const r of allReports || []) {
+      if (r.groupId) seen.add(r.groupId);
+    }
+    withReport = enabled.filter((g) => seen.has(g.groupId)).length;
   }
-  const withReport = enabled.filter((g) => latestByGroup.has(g.groupId)).length;
 
   $("monitored-stats").innerHTML = `
-    <div class="stat-card"><div class="stat-num">${enabled.length}</div><div class="stat-label">监控中</div></div>
+    <div class="stat-card"><div class="stat-num">${enabled.length}</div><div class="stat-label">监听中</div></div>
     <div class="stat-card"><div class="stat-num">${totalMsg}</div><div class="stat-label">累计消息</div></div>
     <div class="stat-card"><div class="stat-num">${llm}</div><div class="stat-label">LLM 开启</div></div>
-    <div class="stat-card"><div class="stat-num">${withReport}</div><div class="stat-label">已有报告</div></div>
+    <div class="stat-card"><div class="stat-num">${withReport}</div><div class="stat-label">已有分析</div></div>
   `;
 
-  const box = $("monitored-list");
+  const box = $("monitored-group-list");
   if (!enabled.length) {
-    box.innerHTML = `<div class="empty">暂无启用监控的群。到「群列表」打开群配置并勾选「启用监控此群」。</div>`;
+    monitoredSelectedGroupId = null;
+    monitoredReportsCache = [];
+    box.innerHTML = `<div class="empty">暂无启用监听的群。到「群列表」打开群配置并勾选「启用监听此群」。</div>`;
+    $("monitored-reports-title").textContent = "LLM 分析主题";
+    $("monitored-reports-hint").textContent = "请选择左侧群";
+    renderMonitoredReportList([]);
     return;
   }
+
+  if (
+    !monitoredSelectedGroupId ||
+    !enabled.some((g) => g.groupId === monitoredSelectedGroupId)
+  ) {
+    monitoredSelectedGroupId = enabled[0].groupId;
+  }
+
   box.innerHTML = enabled
     .map((g) => {
       const last = g.lastTime
         ? new Date(g.lastTime * 1000).toLocaleString()
         : "暂无消息";
       const name = groupDisplayName(g.groupId, g.groupName);
-      const report = latestByGroup.get(g.groupId);
-      const risk = (report?.riskMax || "none").toLowerCase();
-      const skipped = (report?.headline || "").includes("[定时跳过]");
-      const body = (report?.reportMd || "").trim();
-      const snippet =
-        body.length > 280 ? body.slice(0, 280).trimEnd() + "…" : body;
-      const llmBlock = report
-        ? `<div class="monitored-llm ${risk === "high" ? "high" : ""} ${skipped ? "skipped" : ""}">
-            <div class="monitored-llm-head">
-              <span class="monitored-llm-title">${escapeHtml(report.headline || "(无标题)")}</span>
-              <span class="monitored-llm-meta">${escapeHtml(report.createdAt || "")} · 风险 ${escapeHtml(
-                report.riskMax || "-",
-              )} · ${report.msgCount ?? "-"} 条</span>
-            </div>
-            <div class="monitored-llm-body">${
-              snippet ? escapeHtml(snippet) : "<span class='muted'>（无正文）</span>"
-            }</div>
-          </div>`
-        : `<div class="monitored-llm empty-llm">${
-            g.llmEnabled ? "暂无 LLM 报告，可在群详情中「立即 LLM 分析」" : "未开启 LLM 检测"
-          }</div>`;
-      return `<button class="monitored-card" type="button" data-id="${escapeHtml(g.groupId)}">
-        <div class="monitored-card-top">
-          <div>
-            <div class="name">${escapeHtml(name)}</div>
-            <div class="meta">群号 ${escapeHtml(g.groupId)} · 最近 ${escapeHtml(last)} · ${g.msgCount} 条</div>
-          </div>
-          <div class="badges">
-            <span class="badge on">监控中</span>
-            <span class="badge ${g.keywordEnabled ? "on" : ""}">关键词</span>
-            <span class="badge ${g.llmEnabled ? "on" : ""}">LLM</span>
-          </div>
+      const active = g.groupId === monitoredSelectedGroupId ? "active" : "";
+      return `<button class="monitored-group-item ${active}" type="button" data-id="${escapeHtml(
+        g.groupId,
+      )}">
+        <div class="name">${escapeHtml(name)}</div>
+        <div class="meta">群号 ${escapeHtml(g.groupId)}</div>
+        <div class="meta">${escapeHtml(last)} · ${g.msgCount} 条</div>
+        <div class="badges">
+          <span class="badge ${g.llmEnabled ? "on" : ""}">LLM</span>
+          <span class="badge ${g.keywordEnabled ? "on" : ""}">关键词</span>
         </div>
-        ${llmBlock}
       </button>`;
     })
     .join("");
-  box.querySelectorAll<HTMLButtonElement>(".monitored-card").forEach((btn) => {
-    btn.onclick = async () => {
-      switchTab("groups");
-      await openGroup(btn.dataset.id || "");
+
+  box.querySelectorAll<HTMLButtonElement>(".monitored-group-item").forEach((btn) => {
+    btn.onclick = () => {
+      selectMonitoredGroup(btn.dataset.id || "").catch((e) => toast(String(e), true));
     };
   });
+
+  if (monitoredSelectedGroupId) {
+    await selectMonitoredGroup(monitoredSelectedGroupId);
+  }
 }
 
 function genProviderId() {
@@ -820,10 +956,12 @@ async function openGroup(groupId: string) {
   $("detail-title").textContent = displayName;
   $("detail-sub").textContent = `群号 ${groupId}`;
 
-  $<HTMLInputElement>("g-enabled").checked = !!cfg.enabled;
+  $<HTMLInputElement>("g-blocked").checked = !!cfg.blocked;
+  $<HTMLInputElement>("g-enabled").checked = !!cfg.enabled && !cfg.blocked;
   $<HTMLInputElement>("g-log-all").checked = !!cfg.basic?.logAll;
   $<HTMLInputElement>("g-storage").checked = !!cfg.basic?.storageEnabled;
   $<HTMLInputElement>("g-name").value = cfg.groupName || "";
+  syncBlockEnableUi();
   $<HTMLInputElement>("g-kw-enabled").checked = !!cfg.keywordMonitor?.enabled;
   $<HTMLInputElement>("g-keywords").value = (cfg.keywordMonitor?.keywords || []).join(",");
   $<HTMLInputElement>("g-kw-alert").checked = !!cfg.keywordMonitor?.alertEnabled;
@@ -850,7 +988,7 @@ async function openGroup(groupId: string) {
   const detailBox = $("detail-messages");
   detailBox.dataset.fp = "";
   renderMessages("detail-messages", msgs, { hideGroup: true });
-  const reports = await invoke<ReportRow[]>("api_list_reports", { groupId, limit: 10 });
+  const reports = await invoke<ReportRow[]>("api_list_reports", { groupId, limit: 30 });
   const box = $("detail-reports");
   if (!reports.length) {
     box.innerHTML = `<div class="empty">暂无 LLM 报告，可点「立即执行」</div>`;
@@ -859,26 +997,52 @@ async function openGroup(groupId: string) {
       .map((r) => {
         const risk = (r.riskMax || "none").toLowerCase();
         const skipped = (r.headline || "").includes("[定时跳过]");
-        return `<article class="report ${risk === "high" ? "high" : ""} ${skipped ? "skipped" : ""}">
-          <div class="title">${escapeHtml(r.headline || "(无标题)")}</div>
-          <div class="meta">${escapeHtml(r.createdAt)} · 风险 ${escapeHtml(
+        return `<button class="report-title-item ${risk === "high" ? "high" : ""} ${
+          skipped ? "skipped" : ""
+        }" type="button" data-id="${r.id}">
+          <div class="report-title-text">${escapeHtml(r.headline || "(无标题)")}</div>
+          <div class="report-title-meta">${escapeHtml(r.createdAt || "")} · 风险 ${escapeHtml(
             r.riskMax || "-",
           )} · ${r.msgCount ?? "-"} 条</div>
-          <pre style="white-space:pre-wrap;font-size:12px;margin:8px 0 0">${escapeHtml(
-            r.reportMd || "",
-          )}</pre>
-        </article>`;
+        </button>`;
       })
       .join("");
+    box.querySelectorAll<HTMLButtonElement>(".report-title-item").forEach((btn) => {
+      btn.onclick = () => {
+        const id = Number(btn.dataset.id || 0);
+        const report = reports.find((x) => x.id === id);
+        if (!report) return;
+        monitoredSelectedGroupId = groupId;
+        monitoredReportsCache = reports;
+        switchTab("monitored");
+        refreshMonitored()
+          .then(() => openMonitoredReportDetail(id))
+          .catch((e) => toast(String(e), true));
+      };
+    });
+  }
+}
+
+function syncBlockEnableUi() {
+  const blocked = $<HTMLInputElement>("g-blocked").checked;
+  const enabledEl = $<HTMLInputElement>("g-enabled");
+  if (blocked) {
+    enabledEl.checked = false;
+    enabledEl.disabled = true;
+  } else {
+    enabledEl.disabled = false;
   }
 }
 
 function readGroupForm(): GroupConfig {
   const groupId = currentGroupId || "";
+  const blocked = $<HTMLInputElement>("g-blocked").checked;
+  const enabled = !blocked && $<HTMLInputElement>("g-enabled").checked;
   return {
     groupId,
     groupName: $<HTMLInputElement>("g-name").value.trim(),
-    enabled: $<HTMLInputElement>("g-enabled").checked,
+    enabled,
+    blocked,
     basic: {
       logAll: $<HTMLInputElement>("g-log-all").checked,
       storageEnabled: $<HTMLInputElement>("g-storage").checked,
@@ -1000,11 +1164,20 @@ window.addEventListener("DOMContentLoaded", async () => {
     refreshGroups().catch((e) => toast(String(e), true));
   $("btn-refresh-monitored").onclick = () =>
     refreshMonitored().catch((e) => toast(String(e), true));
+  $("btn-back-monitored-report").onclick = () => {
+    showMonitoredMaster();
+    animateViewEnter($("monitored-master"));
+    if (monitoredSelectedGroupId) {
+      selectMonitoredGroup(monitoredSelectedGroupId).catch(() => undefined);
+    }
+  };
   $("btn-goto-groups").onclick = () => {
     switchTab("groups");
     refreshGroups().catch((e) => toast(String(e), true));
   };
   $("groups-sort").onchange = () => refreshGroups().catch((e) => toast(String(e), true));
+  $("groups-show-blocked").onchange = () =>
+    refreshGroups().catch((e) => toast(String(e), true));
   $("groups-q").onkeydown = (ev) => {
     if (ev.key === "Enter") refreshGroups().catch((e) => toast(String(e), true));
   };
@@ -1025,10 +1198,24 @@ window.addEventListener("DOMContentLoaded", async () => {
   };
   $("btn-save-group").onclick = async () => {
     try {
-      await invoke("api_save_group", { config: readGroupForm() });
-      toast("本群配置已保存");
+      const form = readGroupForm();
+      await invoke("api_save_group", { config: form });
+      toast(form.blocked ? "已屏蔽此群" : "本群配置已保存");
+      if (form.blocked) {
+        $("group-detail").classList.add("hidden");
+        $("groups-master").classList.remove("hidden");
+        currentGroupId = null;
+        await refreshGroups();
+      }
     } catch (e) {
       toast(String(e), true);
+    }
+  };
+  $("g-blocked").onchange = () => syncBlockEnableUi();
+  $("g-enabled").onchange = () => {
+    if ($<HTMLInputElement>("g-enabled").checked) {
+      $<HTMLInputElement>("g-blocked").checked = false;
+      syncBlockEnableUi();
     }
   };
   $("btn-pull-history").onclick = async () => {

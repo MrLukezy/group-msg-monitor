@@ -64,6 +64,7 @@ class GroupConfig(BaseModel):
     group_id: str
     group_name: str = ""
     enabled: bool = False
+    blocked: bool = False  # 屏蔽：不落库、不处理
     basic: GroupBasicConfig = Field(default_factory=GroupBasicConfig)
     keyword_monitor: KeywordMonitorConfig = Field(default_factory=KeywordMonitorConfig)
     llm_monitor: LlmMonitorConfig = Field(default_factory=LlmMonitorConfig)
@@ -166,7 +167,7 @@ def list_group_configs() -> list[GroupConfig]:
 
 
 def enabled_group_ids() -> set[str]:
-    ids = {c.group_id for c in list_group_configs() if c.enabled}
+    ids = {c.group_id for c in list_group_configs() if c.enabled and not c.blocked}
     if ids:
         return ids
     # 兼容旧 .env MONITOR_GROUP_IDS
@@ -177,6 +178,10 @@ def enabled_group_ids() -> set[str]:
                 raw = line.split("=", 1)[1].strip().strip('"')
                 return {x.strip() for x in raw.split(",") if x.strip()}
     return set()
+
+
+def blocked_group_ids() -> set[str]:
+    return {c.group_id for c in list_group_configs() if c.blocked}
 
 
 def provider_by_id(settings: AppSettings, provider_id: str) -> LlmProvider | None:

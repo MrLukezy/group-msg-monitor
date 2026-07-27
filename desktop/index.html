@@ -3,7 +3,7 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>QQ 群消息监控</title>
+    <title>QQ 群消息监听</title>
     <link rel="preconnect" href="https://fonts.googleapis.com" />
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
     <link
@@ -20,18 +20,18 @@
           <span class="brand-mark" aria-hidden="true"></span>
           <div>
             <p class="brand-kicker">Group Msg</p>
-            <h1 class="brand-title">群消息监控</h1>
+            <h1 class="brand-title">群消息监听</h1>
           </div>
         </div>
 
         <nav class="nav" role="tablist" aria-label="主导航">
           <button class="nav-item active" data-tab="live" type="button">
             <span class="nav-icon" aria-hidden="true">◉</span>
-            <span class="nav-label">实时监控</span>
+            <span class="nav-label">实时监听</span>
           </button>
           <button class="nav-item" data-tab="monitored" type="button">
             <span class="nav-icon" aria-hidden="true">★</span>
-            <span class="nav-label">监控中</span>
+            <span class="nav-label">监听中</span>
           </button>
           <button class="nav-item" data-tab="groups" type="button">
             <span class="nav-icon" aria-hidden="true">☰</span>
@@ -47,7 +47,7 @@
           <div class="status-stack" id="status-bar">
             <span class="pill" data-key="napcat">NapCat</span>
             <span class="pill" data-key="onebot">OneBot</span>
-            <span class="pill" data-key="monitor">监控</span>
+            <span class="pill" data-key="monitor" title="指本机 Python 监听服务（python -m app.main）：收群消息、落库、定时 LLM">监听服务</span>
           </div>
         </div>
       </aside>
@@ -55,15 +55,15 @@
       <main class="main">
         <p id="toast" class="toast" hidden></p>
 
-        <!-- 实时监控 -->
+        <!-- 实时监听 -->
         <section id="view-live" class="view active">
           <header class="page-head">
             <div>
-              <h2>全部群消息流</h2>
-              <p>滚动展示已落库消息 · 约 2.5s 刷新</p>
+              <h2>监听群消息流</h2>
+              <p>仅展示已启用监听的群 · 约 2.5s 刷新</p>
             </div>
             <div class="row actions">
-              <button id="btn-start-monitor" class="btn primary" type="button">启动监控</button>
+              <button id="btn-start-monitor" class="btn primary" type="button">启动监听</button>
               <button id="btn-stop-monitor" class="btn danger" type="button">停止</button>
               <button id="btn-start-napcat" class="btn" type="button">启动 NapCat</button>
             </div>
@@ -73,21 +73,54 @@
           </div>
         </section>
 
-        <!-- 监控中 -->
+        <!-- 监听中的群：左群列表 / 右 LLM 主题 / 详情 -->
         <section id="view-monitored" class="view">
-          <header class="page-head">
-            <div>
-              <h2>监控中的群</h2>
-              <p>已启用监控的群 · 展示各群最新 LLM 报告</p>
+          <div id="monitored-master" class="stack fill">
+            <header class="page-head">
+              <div>
+                <h2>监听中的群</h2>
+                <p>左侧选择群 · 右侧查看 LLM 分析主题 · 点击主题进入详情</p>
+              </div>
+              <div class="row actions">
+                <button id="btn-refresh-monitored" class="btn primary" type="button">刷新</button>
+                <button id="btn-goto-groups" class="btn" type="button">去群列表</button>
+              </div>
+            </header>
+            <div id="monitored-stats" class="stats-row"></div>
+            <div class="monitored-split fill">
+              <aside class="panel monitored-groups-pane">
+                <h3 class="pane-title">监听群</h3>
+                <div id="monitored-group-list" class="monitored-group-list"></div>
+              </aside>
+              <div class="panel monitored-reports-pane fill">
+                <div class="monitored-reports-head">
+                  <h3 class="pane-title" id="monitored-reports-title">LLM 分析主题</h3>
+                  <p class="field-hint" id="monitored-reports-hint">请选择左侧群</p>
+                </div>
+                <div id="monitored-report-list" class="report-title-list"></div>
+              </div>
             </div>
-            <div class="row actions">
-              <button id="btn-refresh-monitored" class="btn primary" type="button">刷新</button>
-              <button id="btn-goto-groups" class="btn" type="button">去群列表</button>
+          </div>
+
+          <div id="monitored-report-detail" class="stack fill detail hidden">
+            <header class="page-head">
+              <div>
+                <button id="btn-back-monitored-report" class="btn ghost back" type="button">← 返回主题列表</button>
+                <h2 id="monitored-report-detail-title">LLM 分析详情</h2>
+                <p id="monitored-report-detail-meta"></p>
+              </div>
+            </header>
+            <div class="report-detail-split fill">
+              <div class="panel fill scroll report-detail-panel">
+                <h3 class="pane-title">分析结果</h3>
+                <pre id="monitored-report-detail-body" class="report-detail-body"></pre>
+              </div>
+              <div class="panel fill scroll report-detail-msgs-panel">
+                <h3 class="pane-title">相关对话</h3>
+                <p class="field-hint" id="monitored-report-msgs-hint">分析窗口内的原始消息</p>
+                <div id="monitored-report-detail-msgs" class="messages report-detail-msgs"></div>
+              </div>
             </div>
-          </header>
-          <div id="monitored-stats" class="stats-row"></div>
-          <div class="panel fill">
-            <div id="monitored-list" class="groups-list"></div>
           </div>
         </section>
 
@@ -105,6 +138,7 @@
                   <option value="alpha">字母 / 名称</option>
                 </select>
                 <input id="groups-q" type="search" placeholder="搜索群名 / 群号" />
+                <label class="check toolbar-check"><input id="groups-show-blocked" type="checkbox" /> 显示已屏蔽</label>
                 <button id="btn-refresh-groups" class="btn primary" type="button">刷新</button>
                 <button id="btn-pull-onebot-groups" class="btn" type="button">从 OneBot 拉取</button>
               </div>
@@ -131,7 +165,9 @@
             <div class="detail-grid fill">
               <div class="panel scroll">
                 <h3>基础配置</h3>
-                <label class="check"><input id="g-enabled" type="checkbox" /> 启用监控此群</label>
+                <label class="check"><input id="g-blocked" type="checkbox" /> 屏蔽此群（不落库、不处理）</label>
+                <p class="field-hint">屏蔽后不会进入消息流，也不会做关键词 / LLM。与「启用监听」互斥。</p>
+                <label class="check"><input id="g-enabled" type="checkbox" /> 启用监听此群</label>
                 <label class="check"><input id="g-log-all" type="checkbox" /> 记录全部消息</label>
                 <label class="check"><input id="g-storage" type="checkbox" /> SQLite 落库</label>
                 <label>
@@ -169,7 +205,7 @@
                 <label>
                   执行间隔（分钟）
                   <input id="g-llm-every" type="number" min="1" step="1" />
-                  <span class="field-hint">需保持「启动监控」运行；定时任务由监控进程调度。</span>
+                  <span class="field-hint">需保持「启动监听」运行；定时任务由监听进程调度。</span>
                 </label>
                 <label>
                   分析窗口（分钟）
@@ -182,7 +218,7 @@
                   <span class="field-hint">短窗口请设为 1；设太大可能导致定时一直跳过。</span>
                 </label>
                 <label>
-                  监控提示词
+                  分析提示词
                   <textarea id="g-llm-prompt" rows="6"></textarea>
                 </label>
               </div>
@@ -236,7 +272,7 @@
             <div id="stab-llm" class="settings-body hidden">
               <div class="setting-item">
                 <label>代理 (Provider)</label>
-                <p class="settings-desc">点击条目切换默认代理；悬停可编辑/删除。群监控可再单独覆盖。</p>
+                <p class="settings-desc">点击条目切换默认代理；悬停可编辑/删除。群监听可再单独覆盖。</p>
                 <div id="provider-list" class="provider-list"></div>
                 <button id="btn-add-provider" class="provider-add-btn" type="button">＋ 添加代理</button>
               </div>

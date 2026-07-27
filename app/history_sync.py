@@ -104,7 +104,7 @@ async def pull_enabled_groups_history(count: int = 50) -> dict[str, Any]:
 
     results = []
     for cfg in list_group_configs():
-        if not cfg.enabled:
+        if cfg.blocked or not cfg.enabled:
             continue
         try:
             results.append(await pull_group_history(cfg.group_id, count=count))

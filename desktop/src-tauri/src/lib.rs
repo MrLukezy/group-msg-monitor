@@ -80,18 +80,60 @@ fn py_api_json(args: &[&str]) -> Result<Value, String> {
     serde_json::from_str(line).map_err(|e| format!("解析 JSON 失败: {e}; line={line}"))
 }
 
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct StatusInfo {
-    napcat_installed: bool,
-    napcat_webui_up: bool,
-    onebot_ws_up: bool,
-    monitor_running: bool,
+fn monitor_lock_path() -> PathBuf {
+    project_root().join("data").join("monitor.lock")
 }
 
-#[tauri::command]
-fn get_status(state: tauri::State<'_, AppState>) -> StatusInfo {
-    let monitor_running = state
+fn pid_alive(pid: u32) -> bool {
+    if pid == 0 {
+        return false;
+    }
+    #[cfg(windows)]
+    {
+        let output = Command::new("tasklist")
+            .args(["/FI", &format!("PID eq {pid}"), "/NH"])
+            .output();
+        match output {
+            Ok(o) => String::from_utf8_lossy(&o.stdout).contains(&pid.to_string()),
+            Err(_) => false,
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        PathBuf::from(format!("/proc/{pid}")).exists()
+    }
+}
+
+fn read_monitor_lock_pid() -> Option<u32> {
+    let path = monitor_lock_path();
+    if !path.exists() {
+        return None;
+    }
+    #[cfg(windows)]
+    {
+        use std::io::Read;
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_SHARE_READ: u32 = 0x1;
+        const FILE_SHARE_WRITE: u32 = 0x2;
+        let mut f = fs::OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+            .open(&path)
+            .ok()?;
+        let mut raw = String::new();
+        f.read_to_string(&mut raw).ok()?;
+        raw.trim().parse::<u32>().ok()
+    }
+    #[cfg(not(windows))]
+    {
+        fs::read_to_string(&path)
+            .ok()
+            .and_then(|raw| raw.trim().parse::<u32>().ok())
+    }
+}
+
+fn owned_monitor_child_running(state: &AppState) -> bool {
+    state
         .monitor_child
         .lock()
         .ok()
@@ -109,14 +151,38 @@ fn get_status(state: tauri::State<'_, AppState>) -> StatusInfo {
                 false
             }
         })
-        .unwrap_or(false);
+        .unwrap_or(false)
+}
 
+/// 监听服务是否在跑：本窗口拉起的子进程，或本机 lock 中的 PID 仍存活。
+fn monitor_service_running(state: &AppState) -> bool {
+    if owned_monitor_child_running(state) {
+        return true;
+    }
+    match read_monitor_lock_pid() {
+        Some(pid) => pid_alive(pid),
+        // lock 存在但读不到（被占用）→ 通常表示服务仍在持锁
+        None => monitor_lock_path().exists(),
+    }
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct StatusInfo {
+    napcat_installed: bool,
+    napcat_webui_up: bool,
+    onebot_ws_up: bool,
+    monitor_running: bool,
+}
+
+#[tauri::command]
+fn get_status(state: tauri::State<'_, AppState>) -> StatusInfo {
     StatusInfo {
         napcat_installed: napcat_dir().join("launcher-user.bat").exists()
             || napcat_dir().join("launcher.bat").exists(),
         napcat_webui_up: port_open("127.0.0.1", read_webui_port()),
         onebot_ws_up: port_open("127.0.0.1", 3001),
-        monitor_running,
+        monitor_running: monitor_service_running(&state),
     }
 }
 
@@ -140,8 +206,11 @@ fn start_monitor(state: tauri::State<'_, AppState>) -> Result<String, String> {
     {
         let guard = state.monitor_child.lock().map_err(|e| e.to_string())?;
         if guard.is_some() {
-            return Err("监控服务已在运行".into());
+            return Err("监听服务已在本窗口运行".into());
         }
+    }
+    if monitor_service_running(&state) {
+        return Err("检测到本机已有监听服务在运行（请先点「停止」，或结束多余的 python -m app.main）".into());
     }
     let root = project_root();
     let mut child = Command::new(python_exe())
@@ -151,17 +220,17 @@ fn start_monitor(state: tauri::State<'_, AppState>) -> Result<String, String> {
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
-        .map_err(|e| format!("启动监控失败: {e}"))?;
+        .map_err(|e| format!("启动监听失败: {e}"))?;
     std::thread::sleep(Duration::from_millis(400));
     match child.try_wait() {
         Ok(Some(code)) => {
-            return Err(format!("监控进程立即退出 code={code:?}"));
+            return Err(format!("监听进程立即退出 code={code:?}（常见原因：已有另一实例占用）"));
         }
         Ok(None) => {}
         Err(e) => return Err(e.to_string()),
     }
     *state.monitor_child.lock().map_err(|e| e.to_string())? = Some(child);
-    Ok("监控服务已启动".into())
+    Ok("监听服务已启动".into())
 }
 
 #[tauri::command]
@@ -170,9 +239,19 @@ fn stop_monitor(state: tauri::State<'_, AppState>) -> Result<String, String> {
     if let Some(mut child) = guard.take() {
         let _ = child.kill();
         let _ = child.wait();
-        Ok("监控服务已停止".into())
+        Ok("监听服务已停止".into())
+    } else if let Some(pid) = read_monitor_lock_pid().filter(|p| pid_alive(*p)) {
+        let status = Command::new("taskkill")
+            .args(["/PID", &pid.to_string(), "/F"])
+            .status()
+            .map_err(|e| format!("结束监听进程失败: {e}"))?;
+        if status.success() {
+            Ok(format!("已结束外部监听进程 PID={pid}"))
+        } else {
+            Err(format!("结束外部监听进程失败 PID={pid}"))
+        }
     } else {
-        Err("监控服务未在运行".into())
+        Err("监听服务未在运行".into())
     }
 }
 
@@ -191,6 +270,33 @@ fn messages_db_path() -> PathBuf {
     project_root().join("data").join("messages.db")
 }
 
+fn blocked_group_ids_from_disk() -> std::collections::HashSet<String> {
+    let dir = project_root().join("data").join("group_configs");
+    let mut out = std::collections::HashSet::new();
+    let entries = match fs::read_dir(&dir) {
+        Ok(e) => e,
+        Err(_) => return out,
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|s| s.to_str()) != Some("json") {
+            continue;
+        }
+        let Ok(raw) = fs::read_to_string(&path) else {
+            continue;
+        };
+        let Ok(v) = serde_json::from_str::<Value>(&raw) else {
+            continue;
+        };
+        if v.get("blocked").and_then(|b| b.as_bool()).unwrap_or(false) {
+            if let Some(gid) = v.get("group_id").and_then(|x| x.as_str()) {
+                out.insert(gid.to_string());
+            }
+        }
+    }
+    out
+}
+
 fn recent_messages_from_db(group_id: Option<String>, limit: i64) -> Result<Value, String> {
     use rusqlite::Connection;
 
@@ -199,6 +305,7 @@ fn recent_messages_from_db(group_id: Option<String>, limit: i64) -> Result<Value
         return Ok(Value::Array(vec![]));
     }
     let lim = limit.clamp(1, 200);
+    let blocked = blocked_group_ids_from_disk();
     let conn = Connection::open(&path).map_err(|e| format!("打开 messages.db 失败: {e}"))?;
 
     let mut rows_out: Vec<Value> = Vec::new();
@@ -223,6 +330,9 @@ fn recent_messages_from_db(group_id: Option<String>, limit: i64) -> Result<Value
     };
 
     if let Some(gid) = group_id.filter(|s| !s.is_empty()) {
+        if blocked.contains(&gid) {
+            return Ok(Value::Array(vec![]));
+        }
         let mut stmt = conn
             .prepare(
                 "SELECT id, group_id, COALESCE(user_id,''), COALESCE(sender_name,''),
@@ -257,6 +367,7 @@ fn recent_messages_from_db(group_id: Option<String>, limit: i64) -> Result<Value
             );
         }
     } else {
+        let fetch_lim = (lim.saturating_mul(5)).clamp(lim, 500);
         let mut stmt = conn
             .prepare(
                 "SELECT id, group_id, COALESCE(user_id,''), COALESCE(sender_name,''),
@@ -265,7 +376,7 @@ fn recent_messages_from_db(group_id: Option<String>, limit: i64) -> Result<Value
             )
             .map_err(|e| e.to_string())?;
         let rows = stmt
-            .query_map(rusqlite::params![lim], |r| {
+            .query_map(rusqlite::params![fetch_lim], |r| {
                 Ok((
                     r.get::<_, i64>(0)?,
                     r.get::<_, String>(1)?,
@@ -280,6 +391,9 @@ fn recent_messages_from_db(group_id: Option<String>, limit: i64) -> Result<Value
         for row in rows {
             let (id, group_id, user_id, sender_name, content, event_time, created_at) =
                 row.map_err(|e| e.to_string())?;
+            if blocked.contains(&group_id) {
+                continue;
+            }
             push_row(
                 id,
                 group_id,
@@ -290,6 +404,83 @@ fn recent_messages_from_db(group_id: Option<String>, limit: i64) -> Result<Value
                 created_at,
             );
         }
+        if rows_out.len() as i64 > lim {
+            rows_out.truncate(lim as usize);
+        }
+    }
+    Ok(Value::Array(rows_out))
+}
+
+#[tauri::command]
+fn api_messages_in_window(
+    group_id: String,
+    start_ts: i64,
+    end_ts: i64,
+    limit: i64,
+) -> Result<Value, String> {
+    messages_in_window_from_db(group_id, start_ts, end_ts, limit)
+}
+
+fn messages_in_window_from_db(
+    group_id: String,
+    start_ts: i64,
+    end_ts: i64,
+    limit: i64,
+) -> Result<Value, String> {
+    use rusqlite::Connection;
+
+    let path = messages_db_path();
+    if !path.exists() || group_id.is_empty() {
+        return Ok(Value::Array(vec![]));
+    }
+    if blocked_group_ids_from_disk().contains(&group_id) {
+        return Ok(Value::Array(vec![]));
+    }
+    let lim = limit.clamp(1, 800);
+    let start = start_ts.min(end_ts);
+    let end = start_ts.max(end_ts);
+    let conn = Connection::open(&path).map_err(|e| format!("打开 messages.db 失败: {e}"))?;
+
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, group_id, COALESCE(user_id,''), COALESCE(sender_name,''),
+                    COALESCE(content,''), event_time, COALESCE(created_at,'')
+             FROM messages
+             WHERE group_id=?
+               AND COALESCE(event_time, 0) >= ?
+               AND COALESCE(event_time, 0) <= ?
+             ORDER BY COALESCE(event_time, 0) ASC, id ASC
+             LIMIT ?",
+        )
+        .map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map(rusqlite::params![group_id, start, end, lim], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
+                r.get::<_, String>(4)?,
+                r.get::<_, Option<i64>>(5)?,
+                r.get::<_, String>(6)?,
+            ))
+        })
+        .map_err(|e| e.to_string())?;
+
+    let mut rows_out: Vec<Value> = Vec::new();
+    for row in rows {
+        let (id, gid, user_id, sender_name, content, event_time, created_at) =
+            row.map_err(|e| e.to_string())?;
+        rows_out.push(serde_json::json!({
+            "id": id,
+            "groupId": gid,
+            "groupName": "",
+            "userId": user_id,
+            "senderName": sender_name,
+            "content": content,
+            "eventTime": event_time,
+            "createdAt": created_at,
+        }));
     }
     Ok(Value::Array(rows_out))
 }
@@ -411,7 +602,8 @@ fn group_to_camel(v: Value) -> Value {
     serde_json::json!({
         "groupId": o.get("group_id").cloned().unwrap_or(Value::Null),
         "groupName": o.get("group_name").cloned().unwrap_or(Value::String(String::new())),
-        "enabled": o.get("enabled").cloned().unwrap_or(Value::Bool(true)),
+        "enabled": o.get("enabled").cloned().unwrap_or(Value::Bool(false)),
+        "blocked": o.get("blocked").cloned().unwrap_or(Value::Bool(false)),
         "basic": {
             "logAll": bo.get("log_all").cloned().unwrap_or(Value::Bool(true)),
             "storageEnabled": bo.get("storage_enabled").cloned().unwrap_or(Value::Bool(true)),
@@ -548,6 +740,7 @@ pub fn run() {
             stop_monitor,
             api_list_groups,
             api_recent_messages,
+            api_messages_in_window,
             api_get_settings,
             api_save_settings,
             api_get_group,

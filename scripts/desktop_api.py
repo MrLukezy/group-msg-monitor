@@ -90,6 +90,7 @@ def cmd_list_groups(sort: str, q: str) -> None:
                 "groupId": gid,
                 "groupName": cfg.group_name or names.get(gid) or "",
                 "enabled": cfg.enabled,
+                "blocked": cfg.blocked,
                 "lastTime": meta.get("last_time"),
                 "msgCount": meta.get("msg_count") or 0,
                 "memberCount": mem.get("member_count"),
@@ -240,7 +241,8 @@ def cmd_save_group(raw: str) -> None:
         {
             "group_id": pick(data, "groupId", "group_id"),
             "group_name": pick(data, "groupName", "group_name", default="") or "",
-            "enabled": pick(data, "enabled", default=True),
+            "enabled": pick(data, "enabled", default=False),
+            "blocked": pick(data, "blocked", default=False),
             "basic": {
                 "log_all": pick(basic, "logAll", "log_all", default=True),
                 "storage_enabled": pick(basic, "storageEnabled", "storage_enabled", default=True),
@@ -262,6 +264,11 @@ def cmd_save_group(raw: str) -> None:
             },
         }
     )
+    # 屏蔽与启用互斥
+    if cfg.blocked:
+        cfg.enabled = False
+    elif cfg.enabled:
+        cfg.blocked = False
     if isinstance(cfg.keyword_monitor.keywords, str):
         cfg.keyword_monitor.keywords = [
             x.strip() for x in cfg.keyword_monitor.keywords.split(",") if x.strip()
@@ -271,6 +278,9 @@ def cmd_save_group(raw: str) -> None:
 
 
 def cmd_run_llm(group_id: str) -> None:
+    cfg = load_group_config(group_id)
+    if cfg.blocked:
+        raise SystemExit("该群已屏蔽，无法执行 LLM 分析")
     result = asyncio.run(run_group_summary(group_id, job_type="manual"))
     out(result)
 
@@ -278,6 +288,9 @@ def cmd_run_llm(group_id: str) -> None:
 def cmd_pull_history(group_id: str, count: int) -> None:
     from app.history_sync import pull_group_history
 
+    cfg = load_group_config(group_id)
+    if cfg.blocked:
+        raise SystemExit("该群已屏蔽，无法拉取历史")
     result = asyncio.run(pull_group_history(group_id, count=count))
     out(result)
 

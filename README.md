@@ -1,4 +1,4 @@
-# QQ 群消息实时监控
+# QQ 群消息实时监听
 
 本机小型服务：通过 NapCat（OneBot 11）WebSocket 实时接收指定 QQ 群消息，支持日志、SQLite 落库、关键词 Webhook 告警。
 
