@@ -26,6 +26,24 @@ from app.settings_store import (  # noqa: E402
     save_app_settings,
     save_group_config,
 )
+from app.channels.ids import channel_of_group_id  # noqa: E402
+from app.channels.telegram import (  # noqa: E402
+    cancel_qr_login,
+    check_session_authorized,
+    detect_telegram_desktop,
+    list_telegram_groups,
+    qr_status,
+    start_qr_login_process,
+    submit_2fa_password,
+)
+from app.channels.wechat import (  # noqa: E402
+    bind_wechat_flow,
+    detect_wechat_accounts,
+    list_wechat_groups,
+    scan_keys_from_process,
+    wechat_decrypted_dir,
+    wechat_keys_path,
+)
 
 
 def out(data) -> None:
@@ -89,6 +107,7 @@ def cmd_list_groups(sort: str, q: str) -> None:
             {
                 "groupId": gid,
                 "groupName": cfg.group_name or names.get(gid) or "",
+                "channel": cfg.channel or channel_of_group_id(gid),
                 "enabled": cfg.enabled,
                 "blocked": cfg.blocked,
                 "lastTime": meta.get("last_time"),
@@ -197,6 +216,7 @@ def cmd_save_settings(raw: str) -> None:
         "onebot_access_token": data.get("onebotAccessToken") or data.get("onebot_access_token"),
         "llm": data.get("llm"),
         "ui": data.get("ui") or {},
+        "channels": data.get("channels") or {},
     }
     # llm providers camelCase normalize
     llm = mapped.get("llm") or {}
@@ -228,9 +248,391 @@ def cmd_save_settings(raw: str) -> None:
             "theme": (ui.get("theme") or "midnight").strip() or "midnight",
         }
 
+    channels = mapped.get("channels") or {}
+    if isinstance(channels, dict):
+        def _ch(src: dict, extra: dict | None = None) -> dict:
+            out = {
+                "bound": bool(src.get("bound", False)),
+                "label": (src.get("label") or "").strip(),
+                "last_error": (src.get("lastError") or src.get("last_error") or "").strip(),
+            }
+            if extra:
+                out.update(extra)
+            return out
+
+        qq = channels.get("qq") or {}
+        wx = channels.get("wechat") or {}
+        tg = channels.get("telegram") or {}
+        mapped["channels"] = {
+            "qq": _ch(qq if isinstance(qq, dict) else {}),
+            "wechat": _ch(
+                wx if isinstance(wx, dict) else {},
+                {
+                    "data_dir": (wx.get("dataDir") or wx.get("data_dir") or "").strip(),
+                    "decrypted_dir": (wx.get("decryptedDir") or wx.get("decrypted_dir") or "").strip(),
+                    "keys_path": (wx.get("keysPath") or wx.get("keys_path") or "").strip(),
+                    "poll_seconds": float(wx.get("pollSeconds") or wx.get("poll_seconds") or 1.0),
+                },
+            ),
+            "telegram": _ch(
+                tg if isinstance(tg, dict) else {},
+                {
+                    "api_id": int(tg.get("apiId") or tg.get("api_id") or 0),
+                    "api_hash": (tg.get("apiHash") or tg.get("api_hash") or "").strip(),
+                    "bot_token": (tg.get("botToken") or tg.get("bot_token") or "").strip(),
+                    "poll_timeout": int(tg.get("pollTimeout") or tg.get("poll_timeout") or 25),
+                },
+            ),
+        }
+
     settings = AppSettings.model_validate(mapped)
     save_app_settings(settings)
     out({"ok": True})
+
+
+def _cache_channel_groups(groups: list[dict], channel: str) -> int:
+    path = ROOT / "data" / "groups_cache.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    existing: dict = {"groups": [], "login": None}
+    if path.exists():
+        try:
+            existing = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+    old = [
+        g
+        for g in (existing.get("groups") or [])
+        if channel_of_group_id(str(g.get("group_id") or "")) != channel
+        and (g.get("channel") or channel_of_group_id(str(g.get("group_id") or ""))) != channel
+    ]
+    merged = old + groups
+    existing["groups"] = merged
+    path.write_text(json.dumps(existing, ensure_ascii=False, indent=2), encoding="utf-8")
+    for g in groups:
+        gid = str(g.get("group_id") or "")
+        name = g.get("group_name") or ""
+        if not gid:
+            continue
+        cfg = load_group_config(gid)
+        changed = False
+        if name and cfg.group_name != name:
+            cfg.group_name = name
+            changed = True
+        ch = g.get("channel") or channel
+        if cfg.channel != ch:
+            cfg.channel = ch
+            changed = True
+        if changed:
+            save_group_config(cfg)
+    return len(groups)
+
+
+def cmd_bind_qq(raw: str) -> None:
+    data = json.loads(raw or "{}")
+    settings = load_app_settings()
+    ws = (data.get("onebotWsUrl") or data.get("ws") or settings.onebot_ws_url or "").strip()
+    token = (data.get("onebotAccessToken") or data.get("token") or settings.onebot_access_token or "").strip()
+    if ws:
+        settings.onebot_ws_url = ws
+    settings.onebot_access_token = token
+    settings.channels.qq.bound = True
+    settings.channels.qq.label = (data.get("label") or "OneBot / NapCat").strip()
+    settings.channels.qq.last_error = ""
+    save_app_settings(settings)
+    out({"ok": True, "message": "QQ / OneBot 已绑定", "channels": dump_public(settings.channels)})
+
+
+def cmd_bind_telegram(raw: str) -> None:
+    data = json.loads(raw or "{}")
+    settings = load_app_settings()
+    api_id = int(data.get("apiId") or data.get("api_id") or settings.channels.telegram.api_id or 0)
+    api_hash = (
+        data.get("apiHash") or data.get("api_hash") or settings.channels.telegram.api_hash or ""
+    ).strip()
+    if api_id:
+        settings.channels.telegram.api_id = api_id
+    if api_hash:
+        settings.channels.telegram.api_hash = api_hash
+    save_app_settings(settings)
+
+    result = asyncio.run(
+        check_session_authorized(
+            settings.channels.telegram.api_id,
+            settings.channels.telegram.api_hash,
+        )
+    )
+    if not result.get("authorized"):
+        out(
+            {
+                "ok": False,
+                "message": result.get("message")
+                or "尚未扫码登录。请先点「扫码登录」，成功后再点绑定",
+                "need_qr": True,
+            }
+        )
+        return
+
+    settings = load_app_settings()
+    settings.channels.telegram.bound = True
+    settings.channels.telegram.label = (
+        data.get("label") or result.get("label") or "Telegram 用户"
+    )
+    settings.channels.telegram.last_error = ""
+    # 清空废弃 bot_token，避免误解
+    settings.channels.telegram.bot_token = ""
+    save_app_settings(settings)
+    groups = []
+    try:
+        groups = asyncio.run(
+            list_telegram_groups(
+                settings.channels.telegram.api_id,
+                settings.channels.telegram.api_hash,
+            )
+        )
+        if groups:
+            _cache_channel_groups(groups, "telegram")
+    except Exception as e:
+        out(
+            {
+                "ok": True,
+                "message": f"已绑定，但拉群失败: {e}",
+                "channels": dump_public(settings.channels),
+            }
+        )
+        return
+    out(
+        {
+            "ok": True,
+            "message": result.get("message") or "Telegram 用户已绑定",
+            "channels": dump_public(settings.channels),
+            "groups": groups,
+        }
+    )
+
+
+def cmd_telegram_qr_start(raw: str) -> None:
+    data = json.loads(raw or "{}")
+    settings = load_app_settings()
+    api_id = int(data.get("apiId") or data.get("api_id") or settings.channels.telegram.api_id or 0)
+    api_hash = (
+        data.get("apiHash") or data.get("api_hash") or settings.channels.telegram.api_hash or ""
+    ).strip()
+    if api_id:
+        settings.channels.telegram.api_id = api_id
+    if api_hash:
+        settings.channels.telegram.api_hash = api_hash
+    save_app_settings(settings)
+    result = start_qr_login_process(settings.channels.telegram.api_id, settings.channels.telegram.api_hash)
+    out(result)
+
+
+def cmd_telegram_qr_status() -> None:
+    st = qr_status()
+    # 若已授权，自动提示可绑定
+    if st.get("status") == "authorized":
+        settings = load_app_settings()
+        if st.get("label"):
+            settings.channels.telegram.label = str(st["label"])
+            save_app_settings(settings)
+    out(st)
+
+
+def cmd_telegram_qr_cancel() -> None:
+    cancel_qr_login()
+    out({"ok": True, "message": "已取消扫码"})
+
+
+def cmd_telegram_qr_2fa(raw: str) -> None:
+    data = json.loads(raw or "{}")
+    password = (data.get("password") or "").strip()
+    out(submit_2fa_password(password))
+
+
+def cmd_telegram_detect() -> None:
+    settings = load_app_settings()
+    local = detect_telegram_desktop()
+    session = asyncio.run(
+        check_session_authorized(
+            settings.channels.telegram.api_id,
+            settings.channels.telegram.api_hash,
+        )
+    ) if settings.channels.telegram.api_id and settings.channels.telegram.api_hash else {
+        "ok": True,
+        "authorized": False,
+        "message": "请先填写 api_id / api_hash",
+    }
+    out(
+        {
+            "ok": True,
+            "local": local,
+            "session": session,
+            "message": session.get("message")
+            or (f"检测到 {len(local)} 处本地 Telegram 数据" if local else "未检测到本地 Telegram"),
+        }
+    )
+
+
+def cmd_test_telegram() -> None:
+    settings = load_app_settings()
+    t0 = time.time()
+    result = asyncio.run(
+        check_session_authorized(
+            settings.channels.telegram.api_id,
+            settings.channels.telegram.api_hash,
+        )
+    )
+    result["latencyMs"] = int((time.time() - t0) * 1000)
+    result["ok"] = bool(result.get("authorized"))
+    out(result)
+
+
+def cmd_pull_telegram_groups() -> None:
+    settings = load_app_settings()
+    if not settings.channels.telegram.bound:
+        out({"ok": False, "message": "请先绑定 Telegram 用户账号"})
+        return
+    if not settings.channels.telegram.api_id or not settings.channels.telegram.api_hash:
+        out({"ok": False, "message": "缺少 api_id / api_hash"})
+        return
+    try:
+        groups = asyncio.run(
+            list_telegram_groups(
+                settings.channels.telegram.api_id,
+                settings.channels.telegram.api_hash,
+            )
+        )
+    except Exception as e:
+        out({"ok": False, "message": str(e)})
+        return
+    n = _cache_channel_groups(groups, "telegram")
+    out(
+        {
+            "ok": True,
+            "count": n,
+            "groups": groups,
+            "message": f"已缓存 {n} 个 Telegram 群（来自已登录账号会话列表）",
+        }
+    )
+
+
+def cmd_bind_wechat(raw: str) -> None:
+    data = json.loads(raw or "{}")
+    data_dir = (data.get("dataDir") or data.get("data_dir") or "").strip()
+    scan = bool(data.get("scanKeys", True)) if "scanKeys" in data else True
+    result = asyncio.run(bind_wechat_flow(data_dir=data_dir, scan_keys=scan))
+    if not result.get("ok"):
+        # 仍允许在仅有账号目录时绑定，后续再扫 key
+        if not result.get("data_dir") and not result.get("accounts"):
+            out(result)
+            return
+    settings = load_app_settings()
+    settings.channels.wechat.bound = True
+    settings.channels.wechat.data_dir = result.get("data_dir") or data_dir
+    settings.channels.wechat.decrypted_dir = result.get("decrypted_dir") or ""
+    settings.channels.wechat.keys_path = result.get("keys_path") or str(wechat_keys_path())
+    account = Path(settings.channels.wechat.data_dir).name if settings.channels.wechat.data_dir else "微信"
+    settings.channels.wechat.label = data.get("label") or account
+    settings.channels.wechat.last_error = "" if result.get("ok") else (result.get("message") or "")
+    save_app_settings(settings)
+    groups = result.get("groups") or []
+    if groups:
+        _cache_channel_groups(groups, "wechat")
+    out(
+        {
+            "ok": True,
+            "message": result.get("message") or "微信已绑定（需保持 PC 微信登录）",
+            "channels": dump_public(settings.channels),
+            "groups": groups,
+            "accounts": result.get("accounts") or [],
+        }
+    )
+
+
+def cmd_unbind_channel(channel: str) -> None:
+    ch = (channel or "").strip().lower()
+    settings = load_app_settings()
+    if ch == "qq":
+        settings.channels.qq.bound = False
+        settings.channels.qq.label = ""
+        settings.channels.qq.last_error = ""
+    elif ch in ("wechat", "wx"):
+        settings.channels.wechat.bound = False
+        settings.channels.wechat.label = ""
+        settings.channels.wechat.last_error = ""
+    elif ch in ("telegram", "tg"):
+        settings.channels.telegram.bound = False
+        settings.channels.telegram.label = ""
+        settings.channels.telegram.last_error = ""
+        # 保留 api_id/api_hash 与 session，方便重新绑定
+    else:
+        out({"ok": False, "message": f"未知通道: {channel}"})
+        return
+    save_app_settings(settings)
+    out({"ok": True, "message": f"已解绑 {ch}", "channels": dump_public(settings.channels)})
+
+
+def cmd_wechat_detect() -> None:
+    from app.channels.wechat import searched_wechat_hints
+
+    accounts = detect_wechat_accounts()
+    hints = searched_wechat_hints()
+    if accounts:
+        msg = f"发现 {len(accounts)} 个账号目录"
+    else:
+        msg = (
+            "未找到微信账号数据目录。请确认 PC 微信已登录；"
+            "若文件保存在自定义位置，可在「数据目录」手动填入 "
+            "…\\xwechat_files\\账号目录（含 db_storage 的那一层）"
+        )
+    out(
+        {
+            "ok": True,
+            "accounts": accounts,
+            "roots": hints,
+            "message": msg,
+        }
+    )
+
+
+def cmd_wechat_scan_keys() -> None:
+    result = scan_keys_from_process()
+    if result.get("ok"):
+        settings = load_app_settings()
+        payload = {
+            "keys": result["keys"],
+            "data_dir": settings.channels.wechat.data_dir,
+            "ts": time.time(),
+        }
+        wechat_keys_path().write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        settings.channels.wechat.keys_path = str(wechat_keys_path())
+        save_app_settings(settings)
+        result["keys_path"] = str(wechat_keys_path())
+    out(result)
+
+
+def cmd_pull_wechat_groups() -> None:
+    settings = load_app_settings()
+    wx = settings.channels.wechat
+    if not wx.bound:
+        out({"ok": False, "message": "请先绑定微信"})
+        return
+    dec = wx.decrypted_dir or (
+        str(wechat_decrypted_dir(Path(wx.data_dir).name)) if wx.data_dir else ""
+    )
+    if not dec or not Path(dec).is_dir():
+        # 尝试再走一遍绑定解密
+        result = asyncio.run(bind_wechat_flow(data_dir=wx.data_dir, scan_keys=True))
+        dec = result.get("decrypted_dir") or dec
+        if result.get("groups"):
+            n = _cache_channel_groups(result["groups"], "wechat")
+            out({"ok": True, "count": n, "groups": result["groups"], "message": result.get("message")})
+            return
+    groups = list_wechat_groups(dec) if dec else []
+    n = _cache_channel_groups(groups, "wechat")
+    out({"ok": True, "count": n, "groups": groups, "message": f"已缓存 {n} 个微信群"})
 
 
 def cmd_get_group(group_id: str) -> None:
@@ -250,10 +652,13 @@ def cmd_save_group(raw: str) -> None:
     basic = data.get("basic") or {}
     kw = data.get("keywordMonitor") or data.get("keyword_monitor") or {}
     llm = data.get("llmMonitor") or data.get("llm_monitor") or {}
+    group_id = pick(data, "groupId", "group_id")
+    channel = pick(data, "channel", default="") or channel_of_group_id(str(group_id or ""))
     cfg = GroupConfig.model_validate(
         {
-            "group_id": pick(data, "groupId", "group_id"),
+            "group_id": group_id,
             "group_name": pick(data, "groupName", "group_name", default="") or "",
+            "channel": channel,
             "enabled": pick(data, "enabled", default=False),
             "blocked": pick(data, "blocked", default=False),
             "basic": {
@@ -288,7 +693,6 @@ def cmd_save_group(raw: str) -> None:
         ]
     save_group_config(cfg)
     out({"ok": True})
-
 
 def cmd_run_llm(group_id: str) -> None:
     cfg = load_group_config(group_id)
@@ -587,6 +991,27 @@ def main() -> None:
 
     sub.add_parser("test-onebot")
 
+    p_bind_qq = sub.add_parser("bind-qq")
+    p_bind_qq.add_argument("--json", default="{}")
+    p_bind_tg = sub.add_parser("bind-telegram")
+    p_bind_tg.add_argument("--json", default="{}")
+    p_bind_wx = sub.add_parser("bind-wechat")
+    p_bind_wx.add_argument("--json", default="{}")
+    p_unbind = sub.add_parser("unbind-channel")
+    p_unbind.add_argument("--channel", required=True)
+    sub.add_parser("test-telegram")
+    p_tg_qr = sub.add_parser("telegram-qr-start")
+    p_tg_qr.add_argument("--json", default="{}")
+    sub.add_parser("telegram-qr-status")
+    sub.add_parser("telegram-qr-cancel")
+    p_tg_2fa = sub.add_parser("telegram-qr-2fa")
+    p_tg_2fa.add_argument("--json", default="{}")
+    sub.add_parser("telegram-detect")
+    sub.add_parser("wechat-detect")
+    sub.add_parser("wechat-scan-keys")
+    sub.add_parser("pull-telegram-groups")
+    sub.add_parser("pull-wechat-groups")
+
     args = parser.parse_args()
     if args.cmd == "list-groups":
         cmd_list_groups(args.sort, args.q)
@@ -614,6 +1039,34 @@ def main() -> None:
         cmd_test_provider(args.provider_id, args.model)
     elif args.cmd == "test-onebot":
         cmd_test_onebot()
+    elif args.cmd == "bind-qq":
+        cmd_bind_qq(args.json)
+    elif args.cmd == "bind-telegram":
+        cmd_bind_telegram(args.json)
+    elif args.cmd == "bind-wechat":
+        cmd_bind_wechat(args.json)
+    elif args.cmd == "unbind-channel":
+        cmd_unbind_channel(args.channel)
+    elif args.cmd == "test-telegram":
+        cmd_test_telegram()
+    elif args.cmd == "telegram-qr-start":
+        cmd_telegram_qr_start(args.json)
+    elif args.cmd == "telegram-qr-status":
+        cmd_telegram_qr_status()
+    elif args.cmd == "telegram-qr-cancel":
+        cmd_telegram_qr_cancel()
+    elif args.cmd == "telegram-qr-2fa":
+        cmd_telegram_qr_2fa(args.json)
+    elif args.cmd == "telegram-detect":
+        cmd_telegram_detect()
+    elif args.cmd == "wechat-detect":
+        cmd_wechat_detect()
+    elif args.cmd == "wechat-scan-keys":
+        cmd_wechat_scan_keys()
+    elif args.cmd == "pull-telegram-groups":
+        cmd_pull_telegram_groups()
+    elif args.cmd == "pull-wechat-groups":
+        cmd_pull_wechat_groups()
 
 
 if __name__ == "__main__":

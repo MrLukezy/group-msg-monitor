@@ -1050,6 +1050,7 @@ input::placeholder, textarea::placeholder {
 }
 
 .group-item {
+  position: relative;
   display: grid;
   grid-template-columns: 1fr auto;
   gap: 10px;
@@ -1070,12 +1071,23 @@ input::placeholder, textarea::placeholder {
   box-shadow: 0 0 20px color-mix(in srgb, var(--accent-2) 10%, transparent);
 }
 .group-item:active { transform: scale(0.995); }
-.group-item .name { font-weight: 600; color: var(--text); }
+.group-item.has-unread {
+  border-color: color-mix(in srgb, var(--red) 35%, var(--border));
+}
+.group-item .name {
+  font-weight: 600;
+  color: var(--text);
+  padding-right: 24px;
+}
 .group-item .meta {
   font-size: 12px;
   color: var(--text-muted);
   font-family: "IBM Plex Mono", "SF Mono", Menlo, Consolas, monospace;
   margin-top: 4px;
+}
+.group-item .group-unread-badge {
+  top: 10px;
+  right: 10px;
 }
 
 .monitored-split {
@@ -1113,6 +1125,7 @@ input::placeholder, textarea::placeholder {
 }
 
 .monitored-group-item {
+  position: relative;
   display: flex;
   flex-direction: column;
   gap: 4px;
@@ -1136,10 +1149,14 @@ input::placeholder, textarea::placeholder {
   background: color-mix(in srgb, var(--accent-2) 12%, var(--bg-2));
   box-shadow: inset 3px 0 0 var(--accent-2);
 }
+.monitored-group-item.has-unread {
+  border-color: color-mix(in srgb, var(--red) 40%, var(--border));
+}
 .monitored-group-item .name {
   font-weight: 600;
   color: var(--text);
   font-size: 13px;
+  padding-right: 28px;
 }
 .monitored-group-item .meta {
   font-size: 11px;
@@ -1149,6 +1166,27 @@ input::placeholder, textarea::placeholder {
 .monitored-group-item .badges {
   margin-top: 4px;
   justify-content: flex-start;
+}
+.group-unread-badge {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  min-width: 18px;
+  height: 18px;
+  padding: 0 5px;
+  border-radius: 999px;
+  background: var(--red);
+  color: #fff;
+  font-size: 11px;
+  font-weight: 700;
+  line-height: 18px;
+  text-align: center;
+  box-shadow: 0 0 0 2px var(--bg-2);
+  pointer-events: none;
+  z-index: 1;
+}
+.monitored-group-item.active .group-unread-badge {
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent-2) 12%, var(--bg-2));
 }
 
 .monitored-reports-pane {
@@ -1176,6 +1214,7 @@ input::placeholder, textarea::placeholder {
 }
 
 .report-title-item {
+  position: relative;
   display: flex;
   flex-direction: column;
   gap: 4px;
@@ -1202,6 +1241,29 @@ input::placeholder, textarea::placeholder {
 .report-title-item.skipped {
   border-color: color-mix(in srgb, var(--orange) 40%, transparent);
   background: color-mix(in srgb, var(--orange) 8%, var(--bg-2));
+}
+.report-title-item.is-unread {
+  border-color: color-mix(in srgb, var(--red) 38%, var(--border));
+  box-shadow: inset 3px 0 0 var(--red);
+}
+.report-title-item.is-unread .report-title-text {
+  padding-right: 18px;
+}
+.report-unread-dot {
+  position: absolute;
+  top: 12px;
+  right: 12px;
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  background: var(--red);
+  box-shadow: 0 0 0 2px var(--bg-2), 0 0 8px color-mix(in srgb, var(--red) 50%, transparent);
+  pointer-events: none;
+}
+.report-title-item.high .report-unread-dot,
+.report-title-item.is-unread .report-unread-dot {
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--red) 10%, var(--bg-2)),
+    0 0 8px color-mix(in srgb, var(--red) 50%, transparent);
 }
 .report-title-text {
   font-weight: 600;
@@ -1449,6 +1511,76 @@ input::placeholder, textarea::placeholder {
   font-weight: 600;
   color: var(--text);
 }
+
+.channel-card {
+  margin: 0 0 18px;
+  padding: 16px 16px 14px;
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  background: color-mix(in srgb, var(--bg-2) 88%, transparent);
+}
+.channel-card-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 12px;
+}
+.channel-title {
+  margin: 0 0 4px;
+  font-size: 16px;
+  font-weight: 700;
+}
+.channel-status {
+  margin: 0;
+  font-size: 12px;
+  color: var(--text-muted);
+  line-height: 1.45;
+}
+.channel-badge {
+  flex: none;
+  padding: 4px 10px;
+  border-radius: 999px;
+  font-size: 12px;
+  border: 1px solid var(--border);
+  color: var(--text-muted);
+}
+.channel-badge.on {
+  color: var(--accent);
+  border-color: color-mix(in srgb, var(--accent) 55%, var(--border));
+  background: color-mix(in srgb, var(--accent) 14%, transparent);
+}
+.channel-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 4px;
+}
+.channel-tag {
+  display: inline-block;
+  padding: 1px 6px;
+  border-radius: 6px;
+  font-size: 11px;
+  color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 12%, transparent);
+  border: 1px solid color-mix(in srgb, var(--accent) 35%, transparent);
+}
+.tg-qr-box {
+  margin: 10px 0 14px;
+  padding: 12px;
+  border: 1px dashed var(--border);
+  border-radius: 12px;
+  text-align: center;
+  background: color-mix(in srgb, var(--bg) 70%, transparent);
+}
+.tg-qr-box img {
+  width: 180px;
+  height: 180px;
+  object-fit: contain;
+  background: #fff;
+  border-radius: 8px;
+}
+.tg-2fa-row { text-align: left; margin-top: 10px; }
 
 .provider-list {
   display: flex;

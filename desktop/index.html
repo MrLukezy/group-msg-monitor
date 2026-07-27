@@ -172,7 +172,7 @@
                 <input id="groups-q" type="search" placeholder="搜索群名 / 群号" />
                 <label class="check toolbar-check"><input id="groups-show-blocked" type="checkbox" /> 显示已屏蔽</label>
                 <button id="btn-refresh-groups" class="btn primary" type="button">刷新</button>
-                <button id="btn-pull-onebot-groups" class="btn" type="button">从 OneBot 拉取</button>
+                <button id="btn-pull-channel-groups" class="btn" type="button">拉取群列表</button>
               </div>
             </header>
             <div class="panel fill">
@@ -282,25 +282,108 @@
 
           <div class="panel settings-panel-wrap fill scroll">
             <div class="settings-tabs" id="settings-tabs">
-              <button class="settings-tab active" type="button" data-stab="onebot">OneBot</button>
+              <button class="settings-tab active" type="button" data-stab="channels">通道绑定</button>
               <button class="settings-tab" type="button" data-stab="llm">语言模型</button>
               <button class="settings-tab" type="button" data-stab="appearance">外观</button>
             </div>
 
-            <div id="stab-onebot" class="settings-body">
-              <div class="setting-item">
-                <label>OneBot WS 地址</label>
-                <input id="s-ws" placeholder="ws://127.0.0.1:3001" />
-              </div>
-              <div class="setting-item">
-                <label>Access Token</label>
-                <input id="s-token" type="password" placeholder="与 NapCat 一致" />
-              </div>
-              <div class="setting-item">
-                <button id="btn-test-onebot" class="btn ghost" type="button">测试 OneBot 连通性</button>
+            <div id="stab-channels" class="settings-body">
+              <p class="settings-desc">分别绑定消息来源。可同时启用多个通道；监听服务启动后按绑定状态接入。</p>
+
+              <div class="channel-card" data-channel="qq">
+                <div class="channel-card-head">
+                  <div>
+                    <h3 class="channel-title">QQ（NapCat / OneBot）</h3>
+                    <p class="channel-status" id="ch-qq-status">未绑定</p>
+                  </div>
+                  <span class="channel-badge" id="ch-qq-badge">未绑定</span>
+                </div>
+                <div class="setting-item">
+                  <label>OneBot WS 地址</label>
+                  <input id="s-ws" placeholder="ws://127.0.0.1:3001" />
+                </div>
+                <div class="setting-item">
+                  <label>Access Token</label>
+                  <input id="s-token" type="password" placeholder="与 NapCat 一致" />
+                </div>
+                <div class="channel-actions">
+                  <button id="btn-bind-qq" class="btn primary" type="button">绑定 QQ</button>
+                  <button id="btn-unbind-qq" class="btn" type="button">解绑</button>
+                  <button id="btn-test-onebot" class="btn ghost" type="button">测试连通</button>
+                  <button id="btn-pull-onebot-groups" class="btn ghost" type="button">拉取 QQ 群</button>
+                </div>
                 <div id="onebot-test-result" class="test-result" hidden></div>
               </div>
+
+              <div class="channel-card" data-channel="wechat">
+                <div class="channel-card-head">
+                  <div>
+                    <h3 class="channel-title">微信（本地登录库）</h3>
+                    <p class="channel-status" id="ch-wx-status">需本机 PC 微信保持登录</p>
+                  </div>
+                  <span class="channel-badge" id="ch-wx-badge">未绑定</span>
+                </div>
+                <div class="setting-item">
+                  <label>数据目录（可空，自动检测；自定义安装请手动填）</label>
+                  <input id="s-wx-dir" placeholder="…\xwechat_files\账号名（含 db_storage 的目录）" />
+                </div>
+                <div class="setting-item">
+                  <label>解密输出目录（可空）</label>
+                  <input id="s-wx-decrypted" placeholder="默认写入 data/wechat_decrypted" />
+                </div>
+                <p class="settings-desc">绑定会尝试从已登录微信进程提取密钥并解密本地库。请尽量以管理员身份运行桌面端。</p>
+                <div class="channel-actions">
+                  <button id="btn-bind-wechat" class="btn primary" type="button">绑定微信</button>
+                  <button id="btn-unbind-wechat" class="btn" type="button">解绑</button>
+                  <button id="btn-wx-detect" class="btn ghost" type="button">检测账号</button>
+                  <button id="btn-wx-scan-keys" class="btn ghost" type="button">扫描密钥</button>
+                  <button id="btn-pull-wechat-groups" class="btn ghost" type="button">拉取微信群</button>
+                </div>
+                <div id="wechat-bind-result" class="test-result" hidden></div>
+              </div>
+
+              <div class="channel-card" data-channel="telegram">
+                <div class="channel-card-head">
+                  <div>
+                    <h3 class="channel-title">Telegram（用户扫码）</h3>
+                    <p class="channel-status" id="ch-tg-status">个人账号登录，不使用 Bot</p>
+                  </div>
+                  <span class="channel-badge" id="ch-tg-badge">未绑定</span>
+                </div>
+                <div class="setting-item">
+                  <label>api_id</label>
+                  <input id="s-tg-api-id" placeholder="在 my.telegram.org 申请" />
+                </div>
+                <div class="setting-item">
+                  <label>api_hash</label>
+                  <input id="s-tg-api-hash" type="password" placeholder="在 my.telegram.org 申请" />
+                </div>
+                <p class="settings-desc">先填写 api_id / api_hash → 扫码登录（手机 Telegram 扫）→ 再点绑定。也可先「检测本地」查看是否已有 session / Desktop 数据。</p>
+                <div id="tg-qr-box" class="tg-qr-box hidden">
+                  <img id="tg-qr-img" alt="Telegram 登录二维码" />
+                  <p id="tg-qr-hint" class="field-hint">等待扫码…</p>
+                  <div class="setting-item tg-2fa-row hidden" id="tg-2fa-row">
+                    <label>两步验证密码</label>
+                    <div class="model-setting-row">
+                      <input id="s-tg-2fa" type="password" placeholder="二次密码" />
+                      <button id="btn-tg-2fa" class="btn primary" type="button">提交</button>
+                    </div>
+                  </div>
+                </div>
+                <div class="channel-actions">
+                  <button id="btn-tg-qr-start" class="btn primary" type="button">扫码登录</button>
+                  <button id="btn-tg-qr-cancel" class="btn" type="button">取消扫码</button>
+                  <button id="btn-bind-telegram" class="btn primary" type="button">绑定 Telegram</button>
+                  <button id="btn-unbind-telegram" class="btn" type="button">解绑</button>
+                  <button id="btn-tg-detect" class="btn ghost" type="button">检测本地</button>
+                  <button id="btn-test-telegram" class="btn ghost" type="button">检测 session</button>
+                  <button id="btn-pull-telegram-groups" class="btn ghost" type="button">拉取 TG 群</button>
+                </div>
+                <div id="telegram-test-result" class="test-result" hidden></div>
+              </div>
             </div>
+
+            <div id="stab-onebot" class="settings-body hidden" hidden></div>
 
             <div id="stab-llm" class="settings-body hidden">
               <div class="setting-item">

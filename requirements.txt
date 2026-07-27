@@ -4,6 +4,11 @@ pydantic>=2.5.0
 pydantic-settings>=2.1.0
 PyYAML>=6.0.1
 python-dotenv>=1.0.0
+cryptography>=42.0.0
+zstandard>=0.22.0
+telethon>=1.36.0
+qrcode>=7.4.2
+Pillow>=10.0.0
 # 可选：Cursor SDK（provider=cursor 时需要）
 # cursor-sdk
 # 可选：OpenCode 官方 Python 包（当前实现以 HTTP 为主）

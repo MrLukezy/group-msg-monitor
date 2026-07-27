@@ -48,7 +48,18 @@ def _extract_messages(payload: dict[str, Any]) -> list[dict[str, Any]]:
 
 async def pull_group_history(group_id: str, count: int = 100) -> dict[str, Any]:
     """拉取最近 count 条群消息并写入 SQLite，返回统计。"""
+    from app.channels.ids import channel_of_group_id
+
+    if channel_of_group_id(group_id) != "qq":
+        return {
+            "ok": False,
+            "inserted": 0,
+            "skipped": 0,
+            "message": "仅 QQ / OneBot 群支持主动拉取历史；微信与 Telegram 依赖实时监听",
+        }
     settings = load_app_settings()
+    if not settings.channels.qq.bound:
+        raise RuntimeError("QQ 通道未绑定")
     ws_url = build_ws_url(settings.onebot_ws_url, settings.onebot_access_token)
     count = max(1, min(int(count or 100), 200))
     store = StoreHandler(sqlite_path())
@@ -100,11 +111,14 @@ async def pull_group_history(group_id: str, count: int = 100) -> dict[str, Any]:
 
 
 async def pull_enabled_groups_history(count: int = 50) -> dict[str, Any]:
+    from app.channels.ids import channel_of_group_id
     from app.settings_store import list_group_configs
 
     results = []
     for cfg in list_group_configs():
         if cfg.blocked or not cfg.enabled:
+            continue
+        if (cfg.channel or channel_of_group_id(cfg.group_id)) != "qq":
             continue
         try:
             results.append(await pull_group_history(cfg.group_id, count=count))

@@ -1,4 +1,4 @@
-"""QQ 群消息实时监控服务入口。"""
+"""群消息实时监控服务入口（QQ / 微信 / Telegram）。"""
 
 from __future__ import annotations
 
@@ -11,6 +11,8 @@ import time
 from logging.handlers import RotatingFileHandler
 from typing import Any
 
+from app.channels.telegram import TelegramUserAdapter
+from app.channels.wechat import WechatLocalAdapter
 from app.config import Settings, load_settings
 from app.filters import matched_keywords
 from app.handlers.alert_handler import AlertHandler
@@ -18,7 +20,7 @@ from app.handlers.log_handler import LogHandler
 from app.handlers.store_handler import StoreHandler
 from app.history_sync import pull_enabled_groups_history
 from app.llm.service import run_group_summary
-from app.models import try_parse_group_message
+from app.models import GroupMessageEvent, try_parse_group_message
 from app.onebot_client import OneBotClient, build_ws_url
 from app.settings_store import (
     ROOT_DIR,
@@ -64,7 +66,6 @@ def acquire_singleton_lock() -> Any:
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     fh = open(lock_path, "a+", encoding="utf-8")
     try:
-        # Windows msvcrt.locking 要求文件至少有对应字节
         if fh.tell() == 0:
             fh.write("0")
             fh.flush()
@@ -126,13 +127,9 @@ class MonitorApp:
         )
         self._alert_cache: dict[str, AlertHandler] = {}
         self._llm_last_run: dict[str, float] = {}
-        self.client = OneBotClient(
-            ws_url=settings.onebot_ws_url,
-            access_token=settings.onebot_access_token,
-            on_event=self.on_event,
-            reconnect_min_delay=settings.reconnect_min_delay,
-            reconnect_max_delay=settings.reconnect_max_delay,
-        )
+        self.qq_client: OneBotClient | None = None
+        self.tg_adapter: TelegramUserAdapter | None = None
+        self.wx_adapter: WechatLocalAdapter | None = None
 
     def _allowed(self) -> set[str]:
         ids = enabled_group_ids()
@@ -140,14 +137,8 @@ class MonitorApp:
             return ids
         return self.settings.allowed_groups
 
-    async def on_event(self, raw: dict[str, Any]) -> None:
-        event = try_parse_group_message(raw)
-        if event is None:
-            return
-
+    async def handle_group_event(self, event: GroupMessageEvent) -> None:
         gcfg = load_group_config(event.group_id_str)
-
-        # 仅处理已启用监听、且未屏蔽的群
         if gcfg.blocked or not gcfg.enabled:
             return
 
@@ -169,6 +160,12 @@ class MonitorApp:
                         self._alert_cache[km.webhook_url] = alert
                     await alert.handle(event, hits)
 
+    async def on_onebot_event(self, raw: dict[str, Any]) -> None:
+        event = try_parse_group_message(raw)
+        if event is None:
+            return
+        await self.handle_group_event(event)
+
     async def llm_scheduler_loop(self) -> None:
         logger = logging.getLogger(__name__)
         while True:
@@ -176,7 +173,6 @@ class MonitorApp:
                 for cfg in list_group_configs():
                     if cfg.blocked or not cfg.enabled or not cfg.llm_monitor.enabled:
                         continue
-                    # 允许 1 分钟级调度；配置非法时回退到 60
                     every = int(cfg.llm_monitor.every_minutes or 60)
                     every = max(1, every)
                     last = self._llm_last_run.get(cfg.group_id, 0)
@@ -198,6 +194,14 @@ class MonitorApp:
                 logger.exception("LLM scheduler 异常")
             await asyncio.sleep(15)
 
+    def stop(self) -> None:
+        if self.qq_client is not None:
+            self.qq_client.stop()
+        if self.tg_adapter is not None:
+            self.tg_adapter.stop()
+        if self.wx_adapter is not None:
+            self.wx_adapter.stop()
+
     async def run(self) -> None:
         logger = logging.getLogger(__name__)
         allowed = self._allowed()
@@ -205,29 +209,81 @@ class MonitorApp:
             logger.warning("当前无启用监控群；可在桌面端群列表中启用")
 
         app_settings = load_app_settings()
-        ws = app_settings.onebot_ws_url or self.settings.onebot_ws_url
-        token = app_settings.onebot_access_token or self.settings.onebot_access_token
-        self.client.ws_url = build_ws_url(ws, token)
-        self.client.access_token = token
+        ch = app_settings.channels
+        tasks: list[Any] = [self.llm_scheduler_loop()]
+
+        # QQ / OneBot
+        if ch.qq.bound:
+            ws = app_settings.onebot_ws_url or self.settings.onebot_ws_url
+            token = app_settings.onebot_access_token or self.settings.onebot_access_token
+            self.qq_client = OneBotClient(
+                ws_url=ws,
+                access_token=token,
+                on_event=self.on_onebot_event,
+                reconnect_min_delay=self.settings.reconnect_min_delay,
+                reconnect_max_delay=self.settings.reconnect_max_delay,
+            )
+            self.qq_client.ws_url = build_ws_url(ws, token)
+            self.qq_client.access_token = token
+            tasks.append(self.qq_client.run_forever())
+            logger.info("通道 QQ 已启用 | ws=%s", ws)
+
+            async def _bootstrap_history() -> None:
+                try:
+                    result = await pull_enabled_groups_history(count=80)
+                    logger.info("启动补拉历史完成: %s", result)
+                except Exception:
+                    logger.exception("启动补拉历史失败")
+
+            tasks.append(_bootstrap_history())
+        else:
+            logger.info("通道 QQ 未绑定，跳过 OneBot")
+
+        # Telegram 用户 session
+        if ch.telegram.bound:
+            if ch.telegram.api_id and ch.telegram.api_hash:
+                try:
+                    self.tg_adapter = TelegramUserAdapter(
+                        api_id=ch.telegram.api_id,
+                        api_hash=ch.telegram.api_hash,
+                        on_message=self.handle_group_event,
+                    )
+                    tasks.append(self.tg_adapter.run_forever())
+                    logger.info(
+                        "通道 Telegram 已启用 | user=%s",
+                        ch.telegram.label or "(session)",
+                    )
+                except Exception:
+                    logger.exception("Telegram 用户适配器启动失败")
+            else:
+                logger.warning("Telegram 已绑定但缺少 api_id / api_hash")
+
+        # WeChat local
+        if ch.wechat.bound:
+            if not ch.wechat.data_dir and not ch.wechat.decrypted_dir:
+                logger.warning("微信已绑定但未配置 data_dir / decrypted_dir")
+            else:
+                self.wx_adapter = WechatLocalAdapter(
+                    data_dir=ch.wechat.data_dir,
+                    decrypted_dir=ch.wechat.decrypted_dir,
+                    keys_path=ch.wechat.keys_path,
+                    on_message=self.handle_group_event,
+                    poll_seconds=ch.wechat.poll_seconds,
+                )
+                tasks.append(self.wx_adapter.run_forever())
+                logger.info(
+                    "通道微信已启用 | data_dir=%s",
+                    ch.wechat.data_dir or ch.wechat.decrypted_dir,
+                )
+
+        if len(tasks) == 1:
+            logger.warning("未绑定任何消息通道；请在总配置中绑定 QQ / 微信 / Telegram")
 
         logger.info(
-            "监听启动 | 启用监听群=%s | ws=%s",
+            "监听启动 | 启用监听群=%s",
             sorted(allowed) if allowed else ["(未启用任何群)"],
-            ws,
         )
-
-        async def _bootstrap_history() -> None:
-            try:
-                result = await pull_enabled_groups_history(count=80)
-                logger.info("启动补拉历史完成: %s", result)
-            except Exception:
-                logger.exception("启动补拉历史失败")
-
-        await asyncio.gather(
-            self.client.run_forever(),
-            self.llm_scheduler_loop(),
-            _bootstrap_history(),
-        )
+        await asyncio.gather(*tasks)
 
 
 async def _amain() -> None:
@@ -237,7 +293,7 @@ async def _amain() -> None:
 
     def _request_stop() -> None:
         logging.getLogger(__name__).info("收到停止信号，正在退出…")
-        app.client.stop()
+        app.stop()
 
     if sys.platform == "win32":
         signal.signal(signal.SIGINT, lambda *_: _request_stop())

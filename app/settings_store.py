@@ -35,9 +35,43 @@ class UiSettings(BaseModel):
     theme: str = "midnight"  # midnight | daylight | ocean | forest | rose | graphite
 
 
+class QqChannelSettings(BaseModel):
+    bound: bool = False
+    label: str = ""
+    last_error: str = ""
+
+
+class WechatChannelSettings(BaseModel):
+    bound: bool = False
+    label: str = ""
+    last_error: str = ""
+    data_dir: str = ""
+    decrypted_dir: str = ""
+    keys_path: str = ""
+    poll_seconds: float = 1.0
+
+
+class TelegramChannelSettings(BaseModel):
+    bound: bool = False
+    label: str = ""
+    last_error: str = ""
+    api_id: int = 0
+    api_hash: str = ""
+    # 兼容旧配置字段（已废弃 Bot）
+    bot_token: str = ""
+    poll_timeout: int = 25
+
+
+class ChannelsSettings(BaseModel):
+    qq: QqChannelSettings = Field(default_factory=QqChannelSettings)
+    wechat: WechatChannelSettings = Field(default_factory=WechatChannelSettings)
+    telegram: TelegramChannelSettings = Field(default_factory=TelegramChannelSettings)
+
+
 class AppSettings(BaseModel):
     onebot_ws_url: str = "ws://127.0.0.1:3001"
     onebot_access_token: str = ""
+    channels: ChannelsSettings = Field(default_factory=ChannelsSettings)
     llm: LlmGlobalSettings = Field(default_factory=LlmGlobalSettings)
     ui: UiSettings = Field(default_factory=UiSettings)
 
@@ -71,6 +105,7 @@ class LlmMonitorConfig(BaseModel):
 class GroupConfig(BaseModel):
     group_id: str
     group_name: str = ""
+    channel: str = "qq"  # qq | wechat | telegram
     enabled: bool = False
     blocked: bool = False  # 屏蔽：不落库、不处理
     basic: GroupBasicConfig = Field(default_factory=GroupBasicConfig)
@@ -114,6 +149,19 @@ def default_app_settings() -> AppSettings:
     )
 
 
+def _migrate_channel_defaults(settings: AppSettings) -> AppSettings:
+    """兼容旧配置：已有 OneBot 地址则默认视为 QQ 已绑定。"""
+    changed = False
+    if not settings.channels.qq.bound and (settings.onebot_ws_url or settings.onebot_access_token):
+        settings.channels.qq.bound = True
+        if not settings.channels.qq.label:
+            settings.channels.qq.label = "OneBot / NapCat"
+        changed = True
+    if changed:
+        save_app_settings(settings)
+    return settings
+
+
 def load_app_settings() -> AppSettings:
     _ensure_dirs()
     if not SETTINGS_PATH.exists():
@@ -131,10 +179,12 @@ def load_app_settings() -> AppSettings:
                     settings.onebot_ws_url = v
                 elif k == "ONEBOT_ACCESS_TOKEN":
                     settings.onebot_access_token = v
+        settings = _migrate_channel_defaults(settings)
         save_app_settings(settings)
         return settings
     data = json.loads(SETTINGS_PATH.read_text(encoding="utf-8"))
-    return AppSettings.model_validate(data)
+    settings = AppSettings.model_validate(data)
+    return _migrate_channel_defaults(settings)
 
 
 def save_app_settings(settings: AppSettings) -> None:
@@ -153,8 +203,15 @@ def load_group_config(group_id: str) -> GroupConfig:
     _ensure_dirs()
     path = group_config_path(group_id)
     if not path.exists():
-        return GroupConfig(group_id=str(group_id))
-    return GroupConfig.model_validate(json.loads(path.read_text(encoding="utf-8")))
+        from app.channels.ids import channel_of_group_id
+
+        return GroupConfig(group_id=str(group_id), channel=channel_of_group_id(group_id))
+    cfg = GroupConfig.model_validate(json.loads(path.read_text(encoding="utf-8")))
+    if not cfg.channel:
+        from app.channels.ids import channel_of_group_id
+
+        cfg.channel = channel_of_group_id(cfg.group_id)
+    return cfg
 
 
 def save_group_config(cfg: GroupConfig) -> None:

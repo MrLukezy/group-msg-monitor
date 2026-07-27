@@ -14,6 +14,7 @@ type StatusInfo = {
 type GroupItem = {
   groupId: string;
   groupName: string;
+  channel?: string;
   enabled: boolean;
   blocked?: boolean;
   lastTime?: number | null;
@@ -44,9 +45,34 @@ type LlmProvider = {
   defaultModel: string;
 };
 
+type ChannelBindQQ = { bound: boolean; label?: string; lastError?: string };
+type ChannelBindWechat = {
+  bound: boolean;
+  label?: string;
+  lastError?: string;
+  dataDir?: string;
+  decryptedDir?: string;
+  keysPath?: string;
+  pollSeconds?: number;
+};
+type ChannelBindTelegram = {
+  bound: boolean;
+  label?: string;
+  lastError?: string;
+  apiId?: number;
+  apiHash?: string;
+  botToken?: string;
+  pollTimeout?: number;
+};
+
 type AppSettings = {
   onebotWsUrl: string;
   onebotAccessToken: string;
+  channels?: {
+    qq?: ChannelBindQQ;
+    wechat?: ChannelBindWechat;
+    telegram?: ChannelBindTelegram;
+  };
   llm: {
     providers: LlmProvider[];
     activeProviderId: string;
@@ -60,6 +86,7 @@ type AppSettings = {
 type GroupConfig = {
   groupId: string;
   groupName: string;
+  channel?: string;
   enabled: boolean;
   blocked?: boolean;
   basic: { logAll: boolean; storageEnabled: boolean };
@@ -172,6 +199,8 @@ let isCompactView = false;
 let selectedTheme = "midnight";
 let lastTipReportId = Number(localStorage.getItem(LAST_TIP_ID_KEY) || "0");
 let unreadCount = 0;
+let unreadByGroup = new Map<string, number>();
+let unreadReportIds = new Set<number>();
 
 function motionOk() {
   return !reduceMotion;
@@ -374,6 +403,15 @@ async function refreshUnreadBadge() {
       (!enabledIds.size || enabledIds.has(r.groupId)),
   );
   unreadCount = unread.length;
+  const byGroup = new Map<string, number>();
+  const unreadIds = new Set<number>();
+  for (const r of unread) {
+    if (r.id) unreadIds.add(r.id);
+    if (!r.groupId) continue;
+    byGroup.set(r.groupId, (byGroup.get(r.groupId) || 0) + 1);
+  }
+  unreadByGroup = byGroup;
+  unreadReportIds = unreadIds;
   const badge = $("monitored-unread-badge");
   const clearBtn = document.getElementById("btn-clear-unread") as HTMLButtonElement | null;
   if (badge) {
@@ -394,7 +432,71 @@ async function refreshUnreadBadge() {
       ? `未读 LLM 总结 ${unreadCount} 条`
       : "缩略模式 · 等待新的 LLM 分析";
   }
+  updateMonitoredGroupUnreadBadges();
+  updateReportTitleUnreadBadges();
   return unread;
+}
+
+function isReportUnread(reportId: number): boolean {
+  return !!reportId && unreadReportIds.has(reportId);
+}
+
+function reportUnreadDotHtml(reportId: number): string {
+  if (!isReportUnread(reportId)) return "";
+  return `<span class="report-unread-dot" title="未读"></span>`;
+}
+
+function updateReportTitleUnreadBadges() {
+  document.querySelectorAll<HTMLButtonElement>(".report-title-item").forEach((btn) => {
+    const id = Number(btn.dataset.id || 0);
+    const unread = isReportUnread(id);
+    btn.classList.toggle("is-unread", unread);
+    let dot = btn.querySelector<HTMLElement>(".report-unread-dot");
+    if (!unread) {
+      dot?.remove();
+      return;
+    }
+    if (!dot) {
+      dot = document.createElement("span");
+      dot.className = "report-unread-dot";
+      dot.title = "未读";
+      btn.appendChild(dot);
+    }
+  });
+}
+
+function groupUnreadCount(groupId: string): number {
+  return unreadByGroup.get(groupId) || 0;
+}
+
+function unreadBadgeHtml(count: number, extraClass = ""): string {
+  if (count <= 0) return "";
+  const text = count > 99 ? "99+" : String(count);
+  return `<span class="group-unread-badge ${extraClass}" title="未读 LLM ${text} 条">${text}</span>`;
+}
+
+function updateMonitoredGroupUnreadBadges() {
+  document
+    .querySelectorAll<HTMLButtonElement>("#monitored-group-list .monitored-group-item")
+    .forEach((btn) => {
+      const gid = btn.dataset.id || "";
+      const n = groupUnreadCount(gid);
+      let el = btn.querySelector<HTMLElement>(".group-unread-badge");
+      if (n <= 0) {
+        el?.remove();
+        btn.classList.toggle("has-unread", false);
+        return;
+      }
+      btn.classList.toggle("has-unread", true);
+      const text = n > 99 ? "99+" : String(n);
+      if (!el) {
+        el = document.createElement("span");
+        el.className = "group-unread-badge";
+        btn.appendChild(el);
+      }
+      el.textContent = text;
+      el.title = `未读 LLM ${text} 条`;
+    });
 }
 
 async function pollLlmTipsAndUnread() {
@@ -460,13 +562,67 @@ function switchTab(name: string) {
   }
 }
 
+function channelLabel(ch?: string) {
+  const c = (ch || "qq").toLowerCase();
+  if (c === "wechat" || c === "wx") return "微信";
+  if (c === "telegram" || c === "tg") return "TG";
+  return "QQ";
+}
+
+function guessChannel(groupId: string, explicit?: string) {
+  if (explicit) return explicit;
+  if (groupId.startsWith("wx:") || groupId.startsWith("wechat:")) return "wechat";
+  if (groupId.startsWith("tg:") || groupId.startsWith("telegram:")) return "telegram";
+  return "qq";
+}
+
 function switchSettingsTab(name: string) {
   document.querySelectorAll(".settings-tab").forEach((t) => {
     t.classList.toggle("active", (t as HTMLElement).dataset.stab === name);
   });
-  $("stab-onebot").classList.toggle("hidden", name !== "onebot");
+  const channelsEl = document.getElementById("stab-channels");
+  if (channelsEl) channelsEl.classList.toggle("hidden", name !== "channels");
+  const onebotEl = document.getElementById("stab-onebot");
+  if (onebotEl) onebotEl.classList.toggle("hidden", true);
   $("stab-llm").classList.toggle("hidden", name !== "llm");
   $("stab-appearance").classList.toggle("hidden", name !== "appearance");
+}
+
+function renderChannelBindings(settings?: AppSettings | null) {
+  const s = settings || settingsCache;
+  const qq = s?.channels?.qq;
+  const wx = s?.channels?.wechat;
+  const tg = s?.channels?.telegram;
+
+  const setBadge = (id: string, bound: boolean) => {
+    const el = document.getElementById(id);
+    if (!el) return;
+    el.textContent = bound ? "已绑定" : "未绑定";
+    el.classList.toggle("on", bound);
+  };
+  setBadge("ch-qq-badge", !!qq?.bound);
+  setBadge("ch-wx-badge", !!wx?.bound);
+  setBadge("ch-tg-badge", !!tg?.bound);
+
+  const qqStatus = document.getElementById("ch-qq-status");
+  if (qqStatus) {
+    qqStatus.textContent = qq?.bound
+      ? `已绑定${qq.label ? ` · ${qq.label}` : ""}`
+      : "未绑定 · 需 NapCat OneBot WS";
+  }
+  const wxStatus = document.getElementById("ch-wx-status");
+  if (wxStatus) {
+    wxStatus.textContent = wx?.bound
+      ? `已绑定${wx.label ? ` · ${wx.label}` : ""} · 需保持 PC 微信登录`
+      : "未绑定 · 需本机 PC 微信保持登录";
+    if (wx?.lastError) wxStatus.textContent += ` · ${wx.lastError}`;
+  }
+  const tgStatus = document.getElementById("ch-tg-status");
+  if (tgStatus) {
+    tgStatus.textContent = tg?.bound
+      ? `已绑定${tg.label ? ` · ${tg.label}` : ""} · 用户账号`
+      : "未绑定 · 扫码登录个人号（非 Bot）";
+  }
 }
 
 async function refreshStatus() {
@@ -578,6 +734,7 @@ async function refreshGroups() {
   const res = await invoke<{ groups: GroupItem[] }>("api_list_groups", { sort, q });
   groupsCache = res.groups || [];
   rememberGroupNames(groupsCache);
+  await refreshUnreadBadge().catch(() => undefined);
   const box = $("groups-list");
   const visible = showBlocked
     ? groupsCache
@@ -586,7 +743,7 @@ async function refreshGroups() {
     box.innerHTML = `<div class="empty">${
       groupsCache.some((g) => g.blocked) && !showBlocked
         ? "当前列表已隐藏屏蔽群。勾选「显示已屏蔽」可查看。"
-        : "暂无群。可先启动监听收消息，或点「从 OneBot 拉取」。"
+        : "暂无群。可先绑定通道后点「拉取群列表」，或启动监听收消息。"
     }</div>`;
     return;
   }
@@ -596,13 +753,18 @@ async function refreshGroups() {
         ? new Date(g.lastTime * 1000).toLocaleString()
         : "暂无消息";
       const name = groupDisplayName(g.groupId, g.groupName);
+      const ch = guessChannel(g.groupId, g.channel);
+      const unread = g.enabled && !g.blocked ? groupUnreadCount(g.groupId) : 0;
       const statusBadge = g.blocked
         ? `<span class="badge blocked">已屏蔽</span>`
         : `<span class="badge ${g.enabled ? "on" : ""}">${g.enabled ? "监听中" : "未启用"}</span>`;
-      return `<button class="group-item ${g.blocked ? "is-blocked" : ""}" type="button" data-id="${escapeHtml(g.groupId)}">
+      return `<button class="group-item ${g.blocked ? "is-blocked" : ""} ${
+        unread > 0 ? "has-unread" : ""
+      }" type="button" data-id="${escapeHtml(g.groupId)}">
+        ${unreadBadgeHtml(unread)}
         <div>
           <div class="name">${escapeHtml(name)}</div>
-          <div class="meta">群号 ${escapeHtml(g.groupId)} · 最近 ${escapeHtml(last)} · ${g.msgCount} 条</div>
+          <div class="meta"><span class="channel-tag">${escapeHtml(channelLabel(ch))}</span> · ${escapeHtml(g.groupId)} · 最近 ${escapeHtml(last)} · ${g.msgCount} 条</div>
         </div>
         <div class="badges">
           ${statusBadge}
@@ -650,9 +812,11 @@ function renderMonitoredReportList(reports: ReportRow[]) {
     .map((r) => {
       const risk = (r.riskMax || "none").toLowerCase();
       const skipped = (r.headline || "").includes("[定时跳过]");
+      const unread = !skipped && isReportUnread(r.id);
       return `<button class="report-title-item ${risk === "high" ? "high" : ""} ${
         skipped ? "skipped" : ""
-      }" type="button" data-id="${r.id}">
+      } ${unread ? "is-unread" : ""}" type="button" data-id="${r.id}">
+        ${reportUnreadDotHtml(unread ? r.id : 0)}
         <div class="report-title-text">${escapeHtml(r.headline || "(无标题)")}</div>
         <div class="report-title-meta">${escapeHtml(r.createdAt || "")} · 风险 ${escapeHtml(
           r.riskMax || "-",
@@ -793,9 +957,12 @@ async function refreshMonitored() {
         : "暂无消息";
       const name = groupDisplayName(g.groupId, g.groupName);
       const active = g.groupId === monitoredSelectedGroupId ? "active" : "";
-      return `<button class="monitored-group-item ${active}" type="button" data-id="${escapeHtml(
+      const unread = groupUnreadCount(g.groupId);
+      const unreadCls = unread > 0 ? "has-unread" : "";
+      return `<button class="monitored-group-item ${active} ${unreadCls}" type="button" data-id="${escapeHtml(
         g.groupId,
       )}">
+        ${unreadBadgeHtml(unread)}
         <div class="name">${escapeHtml(name)}</div>
         <div class="meta">群号 ${escapeHtml(g.groupId)}</div>
         <div class="meta">${escapeHtml(last)} · ${g.msgCount} 条</div>
@@ -812,6 +979,8 @@ async function refreshMonitored() {
       selectMonitoredGroup(btn.dataset.id || "").catch((e) => toast(String(e), true));
     };
   });
+
+  await refreshUnreadBadge().catch(() => undefined);
 
   if (monitoredSelectedGroupId) {
     await selectMonitoredGroup(monitoredSelectedGroupId);
@@ -1095,9 +1264,35 @@ async function persistSettingsFromForm(): Promise<AppSettings> {
       p.id === active.id ? { ...p, defaultModel: model } : p,
     );
   }
+  const prev = settingsCache.channels || {};
   const next: AppSettings = {
     onebotWsUrl: $<HTMLInputElement>("s-ws").value.trim(),
     onebotAccessToken: $<HTMLInputElement>("s-token").value.trim(),
+    channels: {
+      qq: {
+        bound: !!prev.qq?.bound,
+        label: prev.qq?.label || "",
+        lastError: prev.qq?.lastError || "",
+      },
+      wechat: {
+        bound: !!prev.wechat?.bound,
+        label: prev.wechat?.label || "",
+        lastError: prev.wechat?.lastError || "",
+        dataDir: $<HTMLInputElement>("s-wx-dir").value.trim(),
+        decryptedDir: $<HTMLInputElement>("s-wx-decrypted").value.trim(),
+        keysPath: prev.wechat?.keysPath || "",
+        pollSeconds: prev.wechat?.pollSeconds ?? 1,
+      },
+      telegram: {
+        bound: !!prev.telegram?.bound,
+        label: prev.telegram?.label || "",
+        lastError: prev.telegram?.lastError || "",
+        apiId: Number($<HTMLInputElement>("s-tg-api-id").value.trim() || 0),
+        apiHash: $<HTMLInputElement>("s-tg-api-hash").value.trim(),
+        botToken: "",
+        pollTimeout: prev.telegram?.pollTimeout ?? 25,
+      },
+    },
     llm: {
       activeProviderId: settingsCache.llm.activeProviderId,
       providers: settingsCache.llm.providers,
@@ -1110,6 +1305,7 @@ async function persistSettingsFromForm(): Promise<AppSettings> {
   await invoke("api_save_settings", { settings: next });
   settingsCache = next;
   applyTheme(selectedTheme);
+  renderChannelBindings(next);
   return next;
 }
 
@@ -1180,7 +1376,7 @@ async function openGroup(groupId: string) {
   const displayName = groupDisplayName(groupId, cfg.groupName);
   if (cfg.groupName) groupNameMap.set(groupId, cfg.groupName);
   $("detail-title").textContent = displayName;
-  $("detail-sub").textContent = `群号 ${groupId}`;
+  $("detail-sub").textContent = `${channelLabel(guessChannel(groupId, cfg.channel))} · ${groupId}`;
 
   $<HTMLInputElement>("g-blocked").checked = !!cfg.blocked;
   $<HTMLInputElement>("g-enabled").checked = !!cfg.enabled && !cfg.blocked;
@@ -1223,9 +1419,11 @@ async function openGroup(groupId: string) {
       .map((r) => {
         const risk = (r.riskMax || "none").toLowerCase();
         const skipped = (r.headline || "").includes("[定时跳过]");
+        const unread = !skipped && isReportUnread(r.id);
         return `<button class="report-title-item ${risk === "high" ? "high" : ""} ${
           skipped ? "skipped" : ""
-        }" type="button" data-id="${r.id}">
+        } ${unread ? "is-unread" : ""}" type="button" data-id="${r.id}">
+          ${reportUnreadDotHtml(unread ? r.id : 0)}
           <div class="report-title-text">${escapeHtml(r.headline || "(无标题)")}</div>
           <div class="report-title-meta">${escapeHtml(r.createdAt || "")} · 风险 ${escapeHtml(
             r.riskMax || "-",
@@ -1264,9 +1462,11 @@ function readGroupForm(): GroupConfig {
   const groupId = currentGroupId || "";
   const blocked = $<HTMLInputElement>("g-blocked").checked;
   const enabled = !blocked && $<HTMLInputElement>("g-enabled").checked;
+  const cached = groupsCache.find((g) => g.groupId === groupId);
   return {
     groupId,
     groupName: $<HTMLInputElement>("g-name").value.trim(),
+    channel: guessChannel(groupId, cached?.channel),
     enabled,
     blocked,
     basic: {
@@ -1298,13 +1498,19 @@ async function loadSettingsView() {
   settingsCache = await invoke<AppSettings>("api_get_settings");
   $<HTMLInputElement>("s-ws").value = settingsCache.onebotWsUrl || "";
   $<HTMLInputElement>("s-token").value = settingsCache.onebotAccessToken || "";
+  $<HTMLInputElement>("s-wx-dir").value = settingsCache.channels?.wechat?.dataDir || "";
+  $<HTMLInputElement>("s-wx-decrypted").value =
+    settingsCache.channels?.wechat?.decryptedDir || "";
+  $<HTMLInputElement>("s-tg-api-id").value = String(settingsCache.channels?.telegram?.apiId || "");
+  $<HTMLInputElement>("s-tg-api-hash").value = settingsCache.channels?.telegram?.apiHash || "";
   $<HTMLInputElement>("s-compact-mode").checked = !!settingsCache.ui?.compactModeEnabled;
   applyTheme(settingsCache.ui?.theme || "midnight");
+  renderChannelBindings(settingsCache);
   const active = activeProvider();
   settingsModelOptions = active?.defaultModel ? [{ id: active.defaultModel }] : [];
   fillModelSelect("s-default-model", settingsModelOptions, active?.defaultModel || "");
   renderProviderList();
-  switchSettingsTab("llm");
+  switchSettingsTab("channels");
 }
 
 async function tick() {
@@ -1403,7 +1609,7 @@ window.addEventListener("DOMContentLoaded", async () => {
 
   document.querySelectorAll(".settings-tab").forEach((btn) => {
     (btn as HTMLButtonElement).onclick = () => {
-      switchSettingsTab((btn as HTMLElement).dataset.stab || "onebot");
+      switchSettingsTab((btn as HTMLElement).dataset.stab || "channels");
     };
   });
 
@@ -1461,9 +1667,336 @@ window.addEventListener("DOMContentLoaded", async () => {
   $("groups-q").onkeydown = (ev) => {
     if (ev.key === "Enter") refreshGroups().catch((e) => toast(String(e), true));
   };
-  $("btn-pull-onebot-groups").onclick = async () => {
+  $("btn-pull-channel-groups").onclick = async () => {
     try {
-      toast(await invoke<string>("pull_onebot_groups"));
+      const parts: string[] = [];
+      if (settingsCache?.channels?.qq?.bound || !settingsCache?.channels) {
+        try {
+          parts.push(await invoke<string>("pull_onebot_groups"));
+        } catch (e) {
+          parts.push(`QQ: ${e}`);
+        }
+      }
+      if (settingsCache?.channels?.wechat?.bound) {
+        const res = await invoke<{ ok?: boolean; message?: string }>("api_pull_wechat_groups");
+        parts.push(res.message || (res.ok ? "微信群已拉取" : "微信拉取失败"));
+      }
+      if (settingsCache?.channels?.telegram?.bound) {
+        const res = await invoke<{ ok?: boolean; message?: string }>("api_pull_telegram_groups");
+        parts.push(res.message || (res.ok ? "TG 群已拉取" : "TG 拉取失败"));
+      }
+      toast(parts.filter(Boolean).join("；") || "请先在总配置绑定通道");
+      await refreshGroups();
+    } catch (e) {
+      toast(String(e), true);
+    }
+  };
+  $("btn-bind-qq").onclick = async () => {
+    try {
+      await persistSettingsFromForm();
+      const res = await invoke<{ ok?: boolean; message?: string; channels?: AppSettings["channels"] }>(
+        "api_bind_qq",
+        {
+          payload: {
+            onebotWsUrl: $<HTMLInputElement>("s-ws").value.trim(),
+            onebotAccessToken: $<HTMLInputElement>("s-token").value.trim(),
+          },
+        },
+      );
+      if (res.channels && settingsCache) settingsCache.channels = res.channels;
+      renderChannelBindings(settingsCache);
+      showTestResult("onebot-test-result", !!res.ok, res.message || "");
+      toast(res.message || "QQ 已绑定", !res.ok);
+    } catch (e) {
+      toast(String(e), true);
+    }
+  };
+  $("btn-unbind-qq").onclick = async () => {
+    try {
+      const res = await invoke<{ ok?: boolean; message?: string; channels?: AppSettings["channels"] }>(
+        "api_unbind_channel",
+        { channel: "qq" },
+      );
+      if (res.channels && settingsCache) settingsCache.channels = res.channels;
+      renderChannelBindings(settingsCache);
+      toast(res.message || "已解绑 QQ", !res.ok);
+    } catch (e) {
+      toast(String(e), true);
+    }
+  };
+  $("btn-bind-wechat").onclick = async () => {
+    try {
+      await persistSettingsFromForm();
+      showTestResult("wechat-bind-result", true, "正在绑定微信（扫 key / 解密）…");
+      const res = await invoke<{
+        ok?: boolean;
+        message?: string;
+        channels?: AppSettings["channels"];
+      }>("api_bind_wechat", {
+        payload: {
+          dataDir: $<HTMLInputElement>("s-wx-dir").value.trim(),
+          scanKeys: true,
+        },
+      });
+      if (res.channels && settingsCache) {
+        settingsCache.channels = res.channels;
+        $<HTMLInputElement>("s-wx-dir").value = res.channels.wechat?.dataDir || "";
+        $<HTMLInputElement>("s-wx-decrypted").value = res.channels.wechat?.decryptedDir || "";
+      }
+      renderChannelBindings(settingsCache);
+      showTestResult("wechat-bind-result", !!res.ok, res.message || "");
+      toast(res.message || "微信绑定完成", !res.ok);
+      await refreshGroups();
+    } catch (e) {
+      showTestResult("wechat-bind-result", false, String(e));
+      toast(String(e), true);
+    }
+  };
+  $("btn-unbind-wechat").onclick = async () => {
+    try {
+      const res = await invoke<{ ok?: boolean; message?: string; channels?: AppSettings["channels"] }>(
+        "api_unbind_channel",
+        { channel: "wechat" },
+      );
+      if (res.channels && settingsCache) settingsCache.channels = res.channels;
+      renderChannelBindings(settingsCache);
+      toast(res.message || "已解绑微信", !res.ok);
+    } catch (e) {
+      toast(String(e), true);
+    }
+  };
+  $("btn-wx-detect").onclick = async () => {
+    try {
+      const res = await invoke<{
+        ok?: boolean;
+        message?: string;
+        accounts?: { data_dir?: string; account?: string; root?: string }[];
+        roots?: string[];
+      }>("api_wechat_detect");
+      const first = res.accounts?.[0];
+      if (first?.data_dir) $<HTMLInputElement>("s-wx-dir").value = first.data_dir;
+      const lines = [
+        res.message || "",
+        ...(res.accounts || []).map(
+          (a) => `账号 ${a.account || ""} → ${a.data_dir || ""}`,
+        ),
+        res.roots?.length ? `扫描根目录：\n${res.roots.join("\n")}` : "",
+      ].filter(Boolean);
+      showTestResult("wechat-bind-result", !!(res.accounts && res.accounts.length), lines.join("\n"));
+      toast(res.message || "检测完成", !(res.accounts && res.accounts.length));
+    } catch (e) {
+      toast(String(e), true);
+    }
+  };
+  $("btn-wx-scan-keys").onclick = async () => {
+    try {
+      showTestResult("wechat-bind-result", true, "正在扫描微信进程密钥…");
+      const res = await invoke<{ ok?: boolean; message?: string }>("api_wechat_scan_keys");
+      showTestResult("wechat-bind-result", !!res.ok, res.message || "");
+      toast(res.message || "扫 key 完成", !res.ok);
+    } catch (e) {
+      showTestResult("wechat-bind-result", false, String(e));
+      toast(String(e), true);
+    }
+  };
+  $("btn-pull-wechat-groups").onclick = async () => {
+    try {
+      const res = await invoke<{ ok?: boolean; message?: string }>("api_pull_wechat_groups");
+      toast(res.message || "微信群已拉取", !res.ok);
+      await refreshGroups();
+    } catch (e) {
+      toast(String(e), true);
+    }
+  };
+  $("btn-bind-telegram").onclick = async () => {
+    try {
+      await persistSettingsFromForm();
+      const res = await invoke<{
+        ok?: boolean;
+        message?: string;
+        need_qr?: boolean;
+        channels?: AppSettings["channels"];
+      }>("api_bind_telegram", {
+        payload: {
+          apiId: Number($<HTMLInputElement>("s-tg-api-id").value.trim() || 0),
+          apiHash: $<HTMLInputElement>("s-tg-api-hash").value.trim(),
+        },
+      });
+      if (res.channels && settingsCache) settingsCache.channels = res.channels;
+      renderChannelBindings(settingsCache);
+      showTestResult("telegram-test-result", !!res.ok, res.message || "");
+      toast(res.message || "Telegram 已绑定", !res.ok);
+      if (res.ok) await refreshGroups();
+    } catch (e) {
+      toast(String(e), true);
+    }
+  };
+  $("btn-unbind-telegram").onclick = async () => {
+    try {
+      const res = await invoke<{ ok?: boolean; message?: string; channels?: AppSettings["channels"] }>(
+        "api_unbind_channel",
+        { channel: "telegram" },
+      );
+      if (res.channels && settingsCache) settingsCache.channels = res.channels;
+      renderChannelBindings(settingsCache);
+      toast(res.message || "已解绑 Telegram", !res.ok);
+    } catch (e) {
+      toast(String(e), true);
+    }
+  };
+  let tgQrTimer = 0;
+  const stopTgQrPoll = () => {
+    if (tgQrTimer) {
+      window.clearInterval(tgQrTimer);
+      tgQrTimer = 0;
+    }
+  };
+  const applyTgQrStatus = (st: {
+    status?: string;
+    message?: string;
+    qr_png_base64?: string;
+    url?: string;
+  }) => {
+    const box = $("tg-qr-box");
+    const img = $<HTMLImageElement>("tg-qr-img");
+    const hint = $("tg-qr-hint");
+    const row2fa = $("tg-2fa-row");
+    const status = st.status || "idle";
+    if (status === "waiting_scan" || status === "starting" || status === "need_password") {
+      box.classList.remove("hidden");
+    }
+    if (st.qr_png_base64) {
+      img.src = `data:image/png;base64,${st.qr_png_base64}`;
+      img.hidden = false;
+    } else if (status === "starting") {
+      img.hidden = true;
+    }
+    hint.textContent = st.message || status;
+    row2fa.classList.toggle("hidden", status !== "need_password");
+    if (status === "authorized") {
+      showTestResult("telegram-test-result", true, st.message || "扫码成功");
+      stopTgQrPoll();
+      // 扫码成功后自动绑定
+      invoke<{ ok?: boolean; message?: string; channels?: AppSettings["channels"] }>(
+        "api_bind_telegram",
+        {
+          payload: {
+            apiId: Number($<HTMLInputElement>("s-tg-api-id").value.trim() || 0),
+            apiHash: $<HTMLInputElement>("s-tg-api-hash").value.trim(),
+          },
+        },
+      )
+        .then((res) => {
+          if (res.channels && settingsCache) settingsCache.channels = res.channels;
+          renderChannelBindings(settingsCache);
+          showTestResult(
+            "telegram-test-result",
+            !!res.ok,
+            res.message || st.message || "已绑定",
+          );
+          toast(res.message || "Telegram 已绑定", !res.ok);
+          if (res.ok) refreshGroups().catch(() => undefined);
+        })
+        .catch((e) => toast(String(e), true));
+    } else if (status === "error") {
+      showTestResult("telegram-test-result", false, st.message || "扫码失败");
+      stopTgQrPoll();
+    }
+  };
+  $("btn-tg-qr-start").onclick = async () => {
+    try {
+      await persistSettingsFromForm();
+      stopTgQrPoll();
+      $("tg-qr-box").classList.remove("hidden");
+      $("tg-qr-hint").textContent = "正在启动扫码…";
+      const res = await invoke<{ ok?: boolean; message?: string }>("api_telegram_qr_start", {
+        payload: {
+          apiId: Number($<HTMLInputElement>("s-tg-api-id").value.trim() || 0),
+          apiHash: $<HTMLInputElement>("s-tg-api-hash").value.trim(),
+        },
+      });
+      if (!res.ok) {
+        showTestResult("telegram-test-result", false, res.message || "启动失败");
+        toast(res.message || "启动扫码失败", true);
+        return;
+      }
+      toast("请用手机 Telegram 扫码");
+      tgQrTimer = window.setInterval(() => {
+        invoke<{
+          status?: string;
+          message?: string;
+          qr_png_base64?: string;
+          url?: string;
+        }>("api_telegram_qr_status")
+          .then(applyTgQrStatus)
+          .catch(() => undefined);
+      }, 1200);
+    } catch (e) {
+      toast(String(e), true);
+    }
+  };
+  $("btn-tg-qr-cancel").onclick = async () => {
+    try {
+      stopTgQrPoll();
+      await invoke("api_telegram_qr_cancel");
+      $("tg-qr-box").classList.add("hidden");
+      toast("已取消扫码");
+    } catch (e) {
+      toast(String(e), true);
+    }
+  };
+  $("btn-tg-2fa").onclick = async () => {
+    try {
+      const password = $<HTMLInputElement>("s-tg-2fa").value.trim();
+      const res = await invoke<{ ok?: boolean; message?: string }>("api_telegram_qr_2fa", {
+        payload: { password },
+      });
+      toast(res.message || "已提交密码", !res.ok);
+    } catch (e) {
+      toast(String(e), true);
+    }
+  };
+  $("btn-tg-detect").onclick = async () => {
+    try {
+      const res = await invoke<{
+        ok?: boolean;
+        message?: string;
+        local?: { path?: string; note?: string }[];
+        session?: { authorized?: boolean; message?: string };
+      }>("api_telegram_detect");
+      const lines = [
+        res.message || "",
+        ...(res.local || []).map((x) => `${x.path || ""} — ${x.note || ""}`),
+        res.session?.message || "",
+      ].filter(Boolean);
+      showTestResult("telegram-test-result", !!res.ok, lines.join("\n"));
+      toast(res.message || "检测完成", !res.ok);
+    } catch (e) {
+      toast(String(e), true);
+    }
+  };
+  $("btn-test-telegram").onclick = async () => {
+    try {
+      await persistSettingsFromForm();
+      const res = await invoke<{ ok?: boolean; message?: string; latencyMs?: number }>(
+        "api_test_telegram",
+      );
+      const latency = res.latencyMs != null ? `（${res.latencyMs} ms）` : "";
+      showTestResult(
+        "telegram-test-result",
+        !!res.ok,
+        `${res.ok ? "session 有效" : "未登录"} ${latency}\n${res.message || ""}`,
+      );
+      toast(res.ok ? "Telegram session 正常" : res.message || "请先扫码登录", !res.ok);
+    } catch (e) {
+      showTestResult("telegram-test-result", false, String(e));
+      toast(String(e), true);
+    }
+  };
+  $("btn-pull-telegram-groups").onclick = async () => {
+    try {
+      const res = await invoke<{ ok?: boolean; message?: string }>("api_pull_telegram_groups");
+      toast(res.message || "TG 群已拉取", !res.ok);
       await refreshGroups();
     } catch (e) {
       toast(String(e), true);

@@ -558,6 +558,48 @@ fn settings_to_camel(v: Value) -> Value {
         obj.remove("onebot_access_token")
             .unwrap_or(Value::String(String::new())),
     );
+    let channels = obj
+        .remove("channels")
+        .unwrap_or(Value::Object(Default::default()));
+    let mut ch = channels.as_object().cloned().unwrap_or_default();
+    let qq = ch.remove("qq").unwrap_or(Value::Object(Default::default()));
+    let mut qq_o = qq.as_object().cloned().unwrap_or_default();
+    let wx = ch
+        .remove("wechat")
+        .unwrap_or(Value::Object(Default::default()));
+    let mut wx_o = wx.as_object().cloned().unwrap_or_default();
+    let tg = ch
+        .remove("telegram")
+        .unwrap_or(Value::Object(Default::default()));
+    let mut tg_o = tg.as_object().cloned().unwrap_or_default();
+    out.insert(
+        "channels".into(),
+        serde_json::json!({
+            "qq": {
+                "bound": qq_o.remove("bound").unwrap_or(Value::Bool(false)),
+                "label": qq_o.remove("label").unwrap_or(Value::String(String::new())),
+                "lastError": qq_o.remove("last_error").unwrap_or(Value::String(String::new())),
+            },
+            "wechat": {
+                "bound": wx_o.remove("bound").unwrap_or(Value::Bool(false)),
+                "label": wx_o.remove("label").unwrap_or(Value::String(String::new())),
+                "lastError": wx_o.remove("last_error").unwrap_or(Value::String(String::new())),
+                "dataDir": wx_o.remove("data_dir").unwrap_or(Value::String(String::new())),
+                "decryptedDir": wx_o.remove("decrypted_dir").unwrap_or(Value::String(String::new())),
+                "keysPath": wx_o.remove("keys_path").unwrap_or(Value::String(String::new())),
+                "pollSeconds": wx_o.remove("poll_seconds").unwrap_or(Value::from(1.0)),
+            },
+            "telegram": {
+                "bound": tg_o.remove("bound").unwrap_or(Value::Bool(false)),
+                "label": tg_o.remove("label").unwrap_or(Value::String(String::new())),
+                "lastError": tg_o.remove("last_error").unwrap_or(Value::String(String::new())),
+                "apiId": tg_o.remove("api_id").unwrap_or(Value::from(0)),
+                "apiHash": tg_o.remove("api_hash").unwrap_or(Value::String(String::new())),
+                "botToken": tg_o.remove("bot_token").unwrap_or(Value::String(String::new())),
+                "pollTimeout": tg_o.remove("poll_timeout").unwrap_or(Value::from(25)),
+            },
+        }),
+    );
     let llm = obj.remove("llm").unwrap_or(Value::Object(Default::default()));
     let mut llm_obj = llm.as_object().cloned().unwrap_or_default();
     let providers = llm_obj
@@ -615,6 +657,7 @@ fn group_to_camel(v: Value) -> Value {
     serde_json::json!({
         "groupId": o.get("group_id").cloned().unwrap_or(Value::Null),
         "groupName": o.get("group_name").cloned().unwrap_or(Value::String(String::new())),
+        "channel": o.get("channel").cloned().unwrap_or(Value::String("qq".into())),
         "enabled": o.get("enabled").cloned().unwrap_or(Value::Bool(false)),
         "blocked": o.get("blocked").cloned().unwrap_or(Value::Bool(false)),
         "basic": {
@@ -681,6 +724,98 @@ fn api_test_provider(provider_id: String, model: String) -> Result<Value, String
 #[tauri::command]
 fn api_test_onebot() -> Result<Value, String> {
     py_api_json(&["test-onebot"])
+}
+
+#[tauri::command]
+fn api_bind_qq(payload: Value) -> Result<Value, String> {
+    let raw = payload.to_string();
+    let v = py_api_json(&["bind-qq", "--json", &raw])?;
+    Ok(channels_result_to_camel(v))
+}
+
+#[tauri::command]
+fn api_bind_telegram(payload: Value) -> Result<Value, String> {
+    let raw = payload.to_string();
+    let v = py_api_json(&["bind-telegram", "--json", &raw])?;
+    Ok(channels_result_to_camel(v))
+}
+
+#[tauri::command]
+fn api_bind_wechat(payload: Value) -> Result<Value, String> {
+    let raw = payload.to_string();
+    let v = py_api_json(&["bind-wechat", "--json", &raw])?;
+    Ok(channels_result_to_camel(v))
+}
+
+#[tauri::command]
+fn api_unbind_channel(channel: String) -> Result<Value, String> {
+    let v = py_api_json(&["unbind-channel", "--channel", &channel])?;
+    Ok(channels_result_to_camel(v))
+}
+
+#[tauri::command]
+fn api_test_telegram() -> Result<Value, String> {
+    py_api_json(&["test-telegram"])
+}
+
+#[tauri::command]
+fn api_telegram_qr_start(payload: Value) -> Result<Value, String> {
+    let raw = payload.to_string();
+    py_api_json(&["telegram-qr-start", "--json", &raw])
+}
+
+#[tauri::command]
+fn api_telegram_qr_status() -> Result<Value, String> {
+    py_api_json(&["telegram-qr-status"])
+}
+
+#[tauri::command]
+fn api_telegram_qr_cancel() -> Result<Value, String> {
+    py_api_json(&["telegram-qr-cancel"])
+}
+
+#[tauri::command]
+fn api_telegram_qr_2fa(payload: Value) -> Result<Value, String> {
+    let raw = payload.to_string();
+    py_api_json(&["telegram-qr-2fa", "--json", &raw])
+}
+
+#[tauri::command]
+fn api_telegram_detect() -> Result<Value, String> {
+    py_api_json(&["telegram-detect"])
+}
+
+#[tauri::command]
+fn api_wechat_detect() -> Result<Value, String> {
+    py_api_json(&["wechat-detect"])
+}
+
+#[tauri::command]
+fn api_wechat_scan_keys() -> Result<Value, String> {
+    py_api_json(&["wechat-scan-keys"])
+}
+
+#[tauri::command]
+fn api_pull_telegram_groups() -> Result<Value, String> {
+    py_api_json(&["pull-telegram-groups"])
+}
+
+#[tauri::command]
+fn api_pull_wechat_groups() -> Result<Value, String> {
+    py_api_json(&["pull-wechat-groups"])
+}
+
+fn channels_result_to_camel(v: Value) -> Value {
+    let mut obj = v.as_object().cloned().unwrap_or_default();
+    if let Some(ch) = obj.remove("channels") {
+        let wrapped = serde_json::json!({ "channels": ch });
+        if let Value::Object(mut camel) = settings_to_camel(wrapped) {
+            if let Some(channels) = camel.remove("channels") {
+                obj.insert("channels".into(), channels);
+            }
+        }
+    }
+    Value::Object(obj)
 }
 
 #[tauri::command]
@@ -764,6 +899,20 @@ pub fn run() {
             api_fetch_models,
             api_test_provider,
             api_test_onebot,
+            api_bind_qq,
+            api_bind_telegram,
+            api_bind_wechat,
+            api_unbind_channel,
+            api_test_telegram,
+            api_telegram_qr_start,
+            api_telegram_qr_status,
+            api_telegram_qr_cancel,
+            api_telegram_qr_2fa,
+            api_telegram_detect,
+            api_wechat_detect,
+            api_wechat_scan_keys,
+            api_pull_telegram_groups,
+            api_pull_wechat_groups,
             pull_onebot_groups
         ])
         .setup(|_| {
