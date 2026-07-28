@@ -14,7 +14,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-from app.llm.service import list_reports, run_group_summary, sqlite_path  # noqa: E402
+from app.llm.service import list_reports, run_group_summary, sqlite_path, sum_report_tokens  # noqa: E402
 from app.settings_store import (  # noqa: E402
     AppSettings,
     GroupConfig,
@@ -39,15 +39,34 @@ from app.channels.telegram import (  # noqa: E402
 from app.channels.wechat import (  # noqa: E402
     bind_wechat_flow,
     detect_wechat_accounts,
+    detect_wechat_file_version,
     list_wechat_groups,
-    scan_keys_from_process,
+    save_keys_file,
     wechat_decrypted_dir,
     wechat_keys_path,
+    wechat_memory_scan_likely_broken,
+)
+from app.channels.feature_flags import (  # noqa: E402
+    WECHAT_CHANNEL_ENABLED,
+    WECHAT_DISABLED_MESSAGE,
 )
 
 
+def _wechat_disabled_out() -> None:
+    out({"ok": False, "message": WECHAT_DISABLED_MESSAGE, "disabled": True})
+
+
 def out(data) -> None:
-    print(json.dumps(data, ensure_ascii=False))
+    raw = json.dumps(data, ensure_ascii=False)
+    try:
+        sys.stdout.reconfigure(encoding="utf-8")  # type: ignore[attr-defined]
+    except Exception:
+        pass
+    try:
+        print(raw)
+    except UnicodeEncodeError:
+        # Windows 控制台偶发 gbk：退回可打印转义，避免整次 API 失败
+        print(json.dumps(data, ensure_ascii=True))
 
 
 def db_connect():
@@ -516,34 +535,102 @@ def cmd_pull_telegram_groups() -> None:
 
 
 def cmd_bind_wechat(raw: str) -> None:
+    if not WECHAT_CHANNEL_ENABLED:
+        _wechat_disabled_out()
+        return
     data = json.loads(raw or "{}")
     data_dir = (data.get("dataDir") or data.get("data_dir") or "").strip()
+    keys_file = (data.get("keysFile") or data.get("keys_file") or "").strip()
     scan = bool(data.get("scanKeys", True)) if "scanKeys" in data else True
-    result = asyncio.run(bind_wechat_flow(data_dir=data_dir, scan_keys=scan))
-    if not result.get("ok"):
-        # 仍允许在仅有账号目录时绑定，后续再扫 key
-        if not result.get("data_dir") and not result.get("accounts"):
-            out(result)
-            return
+    result = asyncio.run(
+        bind_wechat_flow(data_dir=data_dir, scan_keys=scan, keys_file=keys_file)
+    )
+    if not result.get("data_dir") and not result.get("accounts"):
+        out(result)
+        return
     settings = load_app_settings()
+    # 账号目录可用即可标记绑定；是否“就绪可列群”看 decrypt_ok
     settings.channels.wechat.bound = True
     settings.channels.wechat.data_dir = result.get("data_dir") or data_dir
     settings.channels.wechat.decrypted_dir = result.get("decrypted_dir") or ""
     settings.channels.wechat.keys_path = result.get("keys_path") or str(wechat_keys_path())
     account = Path(settings.channels.wechat.data_dir).name if settings.channels.wechat.data_dir else "微信"
     settings.channels.wechat.label = data.get("label") or account
-    settings.channels.wechat.last_error = "" if result.get("ok") else (result.get("message") or "")
+    settings.channels.wechat.last_error = "" if result.get("ready") else (result.get("message") or "")
     save_app_settings(settings)
     groups = result.get("groups") or []
     if groups:
         _cache_channel_groups(groups, "wechat")
     out(
         {
-            "ok": True,
+            "ok": bool(result.get("ready") or result.get("data_dir")),
+            "ready": bool(result.get("ready")),
             "message": result.get("message") or "微信已绑定（需保持 PC 微信登录）",
             "channels": dump_public(settings.channels),
             "groups": groups,
             "accounts": result.get("accounts") or [],
+            "version": result.get("version") or "",
+        }
+    )
+
+
+def cmd_wechat_import_keys(raw: str) -> None:
+    if not WECHAT_CHANNEL_ENABLED:
+        _wechat_disabled_out()
+        return
+    data = json.loads(raw or "{}")
+    keys_file = (data.get("keysFile") or data.get("keys_file") or data.get("path") or "").strip()
+    settings = load_app_settings()
+    wx = settings.channels.wechat
+    data_dir = (data.get("dataDir") or data.get("data_dir") or wx.data_dir or "").strip()
+    default_keys = str(wechat_keys_path())
+    if not keys_file:
+        out(
+            {
+                "ok": False,
+                "message": (
+                    "请填写已有密钥文件的完整路径（如 wechat-decrypt 生成的 all_keys.json）。"
+                    f"默认输出位置 {default_keys} 只有在扫 key / 导入成功后才会生成，不能当作导入源。"
+                ),
+            }
+        )
+        return
+    if not Path(keys_file).is_file():
+        same_as_default = Path(keys_file).resolve() == Path(default_keys).resolve() if keys_file else False
+        tip = (
+            f"密钥文件不存在：{keys_file}。"
+            + (
+                "这是本工具的默认保存路径，文件尚未生成。"
+                if same_as_default
+                else ""
+            )
+            + "请先用微信 ≤4.1.9 提取密钥（或从已有 all_keys.json 拷贝），把真实文件路径填到「导入密钥文件」后再试。"
+        )
+        out({"ok": False, "message": tip})
+        return
+    result = asyncio.run(
+        bind_wechat_flow(data_dir=data_dir, scan_keys=False, keys_file=keys_file)
+    )
+    if result.get("data_dir"):
+        settings.channels.wechat.bound = True
+        settings.channels.wechat.data_dir = result["data_dir"]
+        settings.channels.wechat.decrypted_dir = result.get("decrypted_dir") or ""
+        settings.channels.wechat.keys_path = str(wechat_keys_path())
+        settings.channels.wechat.label = settings.channels.wechat.label or Path(result["data_dir"]).name
+        settings.channels.wechat.last_error = "" if result.get("ready") else (result.get("message") or "")
+        save_app_settings(settings)
+    groups = result.get("groups") or []
+    if groups:
+        _cache_channel_groups(groups, "wechat")
+    out(
+        {
+            "ok": bool(result.get("ready")),
+            "ready": bool(result.get("ready")),
+            "count": len(groups),
+            "groups": groups,
+            "message": result.get("message") or "",
+            "channels": dump_public(settings.channels),
+            "version": result.get("version") or "",
         }
     )
 
@@ -572,6 +659,9 @@ def cmd_unbind_channel(channel: str) -> None:
 
 
 def cmd_wechat_detect() -> None:
+    if not WECHAT_CHANNEL_ENABLED:
+        _wechat_disabled_out()
+        return
     from app.channels.wechat import searched_wechat_hints
 
     accounts = detect_wechat_accounts()
@@ -595,25 +685,50 @@ def cmd_wechat_detect() -> None:
 
 
 def cmd_wechat_scan_keys() -> None:
+    if not WECHAT_CHANNEL_ENABLED:
+        _wechat_disabled_out()
+        return
+    from app.channels.wechat import scan_keys_from_process
+
+    settings = load_app_settings()
     result = scan_keys_from_process()
     if result.get("ok"):
-        settings = load_app_settings()
-        payload = {
-            "keys": result["keys"],
-            "data_dir": settings.channels.wechat.data_dir,
-            "ts": time.time(),
-        }
-        wechat_keys_path().write_text(
-            json.dumps(payload, ensure_ascii=False, indent=2),
-            encoding="utf-8",
+        save_keys_file(
+            result.get("keys") or [],
+            data_dir=settings.channels.wechat.data_dir,
         )
         settings.channels.wechat.keys_path = str(wechat_keys_path())
+        settings.channels.wechat.last_error = ""
         save_app_settings(settings)
-        result["keys_path"] = str(wechat_keys_path())
-    out(result)
+        out(
+            {
+                "ok": True,
+                "message": result.get("message") or "",
+                "count": len(result.get("keys") or []),
+                "version": result.get("version") or detect_wechat_file_version(),
+                "keys_path": str(wechat_keys_path()),
+                "channels": dump_public(settings.channels),
+            }
+        )
+        return
+    settings.channels.wechat.last_error = result.get("message") or ""
+    save_app_settings(settings)
+    out(
+        {
+            "ok": False,
+            "message": result.get("message") or "",
+            "count": 0,
+            "version": result.get("version") or detect_wechat_file_version(),
+            "keys_path": str(wechat_keys_path()),
+            "channels": dump_public(settings.channels),
+        }
+    )
 
 
 def cmd_pull_wechat_groups() -> None:
+    if not WECHAT_CHANNEL_ENABLED:
+        _wechat_disabled_out()
+        return
     settings = load_app_settings()
     wx = settings.channels.wechat
     if not wx.bound:
@@ -622,16 +737,59 @@ def cmd_pull_wechat_groups() -> None:
     dec = wx.decrypted_dir or (
         str(wechat_decrypted_dir(Path(wx.data_dir).name)) if wx.data_dir else ""
     )
-    if not dec or not Path(dec).is_dir():
-        # 尝试再走一遍绑定解密
+    has_dbs = bool(dec and Path(dec).is_dir() and any(Path(dec).rglob("*.db")))
+    if not has_dbs:
         result = asyncio.run(bind_wechat_flow(data_dir=wx.data_dir, scan_keys=True))
         dec = result.get("decrypted_dir") or dec
-        if result.get("groups"):
-            n = _cache_channel_groups(result["groups"], "wechat")
-            out({"ok": True, "count": n, "groups": result["groups"], "message": result.get("message")})
+        settings.channels.wechat.decrypted_dir = dec or settings.channels.wechat.decrypted_dir
+        settings.channels.wechat.last_error = (
+            "" if result.get("ready") else (result.get("message") or "")
+        )
+        save_app_settings(settings)
+        groups = result.get("groups") or []
+        if groups:
+            n = _cache_channel_groups(groups, "wechat")
+            out(
+                {
+                    "ok": True,
+                    "count": n,
+                    "groups": groups,
+                    "message": result.get("message") or f"已缓存 {n} 个微信群",
+                    "channels": dump_public(settings.channels),
+                }
+            )
             return
+        ver = result.get("version") or detect_wechat_file_version()
+        msg = result.get("message") or "解密未完成，无法拉取微信群"
+        if wechat_memory_scan_likely_broken(ver) and not wechat_keys_path().exists():
+            msg = (
+                f"{msg}。当前微信 {ver or '≥4.1.10'} 无法自动扫密钥，"
+                "请在总配置中填写并「导入密钥文件」后再拉群。"
+            )
+        out(
+            {
+                "ok": False,
+                "count": 0,
+                "groups": [],
+                "message": msg,
+                "channels": dump_public(settings.channels),
+            }
+        )
+        return
     groups = list_wechat_groups(dec) if dec else []
     n = _cache_channel_groups(groups, "wechat")
+    if n <= 0:
+        out(
+            {
+                "ok": False,
+                "count": 0,
+                "groups": [],
+                "message": "已解密目录中未解析到群聊（@chatroom）。可检查 contact/session 库或重新导入密钥解密。",
+            }
+        )
+        return
+    settings.channels.wechat.last_error = ""
+    save_app_settings(settings)
     out({"ok": True, "count": n, "groups": groups, "message": f"已缓存 {n} 个微信群"})
 
 
@@ -673,9 +831,19 @@ def cmd_save_group(raw: str) -> None:
             },
             "llm_monitor": {
                 "enabled": pick(llm, "enabled", default=False),
+                "text_enabled": pick(llm, "textEnabled", "text_enabled", default=True),
                 "provider_id": pick(llm, "providerId", "provider_id", default="") or "",
                 "model": pick(llm, "model", default="") or "",
                 "prompt": pick(llm, "prompt", default="") or "",
+                "image_enabled": pick(llm, "imageEnabled", "image_enabled", default=True),
+                "image_same_as_text": pick(
+                    llm, "imageSameAsText", "image_same_as_text", default=True
+                ),
+                "image_provider_id": pick(
+                    llm, "imageProviderId", "image_provider_id", default=""
+                )
+                or "",
+                "image_model": pick(llm, "imageModel", "image_model", default="") or "",
                 "every_minutes": pick(llm, "everyMinutes", "every_minutes", default=60),
                 "window_minutes": pick(llm, "windowMinutes", "window_minutes", default=60),
                 "min_messages": pick(llm, "minMessages", "min_messages", default=8),
@@ -691,8 +859,27 @@ def cmd_save_group(raw: str) -> None:
         cfg.keyword_monitor.keywords = [
             x.strip() for x in cfg.keyword_monitor.keywords.split(",") if x.strip()
         ]
+
+    prev = load_group_config(str(group_id))
+    newly_enabled = bool(cfg.enabled and not prev.enabled and not cfg.blocked)
     save_group_config(cfg)
-    out({"ok": True})
+
+    history: dict | None = None
+    if newly_enabled and (cfg.channel or channel_of_group_id(str(group_id))) == "qq":
+        try:
+            from app.history_sync import pull_group_history
+
+            history = asyncio.run(pull_group_history(str(group_id), count=200))
+        except Exception as e:
+            history = {"ok": False, "error": str(e), "inserted": 0, "fetched": 0}
+
+    out(
+        {
+            "ok": True,
+            "newlyEnabled": newly_enabled,
+            "history": history,
+        }
+    )
 
 def cmd_run_llm(group_id: str) -> None:
     cfg = load_group_config(group_id)
@@ -714,8 +901,27 @@ def cmd_pull_history(group_id: str, count: int) -> None:
 
 def cmd_list_reports(group_id: str | None, limit: int) -> None:
     rows = list_reports(group_id, limit)
-    out(
-        [
+    items = []
+    for r in rows:
+        period: dict = {}
+        payload: dict = {}
+        skipped = False
+        raw_json = r.get("report_json") or ""
+        if raw_json:
+            try:
+                parsed = json.loads(raw_json)
+                if isinstance(parsed, dict):
+                    payload = parsed
+                    skipped = bool(payload.get("skipped"))
+                    if isinstance(payload.get("period"), dict):
+                        period = payload["period"]
+            except Exception:
+                period = {}
+        headline = r.get("headline") or ""
+        if not skipped and ("[定时跳过]" in headline or "[跳过]" in headline):
+            skipped = True
+        token_usage = token_usage_from_row(r, payload)
+        items.append(
             {
                 "id": r["id"],
                 "groupId": r["group_id"],
@@ -727,9 +933,60 @@ def cmd_list_reports(group_id: str | None, limit: int) -> None:
                 "msgCount": r["msg_count"],
                 "createdAt": r["created_at"],
                 "reportMd": r["report_md"],
+                "skipped": skipped,
+                "windowExtended": bool(period.get("window_extended")),
+                "lookbackMessages": int(period.get("lookback_messages") or 0),
+                "lookbackReasons": period.get("lookback_reasons") or [],
+                "llmContextRounds": int(period.get("llm_context_rounds") or 0),
+                "earlierMessages": int(period.get("earlier_messages") or 0),
+                "contextUsage": (
+                    payload.get("context_usage")
+                    if isinstance(payload, dict)
+                    and isinstance(payload.get("context_usage"), dict)
+                    else {}
+                ),
+                "source": period.get("source") or "",
+                "promptTokens": token_usage["prompt_tokens"],
+                "completionTokens": token_usage["completion_tokens"],
+                "totalTokens": token_usage["total_tokens"],
+                "tokenUsage": {
+                    "promptTokens": token_usage["prompt_tokens"],
+                    "completionTokens": token_usage["completion_tokens"],
+                    "totalTokens": token_usage["total_tokens"],
+                },
             }
-            for r in rows
-        ]
+        )
+    out(items)
+
+
+def token_usage_from_row(r: dict, payload: dict) -> dict[str, int]:
+    prompt = int(r.get("prompt_tokens") or 0)
+    completion = int(r.get("completion_tokens") or 0)
+    total = int(r.get("total_tokens") or 0)
+    if total <= 0 and isinstance(payload, dict):
+        tu = payload.get("token_usage")
+        if isinstance(tu, dict):
+            prompt = int(tu.get("prompt_tokens") or prompt or 0)
+            completion = int(tu.get("completion_tokens") or completion or 0)
+            total = int(tu.get("total_tokens") or 0)
+    if total <= 0:
+        total = prompt + completion
+    return {
+        "prompt_tokens": prompt,
+        "completion_tokens": completion,
+        "total_tokens": total,
+    }
+
+
+def cmd_token_stats(group_id: str | None) -> None:
+    stats = sum_report_tokens(group_id)
+    out(
+        {
+            "promptTokens": stats["prompt_tokens"],
+            "completionTokens": stats["completion_tokens"],
+            "totalTokens": stats["total_tokens"],
+            "reportCount": stats["report_count"],
+        }
     )
 
 
@@ -979,6 +1236,9 @@ def main() -> None:
     p7.add_argument("--group-id", default="")
     p7.add_argument("--limit", type=int, default=20)
 
+    p_tok = sub.add_parser("token-stats")
+    p_tok.add_argument("--group-id", default="")
+
     p8 = sub.add_parser("cache-groups")
     p8.add_argument("--json", required=True)
 
@@ -1009,6 +1269,8 @@ def main() -> None:
     sub.add_parser("telegram-detect")
     sub.add_parser("wechat-detect")
     sub.add_parser("wechat-scan-keys")
+    p_wx_import = sub.add_parser("wechat-import-keys")
+    p_wx_import.add_argument("--json", default="{}")
     sub.add_parser("pull-telegram-groups")
     sub.add_parser("pull-wechat-groups")
 
@@ -1031,6 +1293,8 @@ def main() -> None:
         cmd_pull_history(args.group_id, args.count)
     elif args.cmd == "list-reports":
         cmd_list_reports(args.group_id or None, args.limit)
+    elif args.cmd == "token-stats":
+        cmd_token_stats(args.group_id or None)
     elif args.cmd == "cache-groups":
         cmd_cache_groups(args.json)
     elif args.cmd == "fetch-models":
@@ -1063,6 +1327,8 @@ def main() -> None:
         cmd_wechat_detect()
     elif args.cmd == "wechat-scan-keys":
         cmd_wechat_scan_keys()
+    elif args.cmd == "wechat-import-keys":
+        cmd_wechat_import_keys(args.json)
     elif args.cmd == "pull-telegram-groups":
         cmd_pull_telegram_groups()
     elif args.cmd == "pull-wechat-groups":

@@ -90,13 +90,22 @@ class KeywordMonitorConfig(BaseModel):
 
 class LlmMonitorConfig(BaseModel):
     enabled: bool = False
+    # 文本分析
+    text_enabled: bool = True
     provider_id: str = ""
     model: str = ""
     prompt: str = (
         "你是群聊监控分析助手。请基于给定聊天记录输出中文 JSON："
-        "headline, topics, key_points, risks, action_items, sentiment。"
+        "headline, topics, key_points, risks, action_items, sentiment, notable_users, appendix。"
+        "appendix 含 nouns/links/notes，用于名词解析、链接详解与补充说明。"
         "禁止编造；不确定请写「记录不足」。risks 需带原文 evidence。"
+        "若含引用回复或补前后文，请按完整多轮对话理解。"
     )
+    # 图片分析（视觉描述）
+    image_enabled: bool = True
+    image_same_as_text: bool = True  # True 时复用文本的 provider/model
+    image_provider_id: str = ""
+    image_model: str = ""
     every_minutes: int = 60
     window_minutes: int = 60
     min_messages: int = 8
@@ -150,13 +159,22 @@ def default_app_settings() -> AppSettings:
 
 
 def _migrate_channel_defaults(settings: AppSettings) -> AppSettings:
-    """兼容旧配置：已有 OneBot 地址则默认视为 QQ 已绑定。"""
+    """兼容旧配置：已有 OneBot 地址则默认视为 QQ 已绑定；屏蔽微信通道时强制解绑。"""
+    from app.channels.feature_flags import WECHAT_CHANNEL_ENABLED, WECHAT_DISABLED_MESSAGE
+
     changed = False
     if not settings.channels.qq.bound and (settings.onebot_ws_url or settings.onebot_access_token):
         settings.channels.qq.bound = True
         if not settings.channels.qq.label:
             settings.channels.qq.label = "OneBot / NapCat"
         changed = True
+    if not WECHAT_CHANNEL_ENABLED:
+        wx = settings.channels.wechat
+        if wx.bound or wx.label or wx.last_error != WECHAT_DISABLED_MESSAGE:
+            wx.bound = False
+            wx.label = ""
+            wx.last_error = WECHAT_DISABLED_MESSAGE
+            changed = True
     if changed:
         save_app_settings(settings)
     return settings
@@ -188,6 +206,12 @@ def load_app_settings() -> AppSettings:
 
 
 def save_app_settings(settings: AppSettings) -> None:
+    from app.channels.feature_flags import WECHAT_CHANNEL_ENABLED, WECHAT_DISABLED_MESSAGE
+
+    if not WECHAT_CHANNEL_ENABLED:
+        settings.channels.wechat.bound = False
+        settings.channels.wechat.label = ""
+        settings.channels.wechat.last_error = WECHAT_DISABLED_MESSAGE
     _ensure_dirs()
     SETTINGS_PATH.write_text(
         settings.model_dump_json(indent=2),

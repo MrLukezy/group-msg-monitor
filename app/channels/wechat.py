@@ -304,6 +304,148 @@ def wechat_decrypted_dir(account: str = "default") -> Path:
     return DATA_DIR / "wechat_decrypted" / safe
 
 
+def detect_wechat_file_version() -> str:
+    """读取本机 Weixin.exe / WeChat.exe 的文件版本（如 4.1.11.55）。"""
+    if sys.platform != "win32":
+        return ""
+    for exe_dir in _running_wechat_exe_dirs():
+        for name in ("Weixin.exe", "WeChat.exe"):
+            exe = exe_dir / name
+            if not exe.is_file():
+                continue
+            ver = _win_file_version(exe)
+            if ver:
+                return ver
+    # 进程未跑时，仍尝试常见安装路径
+    for cand in (
+        Path(os.environ.get("ProgramFiles", r"C:\Program Files")) / "Tencent" / "Weixin" / "Weixin.exe",
+        Path(r"C:\Lukezy\Program Files\wechatApp\Weixin\Weixin.exe"),
+    ):
+        ver = _win_file_version(cand)
+        if ver:
+            return ver
+    return ""
+
+
+def _win_file_version(path: Path) -> str:
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        if not path.is_file():
+            return ""
+        size = ctypes.windll.version.GetFileVersionInfoSizeW(str(path), None)
+        if not size:
+            return ""
+        buf = ctypes.create_string_buffer(size)
+        if not ctypes.windll.version.GetFileVersionInfoW(str(path), 0, size, buf):
+            return ""
+        u = ctypes.c_void_p()
+        ln = wintypes.UINT()
+        if not ctypes.windll.version.VerQueryValueW(
+            buf, "\\", ctypes.byref(u), ctypes.byref(ln)
+        ):
+            return ""
+
+        class VS_FIXEDFILEINFO(ctypes.Structure):
+            _fields_ = [
+                ("dwSignature", wintypes.DWORD),
+                ("dwStrucVersion", wintypes.DWORD),
+                ("dwFileVersionMS", wintypes.DWORD),
+                ("dwFileVersionLS", wintypes.DWORD),
+                ("dwProductVersionMS", wintypes.DWORD),
+                ("dwProductVersionLS", wintypes.DWORD),
+                ("dwFileFlagsMask", wintypes.DWORD),
+                ("dwFileFlags", wintypes.DWORD),
+                ("dwFileOS", wintypes.DWORD),
+                ("dwFileType", wintypes.DWORD),
+                ("dwFileSubtype", wintypes.DWORD),
+                ("dwFileDateMS", wintypes.DWORD),
+                ("dwFileDateLS", wintypes.DWORD),
+            ]
+
+        info = ctypes.cast(u, ctypes.POINTER(VS_FIXEDFILEINFO)).contents
+        ms, ls = info.dwFileVersionMS, info.dwFileVersionLS
+        return f"{ms >> 16}.{ms & 0xFFFF}.{ls >> 16}.{ls & 0xFFFF}"
+    except Exception:
+        return ""
+
+
+def _version_tuple(ver: str) -> tuple[int, ...]:
+    parts: list[int] = []
+    for p in (ver or "").split("."):
+        try:
+            parts.append(int(p))
+        except ValueError:
+            parts.append(0)
+    return tuple(parts)
+
+
+def wechat_memory_scan_likely_broken(ver: str = "") -> bool:
+    """微信 ≥4.1.10 起，被动内存扫描 x'enc+salt' 往往失效。"""
+    v = ver or detect_wechat_file_version()
+    if not v:
+        return False
+    return _version_tuple(v) >= (4, 1, 10)
+
+
+def normalize_key_items(raw: Any) -> list[dict[str, str]]:
+    """兼容本工具与 wechat-decrypt 常见密钥 JSON。"""
+    items: list[dict[str, str]] = []
+
+    def add(enc_key: str, salt: str) -> None:
+        enc_key = (enc_key or "").strip().lower()
+        salt = (salt or "").strip().lower()
+        if len(enc_key) == 64 and len(salt) == 32:
+            items.append({"enc_key": enc_key, "salt": salt})
+
+    if raw is None:
+        return []
+    if isinstance(raw, list):
+        for it in raw:
+            if isinstance(it, dict):
+                add(
+                    str(it.get("enc_key") or it.get("encKey") or it.get("key") or ""),
+                    str(it.get("salt") or it.get("salt_hex") or ""),
+                )
+        return items
+    if isinstance(raw, dict):
+        if "keys" in raw:
+            return normalize_key_items(raw.get("keys"))
+        # {salt: enc_key} 或 {salt: {enc_key: ...}}
+        for k, v in raw.items():
+            if k in ("data_dir", "ts", "version", "db_dir", "message"):
+                continue
+            if isinstance(v, str) and len(k) == 32 and len(v) == 64:
+                add(v, k)
+            elif isinstance(v, dict):
+                add(
+                    str(v.get("enc_key") or v.get("encKey") or v.get("key") or ""),
+                    str(v.get("salt") or k),
+                )
+    return items
+
+
+def load_keys_file(path: str | Path) -> list[dict[str, str]]:
+    p = Path(path)
+    payload = json.loads(p.read_text(encoding="utf-8"))
+    return normalize_key_items(payload)
+
+
+def save_keys_file(keys: list[dict[str, str]], data_dir: str = "", path: Path | None = None) -> Path:
+    out = path or wechat_keys_path()
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(
+        json.dumps(
+            {"keys": keys, "data_dir": data_dir, "ts": time.time()},
+            ensure_ascii=False,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+    return out
+
+
 def _aes_cbc_decrypt(key: bytes, iv: bytes, data: bytes) -> bytes:
     from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 
@@ -469,13 +611,25 @@ def scan_keys_from_process() -> dict[str, Any]:
             kernel32.CloseHandle(handle)
 
     keys = list(found.values())
+    ver = detect_wechat_file_version()
     if not keys:
-        return {
-            "ok": False,
-            "message": "进程内未扫到数据库密钥。请确认微信已登录，并以管理员身份运行桌面端后再试",
-            "keys": [],
-        }
-    return {"ok": True, "message": f"扫到 {len(keys)} 组密钥", "keys": keys}
+        tip = "进程内未扫到数据库密钥。请确认微信已登录，并以管理员身份运行桌面端后再试"
+        if wechat_memory_scan_likely_broken(ver):
+            tip = (
+                f"当前微信版本 {ver or '≥4.1.10'} 通常已不再把 SQLCipher raw key 缓存在可扫描内存中，"
+                "因此无法自动扫密钥、也就无法解密列群。"
+                "请改用「导入密钥文件」：用旧版（≤4.1.9）提取一次后导入 wechat_keys.json / all_keys.json；"
+                "密钥本身升级后一般仍可用。"
+            )
+        elif ver:
+            tip = f"{tip}（当前版本 {ver}）"
+        return {"ok": False, "message": tip, "keys": [], "version": ver}
+    return {
+        "ok": True,
+        "message": f"扫到 {len(keys)} 组密钥" + (f"（微信 {ver}）" if ver else ""),
+        "keys": keys,
+        "version": ver,
+    }
 
 
 def _match_key_for_db(db_path: Path, keys: list[dict[str, str]]) -> bytes | None:
@@ -947,8 +1101,12 @@ class WechatLocalAdapter:
                 logger.exception("微信消息回调失败")
 
 
-async def bind_wechat_flow(data_dir: str = "", scan_keys: bool = True) -> dict[str, Any]:
-    """绑定辅助：检测账号、扫密钥、解密、列群。"""
+async def bind_wechat_flow(
+    data_dir: str = "",
+    scan_keys: bool = True,
+    keys_file: str = "",
+) -> dict[str, Any]:
+    """绑定辅助：检测账号、扫/导入密钥、解密、列群。"""
     accounts = detect_wechat_accounts()
     if not data_dir:
         if not accounts:
@@ -966,41 +1124,91 @@ async def bind_wechat_flow(data_dir: str = "", scan_keys: bool = True) -> dict[s
             }
         data_dir = accounts[0]["data_dir"]
 
+    ver = detect_wechat_file_version()
     keys_result: dict[str, Any] = {"ok": False, "keys": [], "message": "跳过扫 key"}
-    if scan_keys:
+    keys: list[dict[str, str]] = []
+
+    if keys_file:
+        keys_path = Path(keys_file)
+        if not keys_path.is_file():
+            return {
+                "ok": False,
+                "message": (
+                    f"密钥文件不存在：{keys_file}。"
+                    "请填写已有密钥文件的完整路径（如 all_keys.json）；"
+                    f"默认路径 {wechat_keys_path()} 只有扫 key / 导入成功后才会生成。"
+                ),
+                "accounts": accounts,
+                "data_dir": data_dir,
+                "decrypted_dir": str(wechat_decrypted_dir(Path(data_dir).name)),
+                "keys_path": str(wechat_keys_path()),
+                "groups": [],
+                "keys_ok": False,
+                "decrypt_ok": False,
+                "version": ver,
+                "ready": False,
+            }
+        try:
+            keys = await asyncio.to_thread(load_keys_file, keys_file)
+            if keys:
+                save_keys_file(keys, data_dir=data_dir)
+                keys_result = {
+                    "ok": True,
+                    "keys": keys,
+                    "message": f"已从文件导入 {len(keys)} 组密钥",
+                }
+            else:
+                keys_result = {
+                    "ok": False,
+                    "keys": [],
+                    "message": f"密钥文件未解析到有效条目：{keys_file}",
+                }
+        except Exception as e:
+            keys_result = {"ok": False, "keys": [], "message": f"读取密钥文件失败：{e}"}
+    elif scan_keys:
         keys_result = await asyncio.to_thread(scan_keys_from_process)
         if keys_result.get("ok"):
-            wechat_keys_path().write_text(
-                json.dumps(
-                    {"keys": keys_result["keys"], "data_dir": data_dir, "ts": time.time()},
-                    ensure_ascii=False,
-                    indent=2,
-                ),
-                encoding="utf-8",
-            )
+            keys = list(keys_result.get("keys") or [])
+            save_keys_file(keys, data_dir=data_dir)
 
-    decrypt_result: dict[str, Any] = {"ok": False, "message": "无密钥，未解密"}
-    keys = keys_result.get("keys") or []
     if not keys and wechat_keys_path().exists():
         try:
-            payload = json.loads(wechat_keys_path().read_text(encoding="utf-8"))
-            keys = payload.get("keys") or []
+            keys = load_keys_file(wechat_keys_path())
+            if keys and not keys_result.get("ok"):
+                keys_result = {
+                    "ok": True,
+                    "keys": keys,
+                    "message": f"使用已保存密钥 {len(keys)} 组",
+                }
         except Exception:
             keys = []
+
+    decrypt_result: dict[str, Any] = {"ok": False, "message": "无密钥，未解密"}
     if keys:
         decrypt_result = await asyncio.to_thread(decrypt_account_dbs, data_dir, keys)
 
     groups: list[dict[str, Any]] = []
     out_dir = decrypt_result.get("out_dir") or str(wechat_decrypted_dir(Path(data_dir).name))
-    if Path(out_dir).is_dir():
+    if Path(out_dir).is_dir() and any(Path(out_dir).rglob("*.db")):
         groups = await asyncio.to_thread(list_wechat_groups, out_dir)
 
-    ok = bool(decrypt_result.get("ok") or Path(out_dir).is_dir())
+    decrypt_ok = bool(decrypt_result.get("ok"))
+    ok = decrypt_ok and bool(groups or Path(out_dir).is_dir())
+    if not keys:
+        ok = False
     msg_parts = [
         keys_result.get("message") or "",
         decrypt_result.get("message") or "",
-        f"发现群 {len(groups)} 个" if groups else "暂未解析到群（可稍后再拉群）",
     ]
+    if groups:
+        msg_parts.append(f"发现群 {len(groups)} 个")
+    elif decrypt_ok:
+        msg_parts.append("解密完成但未解析到群聊（联系人库可能为空）")
+    elif wechat_memory_scan_likely_broken(ver):
+        msg_parts.append("当前无法自动列群，请先导入密钥文件后再点「拉取微信群」")
+    else:
+        msg_parts.append("暂未解析到群（需先有密钥并完成解密）")
+
     return {
         "ok": ok,
         "message": "；".join([m for m in msg_parts if m]),
@@ -1009,6 +1217,8 @@ async def bind_wechat_flow(data_dir: str = "", scan_keys: bool = True) -> dict[s
         "decrypted_dir": out_dir,
         "keys_path": str(wechat_keys_path()),
         "groups": groups,
-        "keys_ok": bool(keys_result.get("ok")),
-        "decrypt_ok": bool(decrypt_result.get("ok")),
+        "keys_ok": bool(keys_result.get("ok") or keys),
+        "decrypt_ok": decrypt_ok,
+        "version": ver,
+        "ready": decrypt_ok,
     }

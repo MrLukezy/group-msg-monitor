@@ -126,8 +126,14 @@
               </aside>
               <div class="panel monitored-reports-pane fill">
                 <div class="monitored-reports-head">
-                  <h3 class="pane-title" id="monitored-reports-title">LLM 分析主题</h3>
-                  <p class="field-hint" id="monitored-reports-hint">请选择左侧群</p>
+                  <div class="monitored-reports-head-main">
+                    <h3 class="pane-title" id="monitored-reports-title">LLM 分析主题</h3>
+                    <p class="field-hint" id="monitored-reports-hint">请选择左侧群</p>
+                  </div>
+                  <label class="check toolbar-check" title="隐藏因消息太少而定时跳过的条目">
+                    <input id="monitored-hide-skipped" type="checkbox" checked />
+                    忽略定时跳过
+                  </label>
                 </div>
                 <div id="monitored-report-list" class="report-title-list"></div>
               </div>
@@ -162,20 +168,33 @@
             <header class="page-head">
               <div>
                 <h2>群列表</h2>
-                <p>手动刷新 · 支持排序与搜索</p>
+                <p>手动刷新 · 支持排序、搜索与活跃过滤</p>
               </div>
               <div class="row actions toolbar">
                 <select id="groups-sort">
                   <option value="recent">最近接收消息</option>
                   <option value="alpha">字母 / 名称</option>
                 </select>
+                <select id="groups-active-filter" title="按本地落库消息活跃度过滤">
+                  <option value="0" selected>全部群</option>
+                  <option value="any">有落库消息</option>
+                  <option value="7">近 7 天有消息</option>
+                  <option value="30">近 30 天有消息</option>
+                  <option value="90">近 90 天有消息</option>
+                </select>
                 <input id="groups-q" type="search" placeholder="搜索群名 / 群号" />
                 <label class="check toolbar-check"><input id="groups-show-blocked" type="checkbox" /> 显示已屏蔽</label>
+                <label class="check toolbar-check" title="监听中的群即使不满足活跃条件也保留">
+                  <input id="groups-keep-enabled" type="checkbox" checked /> 始终显示监听中
+                </label>
                 <button id="btn-refresh-groups" class="btn primary" type="button">刷新</button>
                 <button id="btn-pull-channel-groups" class="btn" type="button">拉取群列表</button>
               </div>
             </header>
             <div class="panel fill">
+              <div id="groups-filter-bar" class="groups-filter-bar">
+                <span id="groups-filter-summary">过滤条件加载中…</span>
+              </div>
               <div id="groups-list" class="groups-list"></div>
             </div>
           </div>
@@ -189,7 +208,7 @@
               </div>
               <div class="row actions">
                 <button id="btn-save-group" class="btn primary" type="button">保存本群配置</button>
-                <button id="btn-pull-history" class="btn" type="button">拉取历史</button>
+                <button id="btn-pull-history" class="btn" type="button">拉取历史（补同步）</button>
                 <button id="btn-run-llm" class="btn" type="button">立即 LLM 分析</button>
               </div>
             </header>
@@ -200,6 +219,7 @@
                 <label class="check"><input id="g-blocked" type="checkbox" /> 屏蔽此群（不落库、不处理）</label>
                 <p class="field-hint">屏蔽后不会进入消息流，也不会做关键词 / LLM。与「启用监听」互斥。</p>
                 <label class="check"><input id="g-enabled" type="checkbox" /> 启用监听此群</label>
+                <p class="field-hint">启用后才会实时落库；首次启用会自动从 OneBot 补拉最近历史。监听服务需保持运行。</p>
                 <label class="check"><input id="g-log-all" type="checkbox" /> 记录全部消息</label>
                 <label class="check"><input id="g-storage" type="checkbox" /> SQLite 落库</label>
                 <label>
@@ -222,19 +242,6 @@
                 <h3>LLM 检测</h3>
                 <label class="check"><input id="g-llm-enabled" type="checkbox" /> 启用定时 LLM 分析</label>
                 <label>
-                  Provider
-                  <select id="g-llm-provider"></select>
-                </label>
-                <label>
-                  模型（可覆盖全局默认）
-                  <div class="model-setting-row">
-                    <select id="g-llm-model">
-                      <option value="">先点右侧刷新获取模型</option>
-                    </select>
-                    <button id="btn-refresh-group-models" class="refresh-models-btn" type="button" title="从 API 拉取模型">⟳</button>
-                  </div>
-                </label>
-                <label>
                   执行间隔（分钟）
                   <input id="g-llm-every" type="number" min="1" step="1" />
                   <span class="field-hint">需保持「启动监听」运行；定时任务由监听进程调度。</span>
@@ -249,10 +256,58 @@
                   <input id="g-llm-min" type="number" min="1" step="1" />
                   <span class="field-hint">短窗口请设为 1；设太大可能导致定时一直跳过。</span>
                 </label>
-                <label>
-                  分析提示词
-                  <textarea id="g-llm-prompt" rows="6"></textarea>
-                </label>
+
+                <div class="llm-subpanel">
+                  <label class="check llm-subpanel-title">
+                    <input id="g-llm-text-enabled" type="checkbox" checked /> 文本分析
+                  </label>
+                  <div id="g-llm-text-config" class="llm-subpanel-body">
+                    <label>
+                      Provider
+                      <select id="g-llm-provider"></select>
+                    </label>
+                    <label>
+                      模型（可覆盖全局默认）
+                      <div class="model-setting-row">
+                        <select id="g-llm-model">
+                          <option value="">先点右侧刷新获取模型</option>
+                        </select>
+                        <button id="btn-refresh-group-models" class="refresh-models-btn" type="button" title="从 API 拉取模型">⟳</button>
+                      </div>
+                    </label>
+                    <label>
+                      分析提示词
+                      <textarea id="g-llm-prompt" rows="6"></textarea>
+                    </label>
+                  </div>
+                </div>
+
+                <div class="llm-subpanel">
+                  <label class="check llm-subpanel-title">
+                    <input id="g-llm-image-enabled" type="checkbox" checked /> 图片分析
+                  </label>
+                  <div id="g-llm-image-wrap" class="llm-subpanel-body">
+                    <label class="check">
+                      <input id="g-llm-image-same" type="checkbox" checked /> 跟文本保持一致
+                    </label>
+                    <span class="field-hint">勾选时复用上方文本分析的 Provider / 模型；需模型支持视觉。</span>
+                    <div id="g-llm-image-config" class="llm-image-config hidden">
+                      <label>
+                        图片 Provider
+                        <select id="g-llm-image-provider"></select>
+                      </label>
+                      <label>
+                        图片模型
+                        <div class="model-setting-row">
+                          <select id="g-llm-image-model">
+                            <option value="">先点右侧刷新获取模型</option>
+                          </select>
+                          <button id="btn-refresh-image-models" class="refresh-models-btn" type="button" title="从 API 拉取模型">⟳</button>
+                        </div>
+                      </label>
+                    </div>
+                  </div>
+                </div>
               </div>
 
               <div class="detail-side">
@@ -315,29 +370,39 @@
                 <div id="onebot-test-result" class="test-result" hidden></div>
               </div>
 
-              <div class="channel-card" data-channel="wechat">
+              <div class="channel-card is-disabled" data-channel="wechat" hidden>
                 <div class="channel-card-head">
                   <div>
-                    <h3 class="channel-title">微信（本地登录库）</h3>
-                    <p class="channel-status" id="ch-wx-status">需本机 PC 微信保持登录</p>
+                    <h3 class="channel-title">微信（已暂时屏蔽）</h3>
+                    <p class="channel-status" id="ch-wx-status">Windows ≥4.1.10 无法稳定取 key，绑定与监听已停用</p>
                   </div>
-                  <span class="channel-badge" id="ch-wx-badge">未绑定</span>
+                  <span class="channel-badge" id="ch-wx-badge">已屏蔽</span>
                 </div>
                 <div class="setting-item">
                   <label>数据目录（可空，自动检测；自定义安装请手动填）</label>
-                  <input id="s-wx-dir" placeholder="…\xwechat_files\账号名（含 db_storage 的目录）" />
+                  <input id="s-wx-dir" placeholder="…\xwechat_files\账号名（含 db_storage 的目录）" disabled />
                 </div>
                 <div class="setting-item">
                   <label>解密输出目录（可空）</label>
-                  <input id="s-wx-decrypted" placeholder="默认写入 data/wechat_decrypted" />
+                  <input id="s-wx-decrypted" placeholder="默认写入 data/wechat_decrypted" disabled />
                 </div>
-                <p class="settings-desc">绑定会尝试从已登录微信进程提取密钥并解密本地库。请尽量以管理员身份运行桌面端。</p>
+                <div class="setting-item">
+                  <label>导入密钥文件（仅填已有文件；4.1.10+ 需要）</label>
+                  <input id="s-wx-keys" placeholder="例如 D:\tools\wechat-decrypt\all_keys.json" disabled />
+                </div>
+                <p class="settings-desc" id="wechat-disabled-note">
+                  微信通道代码仍保留，但功能开关已关闭。恢复时请将
+                  <code>app/channels/feature_flags.py</code> 中
+                  <code>WECHAT_CHANNEL_ENABLED</code> 设为 <code>True</code>，并去掉本卡片的
+                  <code>hidden</code>。
+                </p>
                 <div class="channel-actions">
-                  <button id="btn-bind-wechat" class="btn primary" type="button">绑定微信</button>
-                  <button id="btn-unbind-wechat" class="btn" type="button">解绑</button>
-                  <button id="btn-wx-detect" class="btn ghost" type="button">检测账号</button>
-                  <button id="btn-wx-scan-keys" class="btn ghost" type="button">扫描密钥</button>
-                  <button id="btn-pull-wechat-groups" class="btn ghost" type="button">拉取微信群</button>
+                  <button id="btn-bind-wechat" class="btn primary" type="button" disabled>绑定微信</button>
+                  <button id="btn-unbind-wechat" class="btn" type="button" disabled>解绑</button>
+                  <button id="btn-wx-detect" class="btn ghost" type="button" disabled>检测账号</button>
+                  <button id="btn-wx-scan-keys" class="btn ghost" type="button" disabled>扫描密钥</button>
+                  <button id="btn-wx-import-keys" class="btn ghost" type="button" disabled>导入密钥并解密</button>
+                  <button id="btn-pull-wechat-groups" class="btn ghost" type="button" disabled>拉取微信群</button>
                 </div>
                 <div id="wechat-bind-result" class="test-result" hidden></div>
               </div>
@@ -454,6 +519,23 @@
       </div>
     </div>
     <div id="tip-stack" class="tip-stack" aria-live="polite"></div>
+    <div id="image-lightbox" class="image-lightbox hidden" hidden>
+      <div class="image-lightbox-backdrop" data-lightbox-close="1"></div>
+      <div class="image-lightbox-panel" role="dialog" aria-modal="true" aria-label="图片预览">
+        <div class="image-lightbox-toolbar">
+          <span class="image-lightbox-title">图片预览</span>
+          <div class="image-lightbox-actions">
+            <button id="btn-lightbox-copy" class="btn" type="button">复制图片</button>
+            <button id="btn-lightbox-save" class="btn" type="button">保存图片</button>
+            <button id="btn-lightbox-close" class="btn ghost" type="button" data-lightbox-close="1">关闭</button>
+          </div>
+        </div>
+        <div class="image-lightbox-body">
+          <img id="image-lightbox-img" alt="预览图片" />
+          <p id="image-lightbox-status" class="field-hint">加载中…</p>
+        </div>
+      </div>
+    </div>
     <script type="module" src="/src/main.ts"></script>
   </body>
 </html>

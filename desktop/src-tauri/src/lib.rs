@@ -5,6 +5,7 @@ use std::process::{Child, Command, Stdio};
 use std::sync::Mutex;
 use std::time::Duration;
 
+use base64::Engine;
 use serde::Serialize;
 use serde_json::Value;
 
@@ -525,6 +526,45 @@ fn api_run_llm(group_id: String) -> Result<Value, String> {
         if let Some(job) = obj.remove("job_id") {
             obj.insert("jobId".into(), job);
         }
+        if let Some(tt) = obj.remove("total_tokens") {
+            obj.insert("totalTokens".into(), tt);
+        }
+        if let Some(pt) = obj.remove("prompt_tokens") {
+            obj.insert("promptTokens".into(), pt);
+        }
+        if let Some(ct) = obj.remove("completion_tokens") {
+            obj.insert("completionTokens".into(), ct);
+        }
+        if let Some(tu) = obj.remove("token_usage") {
+            // keep nested snake or map to camel briefly
+            if let Some(tu_obj) = tu.as_object() {
+                let mut mapped = serde_json::Map::new();
+                mapped.insert(
+                    "promptTokens".into(),
+                    tu_obj
+                        .get("prompt_tokens")
+                        .cloned()
+                        .unwrap_or(Value::Number(0.into())),
+                );
+                mapped.insert(
+                    "completionTokens".into(),
+                    tu_obj
+                        .get("completion_tokens")
+                        .cloned()
+                        .unwrap_or(Value::Number(0.into())),
+                );
+                mapped.insert(
+                    "totalTokens".into(),
+                    tu_obj
+                        .get("total_tokens")
+                        .cloned()
+                        .unwrap_or(Value::Number(0.into())),
+                );
+                obj.insert("tokenUsage".into(), Value::Object(mapped));
+            } else {
+                obj.insert("tokenUsage".into(), tu);
+            }
+        }
     }
     Ok(out)
 }
@@ -542,6 +582,16 @@ fn api_list_reports(group_id: Option<String>, limit: i64) -> Result<Value, Strin
         py_api_json(&["list-reports", "--group-id", &gid, "--limit", &lim])?
     } else {
         py_api_json(&["list-reports", "--limit", &lim])?
+    };
+    Ok(v)
+}
+
+#[tauri::command]
+fn api_token_stats(group_id: Option<String>) -> Result<Value, String> {
+    let v = if let Some(gid) = group_id.filter(|s| !s.is_empty()) {
+        py_api_json(&["token-stats", "--group-id", &gid])?
+    } else {
+        py_api_json(&["token-stats"])?
     };
     Ok(v)
 }
@@ -672,9 +722,23 @@ fn group_to_camel(v: Value) -> Value {
         },
         "llmMonitor": {
             "enabled": lo.get("enabled").cloned().unwrap_or(Value::Bool(false)),
+            "textEnabled": lo.get("text_enabled").cloned().unwrap_or(Value::Bool(true)),
             "providerId": lo.get("provider_id").cloned().unwrap_or(Value::String(String::new())),
             "model": lo.get("model").cloned().unwrap_or(Value::String(String::new())),
             "prompt": lo.get("prompt").cloned().unwrap_or(Value::String(String::new())),
+            "imageEnabled": lo.get("image_enabled").cloned().unwrap_or(Value::Bool(true)),
+            "imageSameAsText": lo
+                .get("image_same_as_text")
+                .cloned()
+                .unwrap_or(Value::Bool(true)),
+            "imageProviderId": lo
+                .get("image_provider_id")
+                .cloned()
+                .unwrap_or(Value::String(String::new())),
+            "imageModel": lo
+                .get("image_model")
+                .cloned()
+                .unwrap_or(Value::String(String::new())),
             "everyMinutes": lo.get("every_minutes").cloned().unwrap_or(Value::from(60)),
             "windowMinutes": lo.get("window_minutes").cloned().unwrap_or(Value::from(60)),
             "minMessages": lo.get("min_messages").cloned().unwrap_or(Value::from(8)),
@@ -792,7 +856,15 @@ fn api_wechat_detect() -> Result<Value, String> {
 
 #[tauri::command]
 fn api_wechat_scan_keys() -> Result<Value, String> {
-    py_api_json(&["wechat-scan-keys"])
+    let v = py_api_json(&["wechat-scan-keys"])?;
+    Ok(channels_result_to_camel(v))
+}
+
+#[tauri::command]
+fn api_wechat_import_keys(payload: Value) -> Result<Value, String> {
+    let raw = payload.to_string();
+    let v = py_api_json(&["wechat-import-keys", "--json", &raw])?;
+    Ok(channels_result_to_camel(v))
 }
 
 #[tauri::command]
@@ -802,7 +874,8 @@ fn api_pull_telegram_groups() -> Result<Value, String> {
 
 #[tauri::command]
 fn api_pull_wechat_groups() -> Result<Value, String> {
-    py_api_json(&["pull-wechat-groups"])
+    let v = py_api_json(&["pull-wechat-groups"])?;
+    Ok(channels_result_to_camel(v))
 }
 
 fn channels_result_to_camel(v: Value) -> Value {
@@ -874,6 +947,127 @@ fn pull_onebot_groups() -> Result<String, String> {
     Ok(format!("已从 OneBot 拉取 {n} 个群"))
 }
 
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct FetchedImage {
+    data_url: String,
+    mime: String,
+    bytes_len: usize,
+}
+
+#[tauri::command]
+fn fetch_image_data_url(url: String) -> Result<FetchedImage, String> {
+    let url = url.trim().to_string();
+
+    // 本地媒体：gmm-media:media/... 或 media/...
+    let local_rel = if let Some(rest) = url.strip_prefix("gmm-media:") {
+        Some(rest.trim_start_matches('/').to_string())
+    } else if url.starts_with("media/") {
+        Some(url.clone())
+    } else {
+        None
+    };
+
+    if let Some(rel) = local_rel {
+        let path = project_root().join("data").join(&rel);
+        // 防路径穿越：必须落在 data/media 下
+        let media_root = project_root().join("data").join("media");
+        let canon = path
+            .canonicalize()
+            .map_err(|e| format!("本地图片不存在: {rel} ({e})"))?;
+        let media_canon = media_root
+            .canonicalize()
+            .unwrap_or(media_root.clone());
+        if !canon.starts_with(&media_canon) {
+            return Err("非法本地图片路径".into());
+        }
+        let bytes = fs::read(&canon).map_err(|e| format!("读取本地图片失败: {e}"))?;
+        if bytes.is_empty() {
+            return Err("图片内容为空".into());
+        }
+        if bytes.len() > 25 * 1024 * 1024 {
+            return Err("图片过大（超过 25MB）".into());
+        }
+        let mime = match canon
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("")
+            .to_lowercase()
+            .as_str()
+        {
+            "png" => "image/png",
+            "gif" => "image/gif",
+            "webp" => "image/webp",
+            "bmp" => "image/bmp",
+            _ => "image/jpeg",
+        }
+        .to_string();
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+        return Ok(FetchedImage {
+            data_url: format!("data:{mime};base64,{b64}"),
+            mime,
+            bytes_len: bytes.len(),
+        });
+    }
+
+    if !(url.starts_with("http://") || url.starts_with("https://")) {
+        return Err("仅支持本地媒体或 http/https 图片地址".into());
+    }
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(45))
+        .user_agent(
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 \
+             (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+        )
+        .build()
+        .map_err(|e| format!("创建 HTTP 客户端失败: {e}"))?;
+    let mut req = client.get(&url);
+    let lower = url.to_lowercase();
+    if lower.contains("qpic.cn") || lower.contains("qq.com") || lower.contains("gtimg.cn") {
+        req = req.header("Referer", "https://web.qphoto.qq.com/");
+    }
+    let resp = req.send().map_err(|e| format!("下载图片失败: {e}"))?;
+    if !resp.status().is_success() {
+        return Err(format!(
+            "下载图片失败: HTTP {}（远程图床可能已过期；新消息会在落库时保存到本地）",
+            resp.status()
+        ));
+    }
+    let mime = resp
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("image/jpeg")
+        .split(';')
+        .next()
+        .unwrap_or("image/jpeg")
+        .trim()
+        .to_string();
+    if !mime.starts_with("image/") && mime != "application/octet-stream" {
+        return Err(format!("不是图片类型: {mime}"));
+    }
+    let bytes = resp
+        .bytes()
+        .map_err(|e| format!("读取图片内容失败: {e}"))?;
+    if bytes.is_empty() {
+        return Err("图片内容为空".into());
+    }
+    if bytes.len() > 25 * 1024 * 1024 {
+        return Err("图片过大（超过 25MB）".into());
+    }
+    let mime = if mime == "application/octet-stream" {
+        "image/jpeg".to_string()
+    } else {
+        mime
+    };
+    let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+    Ok(FetchedImage {
+        data_url: format!("data:{mime};base64,{b64}"),
+        mime,
+        bytes_len: bytes.len(),
+    })
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -896,6 +1090,7 @@ pub fn run() {
             api_run_llm,
             api_pull_history,
             api_list_reports,
+            api_token_stats,
             api_fetch_models,
             api_test_provider,
             api_test_onebot,
@@ -911,13 +1106,16 @@ pub fn run() {
             api_telegram_detect,
             api_wechat_detect,
             api_wechat_scan_keys,
+            api_wechat_import_keys,
             api_pull_telegram_groups,
             api_pull_wechat_groups,
-            pull_onebot_groups
+            pull_onebot_groups,
+            fetch_image_data_url
         ])
         .setup(|_| {
             let _ = fs::create_dir_all(project_root().join("data"));
             let _ = fs::create_dir_all(project_root().join("data").join("group_configs"));
+            let _ = fs::create_dir_all(project_root().join("data").join("media"));
             let _ = fs::create_dir_all(project_root().join("logs"));
             Ok(())
         })

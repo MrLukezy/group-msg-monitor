@@ -251,6 +251,29 @@ function isHttpUrl(url: string): boolean {
   return /^https?:\/\//i.test(url);
 }
 
+function isLocalMediaRef(value: string): boolean {
+  const v = (value || "").trim();
+  return (
+    v.startsWith("gmm-media:") ||
+    v.startsWith("media/") ||
+    /^file:\/\//i.test(v)
+  );
+}
+
+function resolveImageOpenUrl(seg: { url?: string; file?: string }): string {
+  const file = (seg.file || "").trim();
+  const url = (seg.url || "").trim();
+  if (isLocalMediaRef(file)) {
+    return file.startsWith("gmm-media:") ? file : `gmm-media:${file.replace(/^\/+/, "")}`;
+  }
+  if (isLocalMediaRef(url)) {
+    return url.startsWith("gmm-media:") ? url : `gmm-media:${url.replace(/^\/+/, "")}`;
+  }
+  if (isHttpUrl(url)) return url;
+  if (isHttpUrl(file)) return file;
+  return "";
+}
+
 export function renderMsgHtml(raw: string): string {
   const segs = parseCqContent(raw);
   if (!segs.length) {
@@ -272,13 +295,14 @@ export function renderMsgHtml(raw: string): string {
         );
         break;
       case "image": {
-        const url = seg.url || "";
-        if (url && isHttpUrl(url)) {
-          // 不内嵌 <img>：避免轮询重绘时反复拉图导致卡死
+        const openUrl = resolveImageOpenUrl(seg);
+        if (openUrl) {
+          // 不内嵌 <img>：避免轮询重绘时反复拉图导致卡死；点击后由应用内悬浮窗打开
+          const label = isLocalMediaRef(openUrl) ? "🖼 查看图片(本地)" : "🖼 查看图片";
           parts.push(
-            `<a class="msg-chip image-link" href="${escapeHtml(url)}" data-ext-url="${escapeHtml(
-              url,
-            )}" title="${escapeHtml(url)}">🖼 查看图片</a>`,
+            `<a class="msg-chip image-link" href="${escapeHtml(openUrl)}" data-image-url="${escapeHtml(
+              openUrl,
+            )}" title="${escapeHtml(openUrl)}">${label}</a>`,
           );
         } else {
           parts.push(`<span class="msg-chip">🖼 图片</span>`);

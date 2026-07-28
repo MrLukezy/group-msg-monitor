@@ -21,6 +21,7 @@ data/telegram_2fa_password.txt
 data/wechat_keys.json
 data/wechat_decrypted/
 data/wechat_poll_state.json
+data/media/
 logs/*.log
 logs/*.log.*
 logs/*.txt

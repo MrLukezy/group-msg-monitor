@@ -104,8 +104,12 @@ class GroupMessageEvent(BaseModel):
 
 
 def try_parse_group_message(event: dict[str, Any]) -> GroupMessageEvent | None:
-    if event.get("post_type") != "message":
+    post = event.get("post_type")
+    # message：他人/群消息；message_sent：自己发送的群消息（部分协议端会推）
+    if post not in ("message", "message_sent"):
         return None
     if event.get("message_type") != "group":
         return None
-    return GroupMessageEvent.model_validate(event)
+    payload = dict(event)
+    payload["post_type"] = "message"
+    return GroupMessageEvent.model_validate(payload)

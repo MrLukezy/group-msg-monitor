@@ -7,6 +7,7 @@ import json
 import logging
 import os
 import re
+from dataclasses import dataclass
 from typing import Any
 
 import aiohttp
@@ -14,6 +15,69 @@ import aiohttp
 from app.settings_store import LlmProvider
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class TokenUsage:
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    total_tokens: int = 0
+
+    def add(self, other: "TokenUsage | None") -> "TokenUsage":
+        if not other:
+            return self
+        self.prompt_tokens += int(other.prompt_tokens or 0)
+        self.completion_tokens += int(other.completion_tokens or 0)
+        self.total_tokens += int(other.total_tokens or 0)
+        if self.total_tokens <= 0:
+            self.total_tokens = self.prompt_tokens + self.completion_tokens
+        return self
+
+    def as_dict(self) -> dict[str, int]:
+        total = int(self.total_tokens or 0)
+        if total <= 0:
+            total = int(self.prompt_tokens or 0) + int(self.completion_tokens or 0)
+        return {
+            "prompt_tokens": int(self.prompt_tokens or 0),
+            "completion_tokens": int(self.completion_tokens or 0),
+            "total_tokens": total,
+        }
+
+
+def parse_usage_payload(data: Any) -> TokenUsage:
+    """从各类 Provider 响应里抽出 usage（兼容 prompt/completion 与 input/output）。"""
+    if not isinstance(data, dict):
+        return TokenUsage()
+    usage = data.get("usage")
+    if not isinstance(usage, dict):
+        usage = data if any(
+            k in data
+            for k in (
+                "prompt_tokens",
+                "completion_tokens",
+                "total_tokens",
+                "input_tokens",
+                "output_tokens",
+            )
+        ) else {}
+    if not isinstance(usage, dict):
+        return TokenUsage()
+    prompt = int(
+        usage.get("prompt_tokens")
+        or usage.get("input_tokens")
+        or usage.get("promptTokens")
+        or 0
+    )
+    completion = int(
+        usage.get("completion_tokens")
+        or usage.get("output_tokens")
+        or usage.get("completionTokens")
+        or 0
+    )
+    total = int(usage.get("total_tokens") or usage.get("totalTokens") or 0)
+    if total <= 0:
+        total = prompt + completion
+    return TokenUsage(prompt_tokens=prompt, completion_tokens=completion, total_tokens=total)
 
 
 def normalize_openai_compatible_base(base_url: str) -> str:
@@ -86,7 +150,12 @@ async def chat_complete(
     temperature: float = 0.2,
     timeout_sec: float = 90,
     force_json: bool = True,
-) -> str:
+    history: list[dict[str, str]] | None = None,
+) -> tuple[str, TokenUsage]:
+    """单轮或多轮对话。history 为既有 user/assistant 消息（不含当前 system/user）。
+
+    返回 (文本内容, token 用量)。部分 Provider 可能无法回报 usage，此时为 0。
+    """
     ptype = (provider.type or "openai_compatible").lower()
     use_model = model or provider.default_model
     if ptype == "openai_compatible":
@@ -98,15 +167,35 @@ async def chat_complete(
             temperature=temperature,
             timeout_sec=timeout_sec,
             force_json=force_json,
+            history=history,
         )
     if ptype == "opencode":
-        return await _opencode(
-            provider, model=use_model, system=system, user=user, timeout_sec=timeout_sec
+        # OpenCode 路径暂拼成单轮文本
+        merged_user = user
+        if history:
+            chunks = []
+            for h in history:
+                role = h.get("role") or "user"
+                chunks.append(f"[{role}]\n{h.get('content') or ''}")
+            chunks.append(f"[user]\n{user}")
+            merged_user = "\n\n".join(chunks)
+        text = await _opencode(
+            provider, model=use_model, system=system, user=merged_user, timeout_sec=timeout_sec
         )
+        return text, TokenUsage()
     if ptype == "cursor":
-        return await _cursor_sdk(
-            provider, model=use_model, system=system, user=user, timeout_sec=timeout_sec
+        merged_user = user
+        if history:
+            chunks = []
+            for h in history:
+                role = h.get("role") or "user"
+                chunks.append(f"[{role}]\n{h.get('content') or ''}")
+            chunks.append(f"[user]\n{user}")
+            merged_user = "\n\n".join(chunks)
+        text = await _cursor_sdk(
+            provider, model=use_model, system=system, user=merged_user, timeout_sec=timeout_sec
         )
+        return text, TokenUsage()
     raise ValueError(f"不支持的 LLM provider type: {provider.type}")
 
 
@@ -212,7 +301,7 @@ async def test_provider_connection(
         chat_preview = ""
         if use_model:
             try:
-                chat_preview = await chat_complete(
+                chat_preview, _usage = await chat_complete(
                     provider,
                     model=use_model,
                     system="Reply with exactly: OK",
@@ -262,20 +351,25 @@ async def _openai_compatible(
     temperature: float,
     timeout_sec: float,
     force_json: bool = True,
-) -> str:
+    history: list[dict[str, str]] | None = None,
+) -> tuple[str, TokenUsage]:
     base = normalize_openai_compatible_base(provider.base_url or "https://api.openai.com/v1")
     url = f"{base}/chat/completions"
     headers = {"Content-Type": "application/json"}
     if provider.api_key:
         headers["Authorization"] = f"Bearer {provider.api_key}"
+    messages: list[dict[str, str]] = [{"role": "system", "content": system}]
+    for h in history or []:
+        role = (h.get("role") or "").strip().lower()
+        content = h.get("content") or ""
+        if role in ("user", "assistant") and content:
+            messages.append({"role": role, "content": content})
+    messages.append({"role": "user", "content": user})
     payload: dict[str, Any] = {
         "model": model,
         "temperature": temperature,
-        "messages": [
-            {"role": "system", "content": system},
-            {"role": "user", "content": user},
-        ],
-        "max_tokens": 64 if not force_json else 2048,
+        "messages": messages,
+        "max_tokens": 64 if not force_json else 4096,
     }
     if force_json:
         payload["response_format"] = {"type": "json_object"}
@@ -287,7 +381,8 @@ async def _openai_compatible(
                 raise RuntimeError(f"OpenAI Compatible 失败 HTTP {resp.status}: {body[:400]}")
             data = json.loads(body)
     try:
-        return data["choices"][0]["message"]["content"]
+        content = data["choices"][0]["message"]["content"]
+        return str(content or ""), parse_usage_payload(data)
     except Exception as e:
         raise RuntimeError(f"解析 OpenAI 响应失败: {e}") from e
 
@@ -430,3 +525,59 @@ async def _cursor_sdk(
         raise RuntimeError(f"Cursor SDK 调用失败: {last}")
 
     return await asyncio.to_thread(_run)
+
+
+async def describe_image(
+    provider: LlmProvider,
+    *,
+    model: str,
+    mime: str,
+    b64: str,
+    timeout_sec: float = 60,
+) -> tuple[str, TokenUsage]:
+    """用视觉能力描述单张图片；不支持时返回空串与零用量。"""
+    ptype = (provider.type or "openai_compatible").lower()
+    if ptype != "openai_compatible":
+        return "", TokenUsage()
+    use_model = model or provider.default_model
+    base = normalize_openai_compatible_base(provider.base_url or "https://api.openai.com/v1")
+    url = f"{base}/chat/completions"
+    headers = {"Content-Type": "application/json"}
+    if provider.api_key:
+        headers["Authorization"] = f"Bearer {provider.api_key}"
+    data_url = f"data:{mime};base64,{b64}"
+    payload: dict[str, Any] = {
+        "model": use_model,
+        "temperature": 0.1,
+        "max_tokens": 300,
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": (
+                            "请用中文简洁描述这张聊天图片的关键内容："
+                            "可见文字请原样摘录；人物/场景/图表/截图界面也要概括。"
+                            "不要臆测看不见的信息。控制在 120 字以内。"
+                        ),
+                    },
+                    {"type": "image_url", "image_url": {"url": data_url}},
+                ],
+            }
+        ],
+    }
+    timeout = aiohttp.ClientTimeout(total=timeout_sec)
+    try:
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.post(url, headers=headers, json=payload) as resp:
+                body = await resp.text()
+                if resp.status >= 400:
+                    logger.warning("图片描述失败 HTTP %s: %s", resp.status, body[:240])
+                    return "", TokenUsage()
+                data = json.loads(body)
+        text = data["choices"][0]["message"]["content"]
+        return str(text or "").strip(), parse_usage_payload(data)
+    except Exception:
+        logger.exception("图片描述调用异常")
+        return "", TokenUsage()

@@ -45,6 +45,8 @@ type LlmProvider = {
   defaultModel: string;
 };
 
+const WECHAT_CHANNEL_ENABLED = false;
+
 type ChannelBindQQ = { bound: boolean; label?: string; lastError?: string };
 type ChannelBindWechat = {
   bound: boolean;
@@ -98,9 +100,14 @@ type GroupConfig = {
   };
   llmMonitor: {
     enabled: boolean;
+    textEnabled?: boolean;
     providerId: string;
     model: string;
     prompt: string;
+    imageEnabled?: boolean;
+    imageSameAsText?: boolean;
+    imageProviderId?: string;
+    imageModel?: string;
     everyMinutes: number;
     windowMinutes: number;
     minMessages: number;
@@ -117,6 +124,27 @@ type ReportRow = {
   reportMd?: string | null;
   windowStart?: number | null;
   windowEnd?: number | null;
+  windowExtended?: boolean;
+  lookbackMessages?: number;
+  llmContextRounds?: number;
+  earlierMessages?: number;
+  contextUsage?: {
+    used_earlier_context?: boolean;
+    earlier_rounds?: number;
+    earlier_messages?: number;
+    summary?: string;
+  };
+  lookbackReasons?: string[];
+  source?: string;
+  skipped?: boolean;
+  promptTokens?: number;
+  completionTokens?: number;
+  totalTokens?: number;
+  tokenUsage?: {
+    promptTokens?: number;
+    completionTokens?: number;
+    totalTokens?: number;
+  };
 };
 
 const PROVIDER_PRESETS: Record<
@@ -176,6 +204,7 @@ const THEMES: {
 
 const READ_IDS_KEY = "gmm_read_report_ids";
 const LAST_TIP_ID_KEY = "gmm_last_tip_report_id";
+const HIDE_SKIPPED_KEY = "gmm_hide_skipped_reports";
 const NORMAL_SIZE = { width: 1280, height: 820 };
 const COMPACT_SIZE = { width: 420, height: 168 };
 
@@ -186,6 +215,7 @@ let settingsCache: AppSettings | null = null;
 let editingProviderId: string | null = null;
 let settingsModelOptions: { id: string }[] = [];
 let groupModelOptions: { id: string }[] = [];
+let imageModelOptions: { id: string }[] = [];
 let toastTimer = 0;
 let reduceMotion = false;
 let groupNameMap = new Map<string, string>();
@@ -250,7 +280,7 @@ function toast(msg: string, err = false) {
 }
 
 function escapeHtml(s: string) {
-  return s
+  return String(s ?? "")
     .replace(/&/g, "&amp;")
     .replace(/</g, "&lt;")
     .replace(/>/g, "&gt;")
@@ -306,7 +336,32 @@ async function clearAllUnread() {
 }
 
 function isSkippedReport(r: ReportRow): boolean {
-  return (r.headline || "").includes("[定时跳过]") || (r.headline || "").includes("[跳过]");
+  if (r.skipped) return true;
+  const h = r.headline || "";
+  return h.includes("[定时跳过]") || h.includes("[跳过]");
+}
+
+function hideSkippedReportsEnabled(): boolean {
+  const el = document.getElementById("monitored-hide-skipped") as HTMLInputElement | null;
+  if (el) return !!el.checked;
+  const raw = localStorage.getItem(HIDE_SKIPPED_KEY);
+  return raw !== "0";
+}
+
+function loadHideSkippedToggle() {
+  const el = document.getElementById("monitored-hide-skipped") as HTMLInputElement | null;
+  if (!el) return;
+  const raw = localStorage.getItem(HIDE_SKIPPED_KEY);
+  el.checked = raw !== "0";
+}
+
+function saveHideSkippedToggle(on: boolean) {
+  localStorage.setItem(HIDE_SKIPPED_KEY, on ? "1" : "0");
+}
+
+function visibleReports(reports: ReportRow[]): ReportRow[] {
+  if (!hideSkippedReportsEnabled()) return reports;
+  return reports.filter((r) => !isSkippedReport(r));
 }
 
 function applyTheme(themeId: string) {
@@ -594,6 +649,9 @@ function renderChannelBindings(settings?: AppSettings | null) {
   const wx = s?.channels?.wechat;
   const tg = s?.channels?.telegram;
 
+  const wxCard = document.querySelector<HTMLElement>('.channel-card[data-channel="wechat"]');
+  if (wxCard) wxCard.hidden = !WECHAT_CHANNEL_ENABLED;
+
   const setBadge = (id: string, bound: boolean) => {
     const el = document.getElementById(id);
     if (!el) return;
@@ -601,7 +659,15 @@ function renderChannelBindings(settings?: AppSettings | null) {
     el.classList.toggle("on", bound);
   };
   setBadge("ch-qq-badge", !!qq?.bound);
-  setBadge("ch-wx-badge", !!wx?.bound);
+  if (WECHAT_CHANNEL_ENABLED) {
+    setBadge("ch-wx-badge", !!wx?.bound);
+  } else {
+    const badge = document.getElementById("ch-wx-badge");
+    if (badge) {
+      badge.textContent = "已屏蔽";
+      badge.classList.remove("on");
+    }
+  }
   setBadge("ch-tg-badge", !!tg?.bound);
 
   const qqStatus = document.getElementById("ch-qq-status");
@@ -612,10 +678,15 @@ function renderChannelBindings(settings?: AppSettings | null) {
   }
   const wxStatus = document.getElementById("ch-wx-status");
   if (wxStatus) {
-    wxStatus.textContent = wx?.bound
-      ? `已绑定${wx.label ? ` · ${wx.label}` : ""} · 需保持 PC 微信登录`
-      : "未绑定 · 需本机 PC 微信保持登录";
-    if (wx?.lastError) wxStatus.textContent += ` · ${wx.lastError}`;
+    if (!WECHAT_CHANNEL_ENABLED) {
+      wxStatus.textContent = "已屏蔽 · Windows ≥4.1.10 暂无稳定取 key 方案";
+    } else if (!wx?.bound) {
+      wxStatus.textContent = "未绑定 · 需本机 PC 微信保持登录";
+    } else if (wx.lastError) {
+      wxStatus.textContent = `已绑定${wx.label ? ` · ${wx.label}` : ""} · 尚未就绪：${wx.lastError}`;
+    } else {
+      wxStatus.textContent = `已绑定${wx.label ? ` · ${wx.label}` : ""} · 需保持 PC 微信登录`;
+    }
   }
   const tgStatus = document.getElementById("ch-tg-status");
   if (tgStatus) {
@@ -727,44 +798,162 @@ async function refreshLive() {
   renderMessages("live-messages", rows);
 }
 
-async function refreshGroups() {
-  const sort = $<HTMLSelectElement>("groups-sort").value;
-  const q = $<HTMLInputElement>("groups-q").value.trim();
-  const showBlocked = $<HTMLInputElement>("groups-show-blocked").checked;
-  const res = await invoke<{ groups: GroupItem[] }>("api_list_groups", { sort, q });
-  groupsCache = res.groups || [];
-  rememberGroupNames(groupsCache);
-  await refreshUnreadBadge().catch(() => undefined);
-  const box = $("groups-list");
-  const visible = showBlocked
-    ? groupsCache
-    : groupsCache.filter((g) => !g.blocked);
-  if (!visible.length) {
-    box.innerHTML = `<div class="empty">${
-      groupsCache.some((g) => g.blocked) && !showBlocked
-        ? "当前列表已隐藏屏蔽群。勾选「显示已屏蔽」可查看。"
-        : "暂无群。可先绑定通道后点「拉取群列表」，或启动监听收消息。"
-    }</div>`;
-    return;
+const GROUPS_ACTIVE_FILTER_KEY = "gmm_groups_active_filter_v2";
+const GROUPS_KEEP_ENABLED_KEY = "gmm_groups_keep_enabled";
+
+/** 活跃过滤：0=全部, any=有落库消息, 7/30/90=近 N 天 */
+type GroupsActiveFilter = "0" | "any" | "7" | "30" | "90";
+
+function loadGroupsActiveFilter(): GroupsActiveFilter {
+  const raw = (localStorage.getItem(GROUPS_ACTIVE_FILTER_KEY) || "").trim();
+  if (raw === "0" || raw === "any" || raw === "7" || raw === "30" || raw === "90") {
+    return raw;
   }
-  box.innerHTML = visible
-    .map((g) => {
-      const last = g.lastTime
-        ? new Date(g.lastTime * 1000).toLocaleString()
-        : "暂无消息";
-      const name = groupDisplayName(g.groupId, g.groupName);
-      const ch = guessChannel(g.groupId, g.channel);
-      const unread = g.enabled && !g.blocked ? groupUnreadCount(g.groupId) : 0;
-      const statusBadge = g.blocked
-        ? `<span class="badge blocked">已屏蔽</span>`
-        : `<span class="badge ${g.enabled ? "on" : ""}">${g.enabled ? "监听中" : "未启用"}</span>`;
-      return `<button class="group-item ${g.blocked ? "is-blocked" : ""} ${
-        unread > 0 ? "has-unread" : ""
-      }" type="button" data-id="${escapeHtml(g.groupId)}">
+  // 不再沿用旧的默认「近30天」，避免把仅拉取、尚未落库的群全滤掉
+  return "0";
+}
+
+function saveGroupsActiveFilter(v: GroupsActiveFilter) {
+  localStorage.setItem(GROUPS_ACTIVE_FILTER_KEY, v);
+}
+
+function loadGroupsKeepEnabled(): boolean {
+  const raw = localStorage.getItem(GROUPS_KEEP_ENABLED_KEY);
+  if (raw === null) return true;
+  return raw === "1" || raw === "true";
+}
+
+function saveGroupsKeepEnabled(on: boolean) {
+  localStorage.setItem(GROUPS_KEEP_ENABLED_KEY, on ? "1" : "0");
+}
+
+function normalizeGroupLastTs(g: GroupItem): number {
+  const raw = Number(g.lastTime || 0);
+  if (!raw) return 0;
+  // 兼容误存毫秒时间戳
+  return raw > 1e12 ? Math.floor(raw / 1000) : raw;
+}
+
+function groupMatchesActiveFilter(g: GroupItem, filter: GroupsActiveFilter): boolean {
+  if (filter === "0") return true;
+  const last = normalizeGroupLastTs(g);
+  const hasMsg = last > 0 || Number(g.msgCount || 0) > 0;
+  if (filter === "any") return hasMsg;
+  if (!hasMsg || !last) return false;
+  const days = Number(filter);
+  const cutoff = Math.floor(Date.now() / 1000) - days * 24 * 60 * 60;
+  return last >= cutoff;
+}
+
+function activeFilterLabel(filter: GroupsActiveFilter): string {
+  if (filter === "0") return "全部群";
+  if (filter === "any") return "有落库消息";
+  return `近 ${filter} 天内有消息`;
+}
+
+function updateGroupsFilterSummary(opts: {
+  filter: GroupsActiveFilter;
+  keepEnabled: boolean;
+  showBlocked: boolean;
+  shown: number;
+  total: number;
+  hiddenInactive: number;
+  hiddenBlocked: number;
+}) {
+  const el = document.getElementById("groups-filter-summary");
+  if (!el) return;
+  const bits = [
+    `<strong>过滤</strong>：${activeFilterLabel(opts.filter)}`,
+    opts.keepEnabled ? "始终显示监听中" : "监听中也按活跃过滤",
+    opts.showBlocked ? "含已屏蔽" : "隐藏已屏蔽",
+    `显示 <strong>${opts.shown}</strong> / ${opts.total}`,
+  ];
+  if (opts.hiddenInactive > 0) {
+    bits.push(`已隐藏不活跃/无落库 ${opts.hiddenInactive}`);
+  }
+  if (opts.hiddenBlocked > 0) bits.push(`已隐藏屏蔽 ${opts.hiddenBlocked}`);
+  if (opts.filter !== "0") {
+    bits.push("活跃度按本地落库消息判断");
+  }
+  el.innerHTML = bits.join(" · ");
+}
+
+async function refreshGroups() {
+  const box = $("groups-list");
+  try {
+    const sort = $<HTMLSelectElement>("groups-sort").value;
+    const q = $<HTMLInputElement>("groups-q").value.trim();
+    const showBlocked = $<HTMLInputElement>("groups-show-blocked").checked;
+    const activeSel = document.getElementById(
+      "groups-active-filter",
+    ) as HTMLSelectElement | null;
+    const keepEnabledEl = document.getElementById(
+      "groups-keep-enabled",
+    ) as HTMLInputElement | null;
+    const filter = (activeSel?.value || loadGroupsActiveFilter()) as GroupsActiveFilter;
+    const keepEnabled = keepEnabledEl ? keepEnabledEl.checked : loadGroupsKeepEnabled();
+    if (activeSel) activeSel.value = filter;
+    if (keepEnabledEl) keepEnabledEl.checked = keepEnabled;
+
+    const res = await invoke<{ groups: GroupItem[] }>("api_list_groups", { sort, q });
+    groupsCache = res.groups || [];
+    rememberGroupNames(groupsCache);
+    await refreshUnreadBadge().catch(() => undefined);
+
+    let hiddenBlocked = 0;
+    let hiddenInactive = 0;
+    const visible = groupsCache.filter((g) => {
+      if (!showBlocked && g.blocked) {
+        hiddenBlocked += 1;
+        return false;
+      }
+      if (!groupMatchesActiveFilter(g, filter)) {
+        if (keepEnabled && g.enabled && !g.blocked) return true;
+        hiddenInactive += 1;
+        return false;
+      }
+      return true;
+    });
+
+    updateGroupsFilterSummary({
+      filter,
+      keepEnabled,
+      showBlocked,
+      shown: visible.length,
+      total: groupsCache.length,
+      hiddenInactive,
+      hiddenBlocked,
+    });
+
+    if (!visible.length) {
+      box.innerHTML = `<div class="empty">${
+        groupsCache.length
+          ? "当前过滤条件下没有群。可将活跃过滤改为「全部群」，或勾选「始终显示监听中」。"
+          : "暂无群。可先绑定通道后点「拉取群列表」，或启动监听收消息。"
+      }</div>`;
+      return;
+    }
+    box.innerHTML = visible
+      .map((g) => {
+        const lastTs = normalizeGroupLastTs(g);
+        const last = lastTs
+          ? new Date(lastTs * 1000).toLocaleString()
+          : "暂无落库消息";
+        const name = groupDisplayName(g.groupId, g.groupName);
+        const ch = guessChannel(g.groupId, g.channel);
+        const unread = g.enabled && !g.blocked ? groupUnreadCount(g.groupId) : 0;
+        const statusBadge = g.blocked
+          ? `<span class="badge blocked">已屏蔽</span>`
+          : `<span class="badge ${g.enabled ? "on" : ""}">${g.enabled ? "监听中" : "未启用"}</span>`;
+        return `<button class="group-item ${g.blocked ? "is-blocked" : ""} ${
+          unread > 0 ? "has-unread" : ""
+        }" type="button" data-id="${escapeHtml(g.groupId)}">
         ${unreadBadgeHtml(unread)}
         <div>
           <div class="name">${escapeHtml(name)}</div>
-          <div class="meta"><span class="channel-tag">${escapeHtml(channelLabel(ch))}</span> · ${escapeHtml(g.groupId)} · 最近 ${escapeHtml(last)} · ${g.msgCount} 条</div>
+          <div class="meta"><span class="channel-tag">${escapeHtml(channelLabel(ch))}</span> · ${escapeHtml(
+            g.groupId,
+          )} · 最近 ${escapeHtml(last)} · ${Number(g.msgCount) || 0} 条</div>
         </div>
         <div class="badges">
           ${statusBadge}
@@ -772,11 +961,18 @@ async function refreshGroups() {
           <span class="badge ${g.llmEnabled ? "on" : ""}">LLM</span>
         </div>
       </button>`;
-    })
-    .join("");
-  box.querySelectorAll<HTMLButtonElement>(".group-item").forEach((btn) => {
-    btn.onclick = () => openGroup(btn.dataset.id || "");
-  });
+      })
+      .join("");
+    box.querySelectorAll<HTMLButtonElement>(".group-item").forEach((btn) => {
+      btn.onclick = () => openGroup(btn.dataset.id || "");
+    });
+  } catch (e) {
+    console.error("refreshGroups failed", e);
+    box.innerHTML = `<div class="empty">加载群列表失败：${escapeHtml(String(e))}</div>`;
+    const summary = document.getElementById("groups-filter-summary");
+    if (summary) summary.textContent = "过滤条件不可用（列表加载失败）";
+    throw e;
+  }
 }
 
 function showMonitoredMaster() {
@@ -793,12 +989,104 @@ function formatReportWindow(r: ReportRow): string {
   return r.createdAt || "";
 }
 
+function reportTotalTokens(r: ReportRow): number {
+  const n =
+    r.totalTokens ??
+    r.tokenUsage?.totalTokens ??
+    (r.promptTokens || 0) + (r.completionTokens || 0);
+  return Number.isFinite(n) ? Math.max(0, Number(n)) : 0;
+}
+
+/** 展示 token 数：千级用 k。 */
+function formatTokenCount(n?: number | null): string {
+  const v = Number(n);
+  if (!Number.isFinite(v) || v <= 0) return "0";
+  if (v < 1000) return String(Math.round(v));
+  if (v < 10000) return `${(v / 1000).toFixed(1)}k`;
+  return `${Math.round(v / 1000)}k`;
+}
+
+function reportTokenMeta(r: ReportRow): string {
+  const total = reportTotalTokens(r);
+  if (!total) return "";
+  const prompt = r.promptTokens ?? r.tokenUsage?.promptTokens ?? 0;
+  const completion = r.completionTokens ?? r.tokenUsage?.completionTokens ?? 0;
+  if (prompt || completion) {
+    return ` · Token ${formatTokenCount(total)}（入 ${formatTokenCount(prompt)} / 出 ${formatTokenCount(completion)}）`;
+  }
+  return ` · Token ${formatTokenCount(total)}`;
+}
+
+/** 渲染分析结果：`**用户名**`（非「标题：」形式）与已知发言者显示为黄色。 */
+function renderReportMdHtml(md: string, extraUserNames: string[] = []): string {
+  const raw = (md || "").trim() || "（无详细内容）";
+  type Tok = { kind: "user" | "bold" | "text"; text: string };
+  const toks: Tok[] = [];
+  const re = /\*\*([^*\n]+)\*\*(：|:)?/g;
+  let last = 0;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(raw))) {
+    if (m.index > last) toks.push({ kind: "text", text: raw.slice(last, m.index) });
+    if (m[2]) {
+      toks.push({ kind: "bold", text: m[1] });
+      toks.push({ kind: "text", text: m[2] });
+    } else {
+      toks.push({ kind: "user", text: m[1] });
+    }
+    last = m.index + m[0].length;
+  }
+  if (last < raw.length) toks.push({ kind: "text", text: raw.slice(last) });
+
+  const known = [
+    ...new Set(
+      extraUserNames
+        .map((n) => (n || "").trim())
+        .filter((n) => n.length >= 2 && n.length <= 32),
+    ),
+  ].sort((a, b) => b.length - a.length);
+
+  const paintText = (text: string): string => {
+    if (!known.length || !text) return escapeHtml(text);
+    const hits: string[] = [];
+    let out = text;
+    for (const name of known) {
+      if (!out.includes(name)) continue;
+      const parts = out.split(name);
+      out = parts.join(`\u0000N${hits.length}\u0000`);
+      hits.push(name);
+    }
+    return escapeHtml(out).replace(/\u0000N(\d+)\u0000/g, (_, i) => {
+      const name = hits[Number(i)] || "";
+      return `<span class="report-user-name">${escapeHtml(name)}</span>`;
+    });
+  };
+
+  return toks
+    .map((t) => {
+      if (t.kind === "user") {
+        return `<span class="report-user-name">${escapeHtml(t.text)}</span>`;
+      }
+      if (t.kind === "bold") {
+        return `<strong class="report-md-strong">${escapeHtml(t.text)}</strong>`;
+      }
+      return paintText(t.text)
+        .replace(/^## (.+)$/gm, `<span class="report-md-h2">$1</span>`)
+        .replace(/^### (.+)$/gm, `<span class="report-md-h3">$1</span>`);
+    })
+    .join("");
+}
+
+function setReportDetailBody(md: string, extraUserNames: string[] = []) {
+  $("monitored-report-detail-body").innerHTML = renderReportMdHtml(md, extraUserNames);
+}
+
 function renderMonitoredReportList(reports: ReportRow[]) {
   const box = $("monitored-report-list");
   if (!monitoredSelectedGroupId) {
     box.innerHTML = `<div class="empty">请选择左侧群查看分析主题</div>`;
     return;
   }
+  const shown = visibleReports(reports);
   if (!reports.length) {
     const g = groupsCache.find((x) => x.groupId === monitoredSelectedGroupId);
     box.innerHTML = `<div class="empty">${
@@ -808,10 +1096,14 @@ function renderMonitoredReportList(reports: ReportRow[]) {
     }</div>`;
     return;
   }
-  box.innerHTML = reports
+  if (!shown.length) {
+    box.innerHTML = `<div class="empty">当前仅有定时跳过记录；可关闭「忽略定时跳过」查看</div>`;
+    return;
+  }
+  box.innerHTML = shown
     .map((r) => {
       const risk = (r.riskMax || "none").toLowerCase();
-      const skipped = (r.headline || "").includes("[定时跳过]");
+      const skipped = isSkippedReport(r);
       const unread = !skipped && isReportUnread(r.id);
       return `<button class="report-title-item ${risk === "high" ? "high" : ""} ${
         skipped ? "skipped" : ""
@@ -820,7 +1112,7 @@ function renderMonitoredReportList(reports: ReportRow[]) {
         <div class="report-title-text">${escapeHtml(r.headline || "(无标题)")}</div>
         <div class="report-title-meta">${escapeHtml(r.createdAt || "")} · 风险 ${escapeHtml(
           r.riskMax || "-",
-        )} · ${r.msgCount ?? "-"} 条</div>
+        )} · ${r.msgCount ?? "-"} 条${escapeHtml(reportTokenMeta(r))}</div>
       </button>`;
     })
     .join("");
@@ -862,15 +1154,25 @@ async function openMonitoredReportDetail(reportId: number) {
   $("monitored-report-detail").classList.remove("hidden");
   animateViewEnter($("monitored-report-detail"));
   $("monitored-report-detail-title").textContent = report.headline || "(无标题)";
+  const lookbackNote =
+    report.windowExtended && report.lookbackMessages
+      ? report.llmContextRounds
+        ? ` · 多轮向前补文 ${report.llmContextRounds} 轮 / ${report.lookbackMessages} 条`
+        : ` · 含回溯前文 ${report.lookbackMessages} 条`
+      : "";
   $("monitored-report-detail-meta").textContent =
-    `${formatReportWindow(report)} · 风险 ${report.riskMax || "-"} · ${report.msgCount ?? "-"} 条消息`;
-  $("monitored-report-detail-body").textContent =
-    (report.reportMd || "").trim() || "（无详细内容）";
+    `${formatReportWindow(report)} · 风险 ${report.riskMax || "-"} · ${report.msgCount ?? "-"} 条消息${lookbackNote}${reportTokenMeta(report)}`;
+  const reportMd = (report.reportMd || "").trim() || "（无详细内容）";
+  setReportDetailBody(reportMd);
 
   const msgsBox = $("monitored-report-detail-msgs");
   msgsBox.dataset.fp = "";
   msgsBox.innerHTML = `<div class="empty">加载相关对话…</div>`;
-  $("monitored-report-msgs-hint").textContent = "分析窗口内的原始消息";
+  $("monitored-report-msgs-hint").textContent = report.windowExtended
+    ? report.llmContextRounds
+      ? `分析实际使用的消息（LLM 审查 ${report.llmContextRounds} 轮后补入前文）`
+      : "分析实际使用的消息（含向前回溯的前文）"
+    : "分析窗口内的原始消息";
 
   const start = Number(report.windowStart || 0);
   const end = Number(report.windowEnd || 0);
@@ -884,14 +1186,25 @@ async function openMonitoredReportDetail(reportId: number) {
       groupId: report.groupId,
       startTs: start,
       endTs: end,
-      limit: 500,
+      limit: 800,
     });
-    $("monitored-report-msgs-hint").textContent =
-      `共 ${rows.length} 条 · ${formatReportWindow(report)}`;
+    const reasons = (report.lookbackReasons || []).filter(Boolean).join("；");
+    const roundBit = report.llmContextRounds
+      ? `LLM 审查 ${report.llmContextRounds} 轮 · `
+      : "";
+    $("monitored-report-msgs-hint").textContent = report.windowExtended
+      ? `共 ${rows.length} 条 · ${roundBit}已回溯前文${
+          report.lookbackMessages ? ` ${report.lookbackMessages} 条` : ""
+        }${reasons ? `（${reasons}）` : ""} · ${formatReportWindow(report)}`
+      : `共 ${rows.length} 条 · ${formatReportWindow(report)}`;
     if (!rows.length) {
       msgsBox.innerHTML = `<div class="empty">该时间窗内无落库消息（可能已被清理或分析时回退了其它窗口）</div>`;
       return;
     }
+    const senderNames = [
+      ...new Set(rows.map((m) => (m.senderName || "").trim()).filter(Boolean)),
+    ];
+    setReportDetailBody(reportMd, senderNames);
     msgsBox.innerHTML = rows.map((m) => messageArticleHtml(m, { hideGroup: true })).join("");
     msgsBox.dataset.fp = idsFingerprint(rows);
     msgsBox.scrollTop = 0;
@@ -913,6 +1226,7 @@ async function refreshMonitored() {
   const totalMsg = enabled.reduce((n, g) => n + (g.msgCount || 0), 0);
 
   let withReport = 0;
+  let totalTokens = 0;
   if (enabled.length) {
     const allReports = await invoke<ReportRow[]>("api_list_reports", {
       groupId: null,
@@ -924,12 +1238,23 @@ async function refreshMonitored() {
     }
     withReport = enabled.filter((g) => seen.has(g.groupId)).length;
   }
+  try {
+    const tok = await invoke<{
+      totalTokens?: number;
+      promptTokens?: number;
+      completionTokens?: number;
+    }>("api_token_stats", { groupId: null });
+    totalTokens = Number(tok?.totalTokens || 0) || 0;
+  } catch {
+    totalTokens = 0;
+  }
 
   $("monitored-stats").innerHTML = `
     <div class="stat-card"><div class="stat-num">${enabled.length}</div><div class="stat-label">监听中</div></div>
     <div class="stat-card"><div class="stat-num">${totalMsg}</div><div class="stat-label">累计消息</div></div>
     <div class="stat-card"><div class="stat-num">${llm}</div><div class="stat-label">LLM 开启</div></div>
     <div class="stat-card"><div class="stat-num">${withReport}</div><div class="stat-label">已有分析</div></div>
+    <div class="stat-card"><div class="stat-num">${formatTokenCount(totalTokens)}</div><div class="stat-label">总 Token</div></div>
   `;
 
   const box = $("monitored-group-list");
@@ -1000,8 +1325,8 @@ function activeProvider(): LlmProvider | undefined {
   );
 }
 
-function fillProvidersSelect(selected?: string) {
-  const sel = $<HTMLSelectElement>("g-llm-provider");
+function fillProvidersSelect(selected?: string, selectId = "g-llm-provider") {
+  const sel = $<HTMLSelectElement>(selectId);
   const providers = settingsCache?.llm.providers || [];
   sel.innerHTML = providers
     .map(
@@ -1012,6 +1337,22 @@ function fillProvidersSelect(selected?: string) {
     )
     .join("");
   if (selected) sel.value = selected;
+}
+
+function syncLlmAnalysisPanels() {
+  const textEl = document.getElementById("g-llm-text-enabled") as HTMLInputElement | null;
+  const imageEl = document.getElementById("g-llm-image-enabled") as HTMLInputElement | null;
+  const sameEl = document.getElementById("g-llm-image-same") as HTMLInputElement | null;
+  const textCfg = document.getElementById("g-llm-text-config");
+  const imageWrap = document.getElementById("g-llm-image-wrap");
+  const imageCfg = document.getElementById("g-llm-image-config");
+  if (!textEl || !imageEl || !sameEl || !textCfg || !imageWrap || !imageCfg) return;
+  const textOn = textEl.checked;
+  const imageOn = imageEl.checked;
+  const sameAsText = sameEl.checked;
+  textCfg.classList.toggle("hidden", !textOn);
+  imageWrap.classList.toggle("hidden", !imageOn);
+  imageCfg.classList.toggle("hidden", !imageOn || sameAsText);
 }
 
 function renderProviderList() {
@@ -1247,6 +1588,35 @@ async function refreshGroupModels() {
   }
 }
 
+async function refreshImageModels() {
+  const providerId = $<HTMLSelectElement>("g-llm-image-provider").value;
+  if (!providerId) {
+    toast("请先选择图片 Provider", true);
+    return;
+  }
+  const btn = $<HTMLButtonElement>("btn-refresh-image-models");
+  btn.disabled = true;
+  try {
+    toast("正在拉取图片模型列表…");
+    imageModelOptions = await fetchModelsByProviderId(providerId);
+    const keep = $<HTMLSelectElement>("g-llm-image-model").value;
+    const provider = settingsCache?.llm.providers.find((p) => p.id === providerId);
+    if (provider?.defaultModel && !imageModelOptions.find((m) => m.id === provider.defaultModel)) {
+      imageModelOptions.unshift({ id: provider.defaultModel });
+    }
+    fillModelSelect(
+      "g-llm-image-model",
+      imageModelOptions,
+      keep || provider?.defaultModel || "",
+    );
+    toast(`已获取 ${imageModelOptions.length} 个模型`);
+  } catch (e) {
+    toast(String(e), true);
+  } finally {
+    btn.disabled = false;
+  }
+}
+
 function showTestResult(elId: string, ok: boolean, text: string) {
   const el = $(elId);
   el.hidden = false;
@@ -1275,11 +1645,15 @@ async function persistSettingsFromForm(): Promise<AppSettings> {
         lastError: prev.qq?.lastError || "",
       },
       wechat: {
-        bound: !!prev.wechat?.bound,
-        label: prev.wechat?.label || "",
-        lastError: prev.wechat?.lastError || "",
-        dataDir: $<HTMLInputElement>("s-wx-dir").value.trim(),
-        decryptedDir: $<HTMLInputElement>("s-wx-decrypted").value.trim(),
+        bound: WECHAT_CHANNEL_ENABLED ? !!prev.wechat?.bound : false,
+        label: WECHAT_CHANNEL_ENABLED ? prev.wechat?.label || "" : "",
+        lastError: WECHAT_CHANNEL_ENABLED
+          ? prev.wechat?.lastError || ""
+          : "微信通道已暂时屏蔽",
+        dataDir: $<HTMLInputElement>("s-wx-dir")?.value.trim() || prev.wechat?.dataDir || "",
+        decryptedDir:
+          $<HTMLInputElement>("s-wx-decrypted")?.value.trim() || prev.wechat?.decryptedDir || "",
+        // keysPath 由后端扫 key / 导入成功后写入，不把「导入输入框」当成存储路径
         keysPath: prev.wechat?.keysPath || "",
         pollSeconds: prev.wechat?.pollSeconds ?? 1,
       },
@@ -1389,7 +1763,19 @@ async function openGroup(groupId: string) {
   $<HTMLInputElement>("g-kw-alert").checked = !!cfg.keywordMonitor?.alertEnabled;
   $<HTMLInputElement>("g-kw-webhook").value = cfg.keywordMonitor?.webhookUrl || "";
   $<HTMLInputElement>("g-llm-enabled").checked = !!cfg.llmMonitor?.enabled;
-  fillProvidersSelect(cfg.llmMonitor?.providerId || settingsCache.llm.activeProviderId);
+  $<HTMLInputElement>("g-llm-text-enabled").checked = cfg.llmMonitor?.textEnabled !== false;
+  $<HTMLInputElement>("g-llm-image-enabled").checked = cfg.llmMonitor?.imageEnabled !== false;
+  $<HTMLInputElement>("g-llm-image-same").checked = cfg.llmMonitor?.imageSameAsText !== false;
+  fillProvidersSelect(
+    cfg.llmMonitor?.providerId || settingsCache.llm.activeProviderId,
+    "g-llm-provider",
+  );
+  fillProvidersSelect(
+    cfg.llmMonitor?.imageProviderId ||
+      cfg.llmMonitor?.providerId ||
+      settingsCache.llm.activeProviderId,
+    "g-llm-image-provider",
+  );
   const groupModel = cfg.llmMonitor?.model || "";
   const selectedProviderId = $<HTMLSelectElement>("g-llm-provider").value;
   const selectedProvider = settingsCache.llm.providers.find((p) => p.id === selectedProviderId);
@@ -1401,10 +1787,22 @@ async function openGroup(groupId: string) {
     groupModelOptions,
     groupModel || selectedProvider?.defaultModel || "",
   );
+  const imageModel = cfg.llmMonitor?.imageModel || "";
+  const imageProviderId = $<HTMLSelectElement>("g-llm-image-provider").value;
+  const imageProvider = settingsCache.llm.providers.find((p) => p.id === imageProviderId);
+  imageModelOptions = [];
+  if (imageModel) imageModelOptions.push({ id: imageModel });
+  else if (imageProvider?.defaultModel) imageModelOptions.push({ id: imageProvider.defaultModel });
+  fillModelSelect(
+    "g-llm-image-model",
+    imageModelOptions,
+    imageModel || imageProvider?.defaultModel || "",
+  );
   $<HTMLInputElement>("g-llm-every").value = String(cfg.llmMonitor?.everyMinutes ?? 60);
   $<HTMLInputElement>("g-llm-window").value = String(cfg.llmMonitor?.windowMinutes ?? 60);
   $<HTMLInputElement>("g-llm-min").value = String(cfg.llmMonitor?.minMessages ?? 8);
   $<HTMLTextAreaElement>("g-llm-prompt").value = cfg.llmMonitor?.prompt || "";
+  syncLlmAnalysisPanels();
 
   const msgs = await invoke<MessageRow[]>("api_recent_messages", { groupId, limit: 40 });
   const detailBox = $("detail-messages");
@@ -1412,13 +1810,16 @@ async function openGroup(groupId: string) {
   renderMessages("detail-messages", msgs, { hideGroup: true });
   const reports = await invoke<ReportRow[]>("api_list_reports", { groupId, limit: 30 });
   const box = $("detail-reports");
+  const shown = visibleReports(reports || []);
   if (!reports.length) {
     box.innerHTML = `<div class="empty">暂无 LLM 报告，可点「立即执行」</div>`;
+  } else if (!shown.length) {
+    box.innerHTML = `<div class="empty">当前仅有定时跳过记录；可在「监听中」关闭「忽略定时跳过」查看</div>`;
   } else {
-    box.innerHTML = reports
+    box.innerHTML = shown
       .map((r) => {
         const risk = (r.riskMax || "none").toLowerCase();
-        const skipped = (r.headline || "").includes("[定时跳过]");
+        const skipped = isSkippedReport(r);
         const unread = !skipped && isReportUnread(r.id);
         return `<button class="report-title-item ${risk === "high" ? "high" : ""} ${
           skipped ? "skipped" : ""
@@ -1427,7 +1828,7 @@ async function openGroup(groupId: string) {
           <div class="report-title-text">${escapeHtml(r.headline || "(无标题)")}</div>
           <div class="report-title-meta">${escapeHtml(r.createdAt || "")} · 风险 ${escapeHtml(
             r.riskMax || "-",
-          )} · ${r.msgCount ?? "-"} 条</div>
+          )} · ${r.msgCount ?? "-"} 条${escapeHtml(reportTokenMeta(r))}</div>
         </button>`;
       })
       .join("");
@@ -1484,9 +1885,14 @@ function readGroupForm(): GroupConfig {
     },
     llmMonitor: {
       enabled: $<HTMLInputElement>("g-llm-enabled").checked,
+      textEnabled: $<HTMLInputElement>("g-llm-text-enabled").checked,
       providerId: $<HTMLSelectElement>("g-llm-provider").value,
       model: $<HTMLSelectElement>("g-llm-model").value.trim(),
       prompt: $<HTMLTextAreaElement>("g-llm-prompt").value,
+      imageEnabled: $<HTMLInputElement>("g-llm-image-enabled").checked,
+      imageSameAsText: $<HTMLInputElement>("g-llm-image-same").checked,
+      imageProviderId: $<HTMLSelectElement>("g-llm-image-provider").value,
+      imageModel: $<HTMLSelectElement>("g-llm-image-model").value.trim(),
       everyMinutes: Number($<HTMLInputElement>("g-llm-every").value || 60),
       windowMinutes: Number($<HTMLInputElement>("g-llm-window").value || 60),
       minMessages: Number($<HTMLInputElement>("g-llm-min").value || 8),
@@ -1501,6 +1907,8 @@ async function loadSettingsView() {
   $<HTMLInputElement>("s-wx-dir").value = settingsCache.channels?.wechat?.dataDir || "";
   $<HTMLInputElement>("s-wx-decrypted").value =
     settingsCache.channels?.wechat?.decryptedDir || "";
+  // 导入框留给用户填「已有密钥文件」；不预填后端默认输出路径（文件往往还不存在）
+  $<HTMLInputElement>("s-wx-keys").value = "";
   $<HTMLInputElement>("s-tg-api-id").value = String(settingsCache.channels?.telegram?.apiId || "");
   $<HTMLInputElement>("s-tg-api-hash").value = settingsCache.channels?.telegram?.apiHash || "";
   $<HTMLInputElement>("s-compact-mode").checked = !!settingsCache.ui?.compactModeEnabled;
@@ -1535,8 +1943,148 @@ async function tick() {
   }
 }
 
+type LightboxState = {
+  url: string;
+  dataUrl: string;
+  mime: string;
+};
+
+let lightboxState: LightboxState | null = null;
+
+function setLightboxStatus(text: string) {
+  const el = document.getElementById("image-lightbox-status");
+  if (el) el.textContent = text;
+}
+
+function closeImageLightbox() {
+  const root = document.getElementById("image-lightbox");
+  if (!root) return;
+  root.classList.add("hidden");
+  root.hidden = true;
+  const img = document.getElementById("image-lightbox-img") as HTMLImageElement | null;
+  if (img) {
+    img.removeAttribute("src");
+  }
+  lightboxState = null;
+  setLightboxStatus("");
+}
+
+async function openImageLightbox(url: string) {
+  const root = document.getElementById("image-lightbox");
+  const img = document.getElementById("image-lightbox-img") as HTMLImageElement | null;
+  if (!root || !img) {
+    toast("图片预览组件不可用", true);
+    return;
+  }
+  lightboxState = null;
+  root.hidden = false;
+  root.classList.remove("hidden");
+  img.removeAttribute("src");
+  setLightboxStatus("正在加载图片…");
+  try {
+    const res = await invoke<{ dataUrl: string; mime: string; bytesLen: number }>(
+      "fetch_image_data_url",
+      { url },
+    );
+    lightboxState = { url, dataUrl: res.dataUrl, mime: res.mime || "image/jpeg" };
+    img.src = res.dataUrl;
+    const kb = Math.max(1, Math.round((res.bytesLen || 0) / 1024));
+    setLightboxStatus(`${kb} KB · ${res.mime || "image"}`);
+  } catch (e) {
+    setLightboxStatus(String(e));
+    toast(String(e), true);
+  }
+}
+
+function dataUrlToBlob(dataUrl: string): Blob {
+  const m = /^data:([^;,]+)?(;base64)?,(.*)$/i.exec(dataUrl);
+  if (!m) throw new Error("无效的图片数据");
+  const mime = m[1] || "image/png";
+  const isB64 = !!m[2];
+  const data = m[3] || "";
+  if (isB64) {
+    const bin = atob(data);
+    const bytes = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i += 1) bytes[i] = bin.charCodeAt(i);
+    return new Blob([bytes], { type: mime });
+  }
+  return new Blob([decodeURIComponent(data)], { type: mime });
+}
+
+function extFromMime(mime: string): string {
+  if (mime.includes("png")) return "png";
+  if (mime.includes("webp")) return "webp";
+  if (mime.includes("gif")) return "gif";
+  if (mime.includes("bmp")) return "bmp";
+  return "jpg";
+}
+
+async function copyLightboxImage() {
+  if (!lightboxState?.dataUrl) {
+    toast("图片尚未加载完成", true);
+    return;
+  }
+  try {
+    const blob = dataUrlToBlob(lightboxState.dataUrl);
+    const mime = blob.type || lightboxState.mime || "image/png";
+    if (!("clipboard" in navigator) || typeof ClipboardItem === "undefined") {
+      throw new Error("当前环境不支持复制图片到剪贴板");
+    }
+    await navigator.clipboard.write([new ClipboardItem({ [mime]: blob })]);
+    toast("图片已复制到剪贴板");
+  } catch (e) {
+    toast(`复制失败：${e}`, true);
+  }
+}
+
+function saveLightboxImage() {
+  if (!lightboxState?.dataUrl) {
+    toast("图片尚未加载完成", true);
+    return;
+  }
+  try {
+    const a = document.createElement("a");
+    a.href = lightboxState.dataUrl;
+    a.download = `group-msg-${Date.now()}.${extFromMime(lightboxState.mime)}`;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    toast("已开始保存图片");
+  } catch (e) {
+    toast(`保存失败：${e}`, true);
+  }
+}
+
 window.addEventListener("DOMContentLoaded", async () => {
   reduceMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+  loadHideSkippedToggle();
+
+  const hideSkippedEl = document.getElementById(
+    "monitored-hide-skipped",
+  ) as HTMLInputElement | null;
+  if (hideSkippedEl) {
+    hideSkippedEl.onchange = () => {
+      saveHideSkippedToggle(!!hideSkippedEl.checked);
+      renderMonitoredReportList(monitoredReportsCache);
+    };
+  }
+
+  document.getElementById("btn-lightbox-close")?.addEventListener("click", () => {
+    closeImageLightbox();
+  });
+  document.getElementById("btn-lightbox-copy")?.addEventListener("click", () => {
+    copyLightboxImage().catch((e) => toast(String(e), true));
+  });
+  document.getElementById("btn-lightbox-save")?.addEventListener("click", () => {
+    saveLightboxImage();
+  });
+  document.getElementById("image-lightbox")?.addEventListener("click", (ev) => {
+    const t = ev.target as HTMLElement | null;
+    if (t?.closest?.("[data-lightbox-close]")) closeImageLightbox();
+  });
+  window.addEventListener("keydown", (ev) => {
+    if (ev.key === "Escape") closeImageLightbox();
+  });
 
   document.querySelectorAll(".nav-item").forEach((btn) => {
     (btn as HTMLButtonElement).onclick = () => {
@@ -1590,6 +2138,13 @@ window.addEventListener("DOMContentLoaded", async () => {
 
   document.addEventListener("click", (ev) => {
     const t = ev.target as HTMLElement | null;
+    const imgA = t?.closest?.("a[data-image-url]") as HTMLAnchorElement | null;
+    if (imgA) {
+      ev.preventDefault();
+      const url = imgA.dataset.imageUrl || imgA.href;
+      if (url) openImageLightbox(url).catch((e) => toast(String(e), true));
+      return;
+    }
     const a = t?.closest?.("a[data-ext-url]") as HTMLAnchorElement | null;
     if (!a) return;
     ev.preventDefault();
@@ -1664,6 +2219,26 @@ window.addEventListener("DOMContentLoaded", async () => {
   $("groups-sort").onchange = () => refreshGroups().catch((e) => toast(String(e), true));
   $("groups-show-blocked").onchange = () =>
     refreshGroups().catch((e) => toast(String(e), true));
+  const activeFilterEl = document.getElementById(
+    "groups-active-filter",
+  ) as HTMLSelectElement | null;
+  if (activeFilterEl) {
+    activeFilterEl.value = loadGroupsActiveFilter();
+    activeFilterEl.onchange = () => {
+      saveGroupsActiveFilter(activeFilterEl.value as GroupsActiveFilter);
+      refreshGroups().catch((e) => toast(String(e), true));
+    };
+  }
+  const keepEnabledEl = document.getElementById(
+    "groups-keep-enabled",
+  ) as HTMLInputElement | null;
+  if (keepEnabledEl) {
+    keepEnabledEl.checked = loadGroupsKeepEnabled();
+    keepEnabledEl.onchange = () => {
+      saveGroupsKeepEnabled(!!keepEnabledEl.checked);
+      refreshGroups().catch((e) => toast(String(e), true));
+    };
+  }
   $("groups-q").onkeydown = (ev) => {
     if (ev.key === "Enter") refreshGroups().catch((e) => toast(String(e), true));
   };
@@ -1677,7 +2252,7 @@ window.addEventListener("DOMContentLoaded", async () => {
           parts.push(`QQ: ${e}`);
         }
       }
-      if (settingsCache?.channels?.wechat?.bound) {
+      if (WECHAT_CHANNEL_ENABLED && settingsCache?.channels?.wechat?.bound) {
         const res = await invoke<{ ok?: boolean; message?: string }>("api_pull_wechat_groups");
         parts.push(res.message || (res.ok ? "微信群已拉取" : "微信拉取失败"));
       }
@@ -1724,90 +2299,155 @@ window.addEventListener("DOMContentLoaded", async () => {
       toast(String(e), true);
     }
   };
-  $("btn-bind-wechat").onclick = async () => {
-    try {
-      await persistSettingsFromForm();
-      showTestResult("wechat-bind-result", true, "正在绑定微信（扫 key / 解密）…");
-      const res = await invoke<{
-        ok?: boolean;
-        message?: string;
-        channels?: AppSettings["channels"];
-      }>("api_bind_wechat", {
-        payload: {
-          dataDir: $<HTMLInputElement>("s-wx-dir").value.trim(),
-          scanKeys: true,
-        },
-      });
-      if (res.channels && settingsCache) {
-        settingsCache.channels = res.channels;
-        $<HTMLInputElement>("s-wx-dir").value = res.channels.wechat?.dataDir || "";
-        $<HTMLInputElement>("s-wx-decrypted").value = res.channels.wechat?.decryptedDir || "";
+  if (WECHAT_CHANNEL_ENABLED) {
+    $("btn-bind-wechat").onclick = async () => {
+      try {
+        await persistSettingsFromForm();
+        const keysFile = $<HTMLInputElement>("s-wx-keys").value.trim();
+        showTestResult(
+          "wechat-bind-result",
+          true,
+          keysFile ? "正在用密钥文件解密…" : "正在绑定微信（扫 key / 解密）…",
+        );
+        const res = await invoke<{
+          ok?: boolean;
+          ready?: boolean;
+          message?: string;
+          channels?: AppSettings["channels"];
+        }>("api_bind_wechat", {
+          payload: {
+            dataDir: $<HTMLInputElement>("s-wx-dir").value.trim(),
+            keysFile,
+            scanKeys: !keysFile,
+          },
+        });
+        if (res.channels && settingsCache) {
+          settingsCache.channels = res.channels;
+          $<HTMLInputElement>("s-wx-dir").value = res.channels.wechat?.dataDir || "";
+          $<HTMLInputElement>("s-wx-decrypted").value = res.channels.wechat?.decryptedDir || "";
+        }
+        renderChannelBindings(settingsCache);
+        const ready = res.ready ?? res.ok;
+        showTestResult("wechat-bind-result", !!ready, res.message || "");
+        toast(res.message || "微信绑定完成", !ready);
+        await refreshGroups();
+      } catch (e) {
+        showTestResult("wechat-bind-result", false, String(e));
+        toast(String(e), true);
       }
-      renderChannelBindings(settingsCache);
-      showTestResult("wechat-bind-result", !!res.ok, res.message || "");
-      toast(res.message || "微信绑定完成", !res.ok);
-      await refreshGroups();
-    } catch (e) {
-      showTestResult("wechat-bind-result", false, String(e));
-      toast(String(e), true);
-    }
-  };
-  $("btn-unbind-wechat").onclick = async () => {
-    try {
-      const res = await invoke<{ ok?: boolean; message?: string; channels?: AppSettings["channels"] }>(
-        "api_unbind_channel",
-        { channel: "wechat" },
-      );
-      if (res.channels && settingsCache) settingsCache.channels = res.channels;
-      renderChannelBindings(settingsCache);
-      toast(res.message || "已解绑微信", !res.ok);
-    } catch (e) {
-      toast(String(e), true);
-    }
-  };
-  $("btn-wx-detect").onclick = async () => {
-    try {
-      const res = await invoke<{
-        ok?: boolean;
-        message?: string;
-        accounts?: { data_dir?: string; account?: string; root?: string }[];
-        roots?: string[];
-      }>("api_wechat_detect");
-      const first = res.accounts?.[0];
-      if (first?.data_dir) $<HTMLInputElement>("s-wx-dir").value = first.data_dir;
-      const lines = [
-        res.message || "",
-        ...(res.accounts || []).map(
-          (a) => `账号 ${a.account || ""} → ${a.data_dir || ""}`,
-        ),
-        res.roots?.length ? `扫描根目录：\n${res.roots.join("\n")}` : "",
-      ].filter(Boolean);
-      showTestResult("wechat-bind-result", !!(res.accounts && res.accounts.length), lines.join("\n"));
-      toast(res.message || "检测完成", !(res.accounts && res.accounts.length));
-    } catch (e) {
-      toast(String(e), true);
-    }
-  };
-  $("btn-wx-scan-keys").onclick = async () => {
-    try {
-      showTestResult("wechat-bind-result", true, "正在扫描微信进程密钥…");
-      const res = await invoke<{ ok?: boolean; message?: string }>("api_wechat_scan_keys");
-      showTestResult("wechat-bind-result", !!res.ok, res.message || "");
-      toast(res.message || "扫 key 完成", !res.ok);
-    } catch (e) {
-      showTestResult("wechat-bind-result", false, String(e));
-      toast(String(e), true);
-    }
-  };
-  $("btn-pull-wechat-groups").onclick = async () => {
-    try {
-      const res = await invoke<{ ok?: boolean; message?: string }>("api_pull_wechat_groups");
-      toast(res.message || "微信群已拉取", !res.ok);
-      await refreshGroups();
-    } catch (e) {
-      toast(String(e), true);
-    }
-  };
+    };
+    $("btn-unbind-wechat").onclick = async () => {
+      try {
+        const res = await invoke<{ ok?: boolean; message?: string; channels?: AppSettings["channels"] }>(
+          "api_unbind_channel",
+          { channel: "wechat" },
+        );
+        if (res.channels && settingsCache) settingsCache.channels = res.channels;
+        renderChannelBindings(settingsCache);
+        toast(res.message || "已解绑微信", !res.ok);
+      } catch (e) {
+        toast(String(e), true);
+      }
+    };
+    $("btn-wx-detect").onclick = async () => {
+      try {
+        const res = await invoke<{
+          ok?: boolean;
+          message?: string;
+          accounts?: { data_dir?: string; account?: string; root?: string }[];
+          roots?: string[];
+        }>("api_wechat_detect");
+        const first = res.accounts?.[0];
+        if (first?.data_dir) $<HTMLInputElement>("s-wx-dir").value = first.data_dir;
+        const lines = [
+          res.message || "",
+          ...(res.accounts || []).map(
+            (a) => `账号 ${a.account || ""} → ${a.data_dir || ""}`,
+          ),
+          res.roots?.length ? `扫描根目录：\n${res.roots.join("\n")}` : "",
+        ].filter(Boolean);
+        showTestResult("wechat-bind-result", !!(res.accounts && res.accounts.length), lines.join("\n"));
+        toast(res.message || "检测完成", !(res.accounts && res.accounts.length));
+      } catch (e) {
+        toast(String(e), true);
+      }
+    };
+    $("btn-wx-scan-keys").onclick = async () => {
+      try {
+        showTestResult("wechat-bind-result", true, "正在扫描微信进程密钥…");
+        const res = await invoke<{
+          ok?: boolean;
+          message?: string;
+          channels?: AppSettings["channels"];
+        }>("api_wechat_scan_keys");
+        if (res.channels && settingsCache) {
+          settingsCache.channels = res.channels;
+          renderChannelBindings(settingsCache);
+        }
+        showTestResult("wechat-bind-result", !!res.ok, res.message || "");
+        toast(res.message || "扫 key 完成", !res.ok);
+      } catch (e) {
+        showTestResult("wechat-bind-result", false, String(e));
+        toast(String(e), true);
+      }
+    };
+    $("btn-wx-import-keys").onclick = async () => {
+      try {
+        await persistSettingsFromForm();
+        const keysFile = $<HTMLInputElement>("s-wx-keys").value.trim();
+        if (!keysFile) {
+          toast("请填写已有密钥文件的完整路径（如 all_keys.json），不要用尚未生成的默认路径", true);
+          showTestResult(
+            "wechat-bind-result",
+            false,
+            "当前本机还没有可用密钥。微信 4.1.10+ 无法自动扫描，请先用 ≤4.1.9 提取密钥文件，再把文件路径填到「导入密钥文件」后重试。",
+          );
+          return;
+        }
+        showTestResult("wechat-bind-result", true, "正在导入密钥并解密…");
+        const res = await invoke<{
+          ok?: boolean;
+          ready?: boolean;
+          message?: string;
+          count?: number;
+          channels?: AppSettings["channels"];
+        }>("api_wechat_import_keys", {
+          payload: {
+            keysFile,
+            dataDir: $<HTMLInputElement>("s-wx-dir").value.trim(),
+          },
+        });
+        if (res.channels && settingsCache) {
+          settingsCache.channels = res.channels;
+          $<HTMLInputElement>("s-wx-dir").value = res.channels.wechat?.dataDir || "";
+          $<HTMLInputElement>("s-wx-decrypted").value = res.channels.wechat?.decryptedDir || "";
+        }
+        renderChannelBindings(settingsCache);
+        showTestResult("wechat-bind-result", !!res.ok, res.message || "");
+        toast(res.message || "导入完成", !res.ok);
+        await refreshGroups();
+      } catch (e) {
+        showTestResult("wechat-bind-result", false, String(e));
+        toast(String(e), true);
+      }
+    };
+    $("btn-pull-wechat-groups").onclick = async () => {
+      try {
+        const res = await invoke<{ ok?: boolean; message?: string; channels?: AppSettings["channels"] }>(
+          "api_pull_wechat_groups",
+        );
+        if (res.channels && settingsCache) {
+          settingsCache.channels = res.channels;
+          renderChannelBindings(settingsCache);
+        }
+        showTestResult("wechat-bind-result", !!res.ok, res.message || "");
+        toast(res.message || "微信群已拉取", !res.ok);
+        await refreshGroups();
+      } catch (e) {
+        toast(String(e), true);
+      }
+    };
+  }
   $("btn-bind-telegram").onclick = async () => {
     try {
       await persistSettingsFromForm();
@@ -2012,14 +2652,47 @@ window.addEventListener("DOMContentLoaded", async () => {
   $("btn-save-group").onclick = async () => {
     try {
       const form = readGroupForm();
-      await invoke("api_save_group", { config: form });
-      toast(form.blocked ? "已屏蔽此群" : "本群配置已保存");
+      const wasEnabled = !!groupsCache.find((g) => g.groupId === form.groupId)?.enabled;
+      if (form.enabled && !wasEnabled && !form.blocked) {
+        toast("正在保存并补拉历史消息…");
+      }
+      const res = await invoke<{
+        ok?: boolean;
+        newlyEnabled?: boolean;
+        history?: {
+          ok?: boolean;
+          fetched?: number;
+          inserted?: number;
+          skipped?: number;
+          error?: string;
+          message?: string;
+        } | null;
+      }>("api_save_group", { config: form });
       if (form.blocked) {
+        toast("已屏蔽此群");
         $("group-detail").classList.add("hidden");
         $("groups-master").classList.remove("hidden");
         currentGroupId = null;
         await refreshGroups();
+        return;
       }
+      const hist = res.history;
+      if (res.newlyEnabled && hist) {
+        if (hist.ok === false) {
+          toast(
+            `已启用监听，但补拉历史失败：${hist.error || hist.message || "未知错误"}`,
+            true,
+          );
+        } else {
+          toast(
+            `已启用监听，并补拉历史：获取 ${hist.fetched ?? 0} 条，新增 ${hist.inserted ?? 0} 条`,
+          );
+        }
+      } else {
+        toast("本群配置已保存");
+      }
+      if (currentGroupId) await openGroup(currentGroupId);
+      await refreshGroups().catch(() => undefined);
     } catch (e) {
       toast(String(e), true);
     }
@@ -2034,19 +2707,26 @@ window.addEventListener("DOMContentLoaded", async () => {
   $("btn-pull-history").onclick = async () => {
     if (!currentGroupId) return;
     try {
-      toast("正在从 OneBot 拉取历史消息…");
+      toast("正在从 OneBot 拉取历史消息（最多约 500 条）…");
       const res = await invoke<{
         ok?: boolean;
         fetched?: number;
         inserted?: number;
         skipped?: number;
-      }>("api_pull_history", { groupId: currentGroupId, count: 100 });
-      toast(
-        `历史拉取完成：获取 ${res.fetched ?? 0} 条，新增 ${res.inserted ?? 0}，已有 ${
-          res.skipped ?? 0
-        }`,
-      );
+        pages?: number;
+        message?: string;
+      }>("api_pull_history", { groupId: currentGroupId, count: 300 });
+      if (res.ok === false) {
+        toast(res.message || "拉取历史失败", true);
+      } else {
+        toast(
+          `历史拉取完成：获取 ${res.fetched ?? 0} 条，新增 ${res.inserted ?? 0}，已有 ${
+            res.skipped ?? 0
+          }${res.pages ? `（${res.pages} 页）` : ""}`,
+        );
+      }
       await openGroup(currentGroupId);
+      await refreshGroups().catch(() => undefined);
     } catch (e) {
       toast(String(e), true);
     }
@@ -2061,6 +2741,9 @@ window.addEventListener("DOMContentLoaded", async () => {
         msgCount?: number;
         reason?: string;
         source?: string;
+        totalTokens?: number;
+        promptTokens?: number;
+        completionTokens?: number;
       }>("api_run_llm", {
         groupId: currentGroupId,
       });
@@ -2068,10 +2751,14 @@ window.addEventListener("DOMContentLoaded", async () => {
         toast(result.reason || "已跳过（消息不足）", true);
       } else {
         const extra = result.source ? ` · ${result.source}` : "";
+        const tok =
+          result.totalTokens && result.totalTokens > 0
+            ? ` · Token ${formatTokenCount(result.totalTokens)}`
+            : "";
         toast(
           `LLM 完成：${result.status}${result.riskMax ? " / 风险 " + result.riskMax : ""} · ${
             result.msgCount ?? "?"
-          } 条${extra}`,
+          } 条${tok}${extra}`,
         );
       }
       await openGroup(currentGroupId);
@@ -2087,14 +2774,34 @@ window.addEventListener("DOMContentLoaded", async () => {
   $("pf-preset").onchange = () => applyPreset($<HTMLSelectElement>("pf-preset").value);
   $("btn-refresh-models").onclick = () => refreshSettingsModels();
   $("btn-refresh-group-models").onclick = () => refreshGroupModels();
+  const btnRefreshImageModels = document.getElementById("btn-refresh-image-models");
+  if (btnRefreshImageModels) {
+    btnRefreshImageModels.onclick = () => refreshImageModels();
+  }
   $("btn-test-provider").onclick = () => testActiveProvider();
   $("btn-test-onebot").onclick = () => testOnebotConnectivity();
+  const bindToggle = (id: string) => {
+    const el = document.getElementById(id) as HTMLInputElement | null;
+    if (el) el.onchange = () => syncLlmAnalysisPanels();
+  };
+  bindToggle("g-llm-text-enabled");
+  bindToggle("g-llm-image-enabled");
+  bindToggle("g-llm-image-same");
   $("g-llm-provider").onchange = () => {
     const providerId = $<HTMLSelectElement>("g-llm-provider").value;
     const provider = settingsCache?.llm.providers.find((p) => p.id === providerId);
     groupModelOptions = provider?.defaultModel ? [{ id: provider.defaultModel }] : [];
     fillModelSelect("g-llm-model", groupModelOptions, provider?.defaultModel || "");
   };
+  const imageProviderSel = document.getElementById("g-llm-image-provider");
+  if (imageProviderSel) {
+    imageProviderSel.onchange = () => {
+      const providerId = $<HTMLSelectElement>("g-llm-image-provider").value;
+      const provider = settingsCache?.llm.providers.find((p) => p.id === providerId);
+      imageModelOptions = provider?.defaultModel ? [{ id: provider.defaultModel }] : [];
+      fillModelSelect("g-llm-image-model", imageModelOptions, provider?.defaultModel || "");
+    };
+  }
   $("s-default-model").onchange = () => {
     const model = $<HTMLSelectElement>("s-default-model").value.trim();
     const active = activeProvider();

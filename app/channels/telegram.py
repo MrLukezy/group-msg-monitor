@@ -193,7 +193,7 @@ async def list_telegram_groups(api_id: int | str, api_hash: str) -> list[dict[st
     return groups
 
 
-def _message_to_event(event: Any) -> GroupMessageEvent | None:
+def _message_to_event(event: Any, *, local_image_rel: str | None = None) -> GroupMessageEvent | None:
     try:
         chat = event.chat
         if chat is None:
@@ -223,7 +223,12 @@ def _message_to_event(event: Any) -> GroupMessageEvent | None:
                 if x
             ).strip() or str(uid or "")
         text = event.raw_text or ""
-        if not text:
+        if local_image_rel:
+            from app.media_store import build_local_image_cq
+
+            img_cq = build_local_image_cq(local_rel=local_image_rel)
+            text = f"{text}{img_cq}" if text else img_cq
+        elif not text:
             if getattr(event, "photo", None):
                 text = "[图片]"
             elif getattr(event, "document", None):
@@ -276,6 +281,8 @@ class TelegramUserAdapter:
     async def run_forever(self) -> None:
         from telethon import TelegramClient, events
 
+        from app.media_store import store_image_from_bytes
+
         client = TelegramClient(str(session_base_path()), self.api_id, self.api_hash)
         self._client = client
 
@@ -283,7 +290,21 @@ class TelegramUserAdapter:
         async def _handler(event: Any) -> None:
             if not getattr(event, "is_group", False):
                 return
-            msg = _message_to_event(event)
+            local_rel: str | None = None
+            try:
+                if getattr(event, "photo", None):
+                    data = await event.download_media(file=bytes)
+                    if isinstance(data, (bytes, bytearray)) and data:
+                        gid = make_group_id("telegram", event.chat_id)
+                        local_rel = store_image_from_bytes(
+                            bytes(data),
+                            group_id=gid,
+                            mime="image/jpeg",
+                            name_hint="tg.jpg",
+                        )
+            except Exception:
+                logger.exception("Telegram 图片落盘失败")
+            msg = _message_to_event(event, local_image_rel=local_rel)
             if msg is None:
                 return
             try:

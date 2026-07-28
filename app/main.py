@@ -12,7 +12,7 @@ from logging.handlers import RotatingFileHandler
 from typing import Any
 
 from app.channels.telegram import TelegramUserAdapter
-from app.channels.wechat import WechatLocalAdapter
+from app.channels.feature_flags import WECHAT_CHANNEL_ENABLED
 from app.config import Settings, load_settings
 from app.filters import matched_keywords
 from app.handlers.alert_handler import AlertHandler
@@ -230,7 +230,7 @@ class MonitorApp:
 
             async def _bootstrap_history() -> None:
                 try:
-                    result = await pull_enabled_groups_history(count=80)
+                    result = await pull_enabled_groups_history(count=200)
                     logger.info("启动补拉历史完成: %s", result)
                 except Exception:
                     logger.exception("启动补拉历史失败")
@@ -258,8 +258,10 @@ class MonitorApp:
             else:
                 logger.warning("Telegram 已绑定但缺少 api_id / api_hash")
 
-        # WeChat local
-        if ch.wechat.bound:
+        # WeChat local（功能开关关闭时一律不启动）
+        if WECHAT_CHANNEL_ENABLED and ch.wechat.bound:
+            from app.channels.wechat import WechatLocalAdapter
+
             if not ch.wechat.data_dir and not ch.wechat.decrypted_dir:
                 logger.warning("微信已绑定但未配置 data_dir / decrypted_dir")
             else:
@@ -275,9 +277,11 @@ class MonitorApp:
                     "通道微信已启用 | data_dir=%s",
                     ch.wechat.data_dir or ch.wechat.decrypted_dir,
                 )
+        elif ch.wechat.bound and not WECHAT_CHANNEL_ENABLED:
+            logger.info("微信通道已屏蔽，忽略绑定配置")
 
         if len(tasks) == 1:
-            logger.warning("未绑定任何消息通道；请在总配置中绑定 QQ / 微信 / Telegram")
+            logger.warning("未绑定任何消息通道；请在总配置中绑定 QQ / Telegram")
 
         logger.info(
             "监听启动 | 启用监听群=%s",

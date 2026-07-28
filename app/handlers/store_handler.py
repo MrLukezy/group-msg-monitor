@@ -6,6 +6,7 @@ import logging
 import sqlite3
 from pathlib import Path
 
+from app.media_store import materialize_event_images
 from app.models import GroupMessageEvent
 
 logger = logging.getLogger(__name__)
@@ -55,6 +56,11 @@ class StoreHandler:
         message_id = "" if event.message_id is None else str(event.message_id)
         payload = event.model_dump(mode="json")
         try:
+            content = await materialize_event_images(event)
+        except Exception:
+            logger.exception("图片本地化失败 message_id=%s，回退原文", message_id)
+            content = event.message_summary
+        try:
             with self._connect() as conn:
                 cur = conn.execute(
                     """
@@ -67,7 +73,7 @@ class StoreHandler:
                         event.group_id_str,
                         "" if event.user_id is None else str(event.user_id),
                         event.display_name,
-                        event.message_summary,
+                        content,
                         json.dumps(payload, ensure_ascii=False),
                         event.time,
                     ),
