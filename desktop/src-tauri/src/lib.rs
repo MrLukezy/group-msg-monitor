@@ -576,14 +576,39 @@ fn api_pull_history(group_id: String, count: i64) -> Result<Value, String> {
 }
 
 #[tauri::command]
-fn api_list_reports(group_id: Option<String>, limit: i64) -> Result<Value, String> {
+fn api_list_reports(
+    group_id: Option<String>,
+    limit: i64,
+    favorites_only: Option<bool>,
+) -> Result<Value, String> {
     let lim = limit.to_string();
-    let v = if let Some(gid) = group_id.filter(|s| !s.is_empty()) {
-        py_api_json(&["list-reports", "--group-id", &gid, "--limit", &lim])?
+    if favorites_only.unwrap_or(false) {
+        return py_api_json(&["list-reports", "--limit", &lim, "--favorites-only"]);
+    }
+    if let Some(gid) = group_id.filter(|s| !s.is_empty()) {
+        py_api_json(&["list-reports", "--group-id", &gid, "--limit", &lim])
     } else {
-        py_api_json(&["list-reports", "--limit", &lim])?
-    };
-    Ok(v)
+        py_api_json(&["list-reports", "--limit", &lim])
+    }
+}
+
+#[tauri::command]
+fn api_set_report_favorite(report_id: i64, favorited: bool) -> Result<Value, String> {
+    let rid = report_id.to_string();
+    let flag = if favorited { "1" } else { "0" };
+    py_api_json(&[
+        "set-report-favorite",
+        "--report-id",
+        &rid,
+        "--favorited",
+        flag,
+    ])
+}
+
+#[tauri::command]
+fn api_report_favorite_messages(report_id: i64) -> Result<Value, String> {
+    let rid = report_id.to_string();
+    py_api_json(&["report-favorite-messages", "--report-id", &rid])
 }
 
 #[tauri::command]
@@ -673,6 +698,7 @@ fn settings_to_camel(v: Value) -> Value {
         "llm".into(),
         serde_json::json!({
             "activeProviderId": llm_obj.remove("active_provider_id").unwrap_or(Value::String(String::new())),
+            "reportKeepLimit": llm_obj.remove("report_keep_limit").unwrap_or(Value::Number(100.into())),
             "providers": providers,
         }),
     );
@@ -1090,6 +1116,8 @@ pub fn run() {
             api_run_llm,
             api_pull_history,
             api_list_reports,
+            api_set_report_favorite,
+            api_report_favorite_messages,
             api_token_stats,
             api_fetch_models,
             api_test_provider,

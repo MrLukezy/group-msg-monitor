@@ -26,6 +26,21 @@ class LlmProvider(BaseModel):
 class LlmGlobalSettings(BaseModel):
     providers: list[LlmProvider] = Field(default_factory=list)
     active_provider_id: str = ""
+    # 全局只保留最近 N 条 LLM 分析报告（20~500）
+    report_keep_limit: int = 100
+
+
+LLM_REPORT_KEEP_MIN = 20
+LLM_REPORT_KEEP_MAX = 500
+LLM_REPORT_KEEP_DEFAULT = 100
+
+
+def clamp_report_keep_limit(value: Any) -> int:
+    try:
+        n = int(value)
+    except Exception:
+        n = LLM_REPORT_KEEP_DEFAULT
+    return max(LLM_REPORT_KEEP_MIN, min(LLM_REPORT_KEEP_MAX, n))
 
 
 class UiSettings(BaseModel):
@@ -95,11 +110,10 @@ class LlmMonitorConfig(BaseModel):
     provider_id: str = ""
     model: str = ""
     prompt: str = (
-        "你是群聊监控分析助手。请基于给定聊天记录输出中文 JSON："
-        "headline, topics, key_points, risks, action_items, sentiment, notable_users, appendix。"
-        "appendix 含 nouns/links/notes，用于名词解析、链接详解与补充说明。"
-        "禁止编造；不确定请写「记录不足」。risks 需带原文 evidence。"
-        "若含引用回复或补前后文，请按完整多轮对话理解。"
+        "请基于群聊做中文分析。若出现 GitHub 仓库或 AI/大模型相关名词，"
+        "必须多轮补齐相关上下文，并在 deep_dives 中深入展开、扩充回答；"
+        "仓库写入 appendix.links，名词写入 appendix.nouns。"
+        "同时关注主题、风险、待办；禁止编造，不确定写「记录不足」。"
     )
     # 图片分析（视觉描述）
     image_enabled: bool = True
@@ -212,11 +226,18 @@ def save_app_settings(settings: AppSettings) -> None:
         settings.channels.wechat.bound = False
         settings.channels.wechat.label = ""
         settings.channels.wechat.last_error = WECHAT_DISABLED_MESSAGE
+    settings.llm.report_keep_limit = clamp_report_keep_limit(settings.llm.report_keep_limit)
     _ensure_dirs()
     SETTINGS_PATH.write_text(
         settings.model_dump_json(indent=2),
         encoding="utf-8",
     )
+    try:
+        from app.llm.service import prune_old_llm_reports
+
+        prune_old_llm_reports(settings.llm.report_keep_limit)
+    except Exception:
+        pass
 
 
 def group_config_path(group_id: str) -> Path:

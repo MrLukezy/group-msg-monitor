@@ -22,6 +22,7 @@ class TokenUsage:
     prompt_tokens: int = 0
     completion_tokens: int = 0
     total_tokens: int = 0
+    estimated: bool = False
 
     def add(self, other: "TokenUsage | None") -> "TokenUsage":
         if not other:
@@ -31,53 +32,138 @@ class TokenUsage:
         self.total_tokens += int(other.total_tokens or 0)
         if self.total_tokens <= 0:
             self.total_tokens = self.prompt_tokens + self.completion_tokens
+        if other.estimated:
+            self.estimated = True
         return self
 
-    def as_dict(self) -> dict[str, int]:
+    def as_dict(self) -> dict[str, Any]:
         total = int(self.total_tokens or 0)
         if total <= 0:
             total = int(self.prompt_tokens or 0) + int(self.completion_tokens or 0)
-        return {
+        out: dict[str, Any] = {
             "prompt_tokens": int(self.prompt_tokens or 0),
             "completion_tokens": int(self.completion_tokens or 0),
             "total_tokens": total,
         }
+        if self.estimated:
+            out["estimated"] = True
+        return out
+
+
+def estimate_token_count(text: str) -> int:
+    """无官方 usage 时的粗估：中文约 1.6 字/token，英文约 4 字符/token。"""
+    if not text:
+        return 0
+    cjk = 0
+    other = 0
+    for ch in text:
+        o = ord(ch)
+        if (
+            0x4E00 <= o <= 0x9FFF
+            or 0x3400 <= o <= 0x4DBF
+            or 0xF900 <= o <= 0xFAFF
+            or 0x3000 <= o <= 0x303F
+        ):
+            cjk += 1
+        elif not ch.isspace():
+            other += 1
+    return max(1, int(cjk / 1.6 + other / 4.0 + 0.999))
 
 
 def parse_usage_payload(data: Any) -> TokenUsage:
-    """从各类 Provider 响应里抽出 usage（兼容 prompt/completion 与 input/output）。"""
+    """从各类 Provider 响应里抽出 usage（兼容多种网关字段）。"""
     if not isinstance(data, dict):
         return TokenUsage()
-    usage = data.get("usage")
-    if not isinstance(usage, dict):
-        usage = data if any(
-            k in data
-            for k in (
-                "prompt_tokens",
-                "completion_tokens",
-                "total_tokens",
-                "input_tokens",
-                "output_tokens",
+
+    candidates: list[dict[str, Any]] = []
+
+    def _push(obj: Any) -> None:
+        if isinstance(obj, dict):
+            candidates.append(obj)
+
+    for key in ("usage", "token_usage", "tokenUsage", "tokens"):
+        _push(data.get(key))
+    for nest_key in ("meta", "data", "result", "output"):
+        nest = data.get(nest_key)
+        if isinstance(nest, dict):
+            for key in ("usage", "token_usage", "tokenUsage", "tokens"):
+                _push(nest.get(key))
+    choices = data.get("choices")
+    if isinstance(choices, list) and choices:
+        c0 = choices[0]
+        if isinstance(c0, dict):
+            _push(c0.get("usage"))
+
+    # 有些响应把 usage 平铺在根上
+    if any(
+        k in data
+        for k in (
+            "prompt_tokens",
+            "completion_tokens",
+            "total_tokens",
+            "input_tokens",
+            "output_tokens",
+        )
+    ):
+        candidates.append(data)
+
+    best = TokenUsage()
+    for usage in candidates:
+        prompt = int(
+            usage.get("prompt_tokens")
+            or usage.get("input_tokens")
+            or usage.get("promptTokens")
+            or usage.get("inputTokens")
+            or 0
+        )
+        completion = int(
+            usage.get("completion_tokens")
+            or usage.get("output_tokens")
+            or usage.get("completionTokens")
+            or usage.get("outputTokens")
+            or 0
+        )
+        total = int(
+            usage.get("total_tokens")
+            or usage.get("totalTokens")
+            or usage.get("total")
+            or 0
+        )
+        if total <= 0:
+            total = prompt + completion
+        if total > best.total_tokens:
+            best = TokenUsage(
+                prompt_tokens=prompt,
+                completion_tokens=completion,
+                total_tokens=total,
             )
-        ) else {}
-    if not isinstance(usage, dict):
-        return TokenUsage()
-    prompt = int(
-        usage.get("prompt_tokens")
-        or usage.get("input_tokens")
-        or usage.get("promptTokens")
-        or 0
+    return best
+
+
+def usage_or_estimate(
+    usage: TokenUsage,
+    *,
+    system: str = "",
+    user: str = "",
+    content: str = "",
+    history: list[dict[str, str]] | None = None,
+) -> TokenUsage:
+    """官方 usage 缺失或为 0 时，用文本长度粗估，保证统计可用。"""
+    if usage.total_tokens > 0 or usage.prompt_tokens > 0 or usage.completion_tokens > 0:
+        if usage.total_tokens <= 0:
+            usage.total_tokens = usage.prompt_tokens + usage.completion_tokens
+        return usage
+    prompt_parts = [system or "", user or ""]
+    for h in history or []:
+        prompt_parts.append(h.get("content") or "")
+    prompt_est = estimate_token_count("\n".join(prompt_parts))
+    completion_est = estimate_token_count(content or "")
+    return TokenUsage(
+        prompt_tokens=prompt_est,
+        completion_tokens=completion_est,
+        total_tokens=prompt_est + completion_est,
+        estimated=True,
     )
-    completion = int(
-        usage.get("completion_tokens")
-        or usage.get("output_tokens")
-        or usage.get("completionTokens")
-        or 0
-    )
-    total = int(usage.get("total_tokens") or usage.get("totalTokens") or 0)
-    if total <= 0:
-        total = prompt + completion
-    return TokenUsage(prompt_tokens=prompt, completion_tokens=completion, total_tokens=total)
 
 
 def normalize_openai_compatible_base(base_url: str) -> str:
@@ -151,6 +237,7 @@ async def chat_complete(
     timeout_sec: float = 90,
     force_json: bool = True,
     history: list[dict[str, str]] | None = None,
+    max_tokens: int | None = None,
 ) -> tuple[str, TokenUsage]:
     """单轮或多轮对话。history 为既有 user/assistant 消息（不含当前 system/user）。
 
@@ -168,6 +255,7 @@ async def chat_complete(
             timeout_sec=timeout_sec,
             force_json=force_json,
             history=history,
+            max_tokens=max_tokens,
         )
     if ptype == "opencode":
         # OpenCode 路径暂拼成单轮文本
@@ -352,6 +440,7 @@ async def _openai_compatible(
     timeout_sec: float,
     force_json: bool = True,
     history: list[dict[str, str]] | None = None,
+    max_tokens: int | None = None,
 ) -> tuple[str, TokenUsage]:
     base = normalize_openai_compatible_base(provider.base_url or "https://api.openai.com/v1")
     url = f"{base}/chat/completions"
@@ -365,11 +454,13 @@ async def _openai_compatible(
         if role in ("user", "assistant") and content:
             messages.append({"role": role, "content": content})
     messages.append({"role": "user", "content": user})
+    token_limit = int(max_tokens) if max_tokens and max_tokens > 0 else (64 if not force_json else 4096)
     payload: dict[str, Any] = {
         "model": model,
         "temperature": temperature,
         "messages": messages,
-        "max_tokens": 64 if not force_json else 4096,
+        "max_tokens": token_limit,
+        "stream": False,
     }
     if force_json:
         payload["response_format"] = {"type": "json_object"}
@@ -381,8 +472,29 @@ async def _openai_compatible(
                 raise RuntimeError(f"OpenAI Compatible 失败 HTTP {resp.status}: {body[:400]}")
             data = json.loads(body)
     try:
-        content = data["choices"][0]["message"]["content"]
-        return str(content or ""), parse_usage_payload(data)
+        content = str(data["choices"][0]["message"]["content"] or "")
+        usage = usage_or_estimate(
+            parse_usage_payload(data),
+            system=system,
+            user=user,
+            content=content,
+            history=history,
+        )
+        if usage.estimated:
+            logger.info(
+                "LLM usage 缺失，已粗估 tokens=%s (provider=%s model=%s)",
+                usage.total_tokens,
+                provider.name,
+                model,
+            )
+        else:
+            logger.debug(
+                "LLM usage tokens=%s (provider=%s model=%s)",
+                usage.total_tokens,
+                provider.name,
+                model,
+            )
+        return content, usage
     except Exception as e:
         raise RuntimeError(f"解析 OpenAI 响应失败: {e}") from e
 
@@ -577,7 +689,14 @@ async def describe_image(
                     return "", TokenUsage()
                 data = json.loads(body)
         text = data["choices"][0]["message"]["content"]
-        return str(text or "").strip(), parse_usage_payload(data)
+        content = str(text or "").strip()
+        usage = usage_or_estimate(
+            parse_usage_payload(data),
+            system="",
+            user="image",
+            content=content,
+        )
+        return content, usage
     except Exception:
         logger.exception("图片描述调用异常")
         return "", TokenUsage()

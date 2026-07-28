@@ -21,6 +21,7 @@ from app.media_store import (
 from app.settings_store import (
     ROOT_DIR,
     GroupConfig,
+    clamp_report_keep_limit,
     load_app_settings,
     load_group_config,
     provider_by_id,
@@ -31,18 +32,23 @@ logger = logging.getLogger(__name__)
 DEFAULT_SYSTEM = (
     "你是群聊监控分析助手。只基于给定记录分析，禁止编造。"
     "必须输出合法 JSON 对象，字段含：headline, topics, key_points, risks, "
-    "action_items, sentiment, notable_users, appendix, context_usage。"
+    "action_items, sentiment, notable_users, deep_dives, appendix, context_usage。"
     "risks 项含 level/type/detail/evidence；evidence 必须是原文摘录。"
     "notable_users 项含 user_id/name/role/summary。"
+    "deep_dives 为深入分析数组，项含 topic/detail/evidence："
+    "当出现 GitHub 仓库、AI/大模型相关名词，或用户自定义要求需深挖时，"
+    "必须在 deep_dives 中写长文展开（每条 detail 建议 120~400 字），不要只写一句话。"
     "appendix 为附录对象，含：nouns（[{term, meaning}] 名词/黑话解析）、"
     "links（[{url, summary}] 链接详解）、notes（[string] 补充说明）。"
-    "若某类附录无内容，用空数组。"
+    "若某类附录无内容，用空数组；有 GitHub/AI 内容时 appendix 也应尽量充实。"
     "context_usage 必填："
     "{used_earlier_context:bool, earlier_rounds:int, earlier_messages:int, summary:string}；"
     "若分析使用了配置时间窗之前补入的消息/引用原文，used_earlier_context 必须为 true，"
     "并在 summary 中简明说明引用了哪些更早内容。"
     "记录可能含「补前文/补后文/引用补全」标记，请把它们当作同一段多轮对话理解。"
     "消息中可能含「[图片描述: …]」，这是对聊天图片的视觉识别结果，必须纳入主题与风险分析。"
+    "用户消息中的「本群自定义分析要求」与「主题深挖规则」优先级最高，必须遵守；"
+    "允许并鼓励在 deep_dives/appendix/key_points 中明显扩充篇幅，不要为了短而省略。"
 )
 
 CONTEXT_CHECK_SYSTEM = (
@@ -54,12 +60,69 @@ CONTEXT_CHECK_SYSTEM = (
     "enough=true 表示可以开始正式分析；need_earlier=true 表示应再向前取聊天记录；"
     "need_reply_ids 只填记录中已出现、但仍缺正文的引用 id；"
     "suggested_earlier_count 建议再取多少条前文（10~40）。"
+    "若用户侧重点或片段中出现 GitHub 仓库 / AI·大模型相关讨论，"
+    "只要相关上下文可能跨多条消息，就应 need_earlier=true 并提高 suggested_earlier_count。"
     "禁止编造 id 或臆测窗外具体内容。"
+)
+
+# 内置：GitHub / AI 相关必须多轮深挖
+TOPIC_DEEP_DIVE_RULES = (
+    "若历史记录中出现 GitHub 仓库（含 github.com、gist、owner/repo、clone/PR/issue 等），"
+    "或 AI 相关名词（大模型、LLM、GPT、Claude、Gemini、Cursor、Agent、Prompt、RAG、微调、"
+    "OpenAI、Anthropic、通义、文心、DeepSeek 等），必须："
+    "1) 通过多轮向前补文尽量凑齐相关讨论上下文；"
+    "2) 在 deep_dives 中对每个仓库/名词做深入分析并明显扩充篇幅；"
+    "3) 仓库链接写入 appendix.links（说明用途、讨论结论；不确定处标明「记录不足」）；"
+    "4) AI 名词写入 appendix.nouns（解释含义与群内用法）；"
+    "5) 禁止只给一句带过。"
+)
+
+_AI_TOPIC_RE = re.compile(
+    r"(?i)\b("
+    r"llm|gpt-?\d*|chatgpt|claude|gemini|openai|anthropic|deepseek|o1|o3|"
+    r"cursor|copilot|rag|prompt|agent|embedding|finetune|fine[-_ ]?tune|"
+    r"transformer|diffusion|midjourney|stable[\s_-]?diffusion"
+    r")\b|"
+    r"(大模型|人工智能|生成式|提示词|微调|智能体|通义|文心|豆包|星火|混元)"
+)
+_GITHUB_TOPIC_RE = re.compile(
+    r"(?i)((https?://)?(www\.)?github\.com/[\w.-]+/[\w.-]+|"
+    r"gist\.github|githubusercontent|"
+    r"\bgit\s*clone\b|\bpull\s*request\b|"
+    r"github\s*仓库|git\s*仓库|开源仓库|开源项目)"
 )
 
 # LLM 驱动向前补前文：最多 5 轮，总时间跨度不超过配置窗口的 5 倍
 MAX_LLM_CONTEXT_ROUNDS = 5
 MAX_WINDOW_MULTIPLIER = 5
+
+
+def detect_focus_topics(text: str) -> dict[str, Any]:
+    """扫描记录中是否含 GitHub / AI 等需深挖主题。"""
+    raw = text or ""
+    github = bool(_GITHUB_TOPIC_RE.search(raw))
+    ai = bool(_AI_TOPIC_RE.search(raw))
+    labels: list[str] = []
+    if github:
+        labels.append("GitHub仓库/链接")
+    if ai:
+        labels.append("AI/大模型相关名词")
+    return {
+        "github": github,
+        "ai": ai,
+        "hit": github or ai,
+        "labels": labels,
+    }
+
+
+def build_analysis_instructions(custom_prompt: str) -> str:
+    """合并本群自定义提示词 + 内置深挖规则（用于多轮审查与正式分析）。"""
+    parts: list[str] = []
+    custom = (custom_prompt or "").strip()
+    if custom:
+        parts.append("【本群自定义分析要求——必须遵守】\n" + custom)
+    parts.append("【主题深挖规则——必须遵守】\n" + TOPIC_DEEP_DIVE_RULES)
+    return "\n\n".join(parts)
 
 
 def sqlite_path() -> Path:
@@ -113,6 +176,7 @@ def ensure_llm_tables(db: Path) -> None:
             """
         )
         _ensure_report_token_columns(conn)
+        _ensure_report_favorite_columns(conn)
 
 
 def _ensure_report_token_columns(conn: sqlite3.Connection) -> None:
@@ -157,6 +221,174 @@ def _ensure_report_token_columns(conn: sqlite3.Connection) -> None:
             continue
 
 
+def _ensure_report_favorite_columns(conn: sqlite3.Connection) -> None:
+    cols = {str(r[1]) for r in conn.execute("PRAGMA table_info(llm_reports)").fetchall()}
+    if "favorited" not in cols:
+        conn.execute(
+            "ALTER TABLE llm_reports ADD COLUMN favorited INTEGER DEFAULT 0"
+        )
+    if "favorited_at" not in cols:
+        conn.execute("ALTER TABLE llm_reports ADD COLUMN favorited_at TEXT")
+    if "favorite_messages_json" not in cols:
+        conn.execute(
+            "ALTER TABLE llm_reports ADD COLUMN favorite_messages_json TEXT"
+        )
+
+
+def fetch_messages_in_window(
+    group_id: str,
+    start_ts: int,
+    end_ts: int,
+    *,
+    limit: int = 800,
+) -> list[dict[str, Any]]:
+    """取时间窗内消息（正序），用于收藏快照。"""
+    db = sqlite_path()
+    if not db.exists() or not group_id:
+        return []
+    start = min(int(start_ts), int(end_ts))
+    end = max(int(start_ts), int(end_ts))
+    lim = max(1, min(800, int(limit)))
+    with sqlite3.connect(db) as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            """
+            SELECT id, group_id, COALESCE(user_id,'') AS user_id,
+                   COALESCE(sender_name,'') AS sender_name,
+                   COALESCE(content,'') AS content,
+                   event_time, COALESCE(created_at,'') AS created_at,
+                   COALESCE(message_id,'') AS message_id
+            FROM messages
+            WHERE group_id=?
+              AND COALESCE(event_time, 0) >= ?
+              AND COALESCE(event_time, 0) <= ?
+            ORDER BY COALESCE(event_time, 0) ASC, id ASC
+            LIMIT ?
+            """,
+            (str(group_id), start, end, lim),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def set_report_favorited(report_id: int, favorited: bool) -> dict[str, Any]:
+    """收藏/取消收藏。收藏时快照当前时间窗聊天记录，之后清理也不会删。"""
+    db = sqlite_path()
+    ensure_llm_tables(db)
+    with sqlite3.connect(db) as conn:
+        conn.row_factory = sqlite3.Row
+        row = conn.execute(
+            """
+            SELECT id, group_id, window_start, window_end, headline,
+                   COALESCE(favorited, 0) AS favorited,
+                   favorite_messages_json
+            FROM llm_reports WHERE id=?
+            """,
+            (int(report_id),),
+        ).fetchone()
+        if not row:
+            raise ValueError(f"报告不存在: {report_id}")
+        if favorited:
+            msgs = fetch_messages_in_window(
+                str(row["group_id"]),
+                int(row["window_start"] or 0),
+                int(row["window_end"] or 0),
+                limit=800,
+            )
+            # 若窗内已无消息但之前有快照，保留旧快照
+            raw_prev = row["favorite_messages_json"]
+            if not msgs and raw_prev:
+                snap = raw_prev
+            else:
+                snap = json.dumps(
+                    [
+                        {
+                            "id": m.get("id"),
+                            "groupId": m.get("group_id"),
+                            "userId": m.get("user_id"),
+                            "senderName": m.get("sender_name"),
+                            "content": m.get("content"),
+                            "eventTime": m.get("event_time"),
+                            "createdAt": m.get("created_at"),
+                            "messageId": m.get("message_id"),
+                        }
+                        for m in msgs
+                    ],
+                    ensure_ascii=False,
+                )
+            conn.execute(
+                """
+                UPDATE llm_reports
+                SET favorited=1,
+                    favorited_at=datetime('now','localtime'),
+                    favorite_messages_json=?
+                WHERE id=?
+                """,
+                (snap, int(report_id)),
+            )
+            msg_count = len(json.loads(snap)) if snap else 0
+        else:
+            conn.execute(
+                """
+                UPDATE llm_reports
+                SET favorited=0, favorited_at=NULL
+                WHERE id=?
+                """,
+                (int(report_id),),
+            )
+            # 取消收藏不删快照，便于再次收藏；清理逻辑仍会按非收藏处理
+            msg_count = 0
+    return {
+        "ok": True,
+        "id": int(report_id),
+        "favorited": bool(favorited),
+        "messageCount": msg_count,
+        "headline": row["headline"],
+    }
+
+
+def get_report_favorite_messages(report_id: int) -> list[dict[str, Any]]:
+    db = sqlite_path()
+    ensure_llm_tables(db)
+    with sqlite3.connect(db) as conn:
+        conn.row_factory = sqlite3.Row
+        row = conn.execute(
+            """
+            SELECT group_id, window_start, window_end,
+                   COALESCE(favorited, 0) AS favorited,
+                   favorite_messages_json
+            FROM llm_reports WHERE id=?
+            """,
+            (int(report_id),),
+        ).fetchone()
+    if not row:
+        return []
+    raw = row["favorite_messages_json"]
+    if raw:
+        try:
+            data = json.loads(raw)
+            if isinstance(data, list):
+                return data
+        except Exception:
+            pass
+    return [
+        {
+            "id": m.get("id"),
+            "groupId": m.get("group_id"),
+            "userId": m.get("user_id"),
+            "senderName": m.get("sender_name"),
+            "content": m.get("content"),
+            "eventTime": m.get("event_time"),
+            "createdAt": m.get("created_at"),
+        }
+        for m in fetch_messages_in_window(
+            str(row["group_id"]),
+            int(row["window_start"] or 0),
+            int(row["window_end"] or 0),
+            limit=800,
+        )
+    ]
+
+
 def token_usage_from_payload(payload: dict[str, Any] | None) -> dict[str, int]:
     if not isinstance(payload, dict):
         return {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
@@ -173,6 +405,63 @@ def token_usage_from_payload(payload: dict[str, Any] | None) -> dict[str, int]:
         "completion_tokens": completion,
         "total_tokens": total,
     }
+
+
+def prune_old_llm_reports(keep: int | None = None) -> int:
+    """只清理未收藏报告：全局保留最近 keep 条未收藏记录；收藏永久保留。"""
+    if keep is None:
+        keep = load_app_settings().llm.report_keep_limit
+    limit = clamp_report_keep_limit(keep)
+    db = sqlite_path()
+    ensure_llm_tables(db)
+    with sqlite3.connect(db) as conn:
+        non_fav = int(
+            conn.execute(
+                """
+                SELECT COUNT(*) FROM llm_reports
+                WHERE COALESCE(favorited, 0) = 0
+                """
+            ).fetchone()[0]
+            or 0
+        )
+        if non_fav <= limit:
+            return 0
+        to_delete = non_fav - limit
+        cur = conn.execute(
+            """
+            DELETE FROM llm_reports
+            WHERE id IN (
+              SELECT id FROM llm_reports
+              WHERE COALESCE(favorited, 0) = 0
+              ORDER BY id ASC
+              LIMIT ?
+            )
+            """,
+            (to_delete,),
+        )
+        deleted = int(cur.rowcount or 0)
+        # 顺带清理很久以前的失败/跳过 job（保留最近 2 倍额度）
+        job_keep = limit * 2
+        job_total = int(conn.execute("SELECT COUNT(*) FROM llm_jobs").fetchone()[0] or 0)
+        if job_total > job_keep:
+            conn.execute(
+                """
+                DELETE FROM llm_jobs
+                WHERE id IN (
+                  SELECT id FROM llm_jobs
+                  ORDER BY id ASC
+                  LIMIT ?
+                )
+                """,
+                (job_total - job_keep,),
+            )
+        if deleted:
+            logger.info(
+                "已清理未收藏 LLM 报告 %s 条，未收藏保留最近 %s 条（收藏不删）",
+                deleted,
+                limit,
+            )
+        return deleted
 
 
 def sum_report_tokens(group_id: str | None = None) -> dict[str, int]:
@@ -913,6 +1202,22 @@ def report_to_md(report: dict[str, Any]) -> str:
             else:
                 lines.append(f"- {u}")
 
+    deep_dives = report.get("deep_dives") or []
+    if deep_dives:
+        lines.append("\n## 深入分析")
+        for i, d in enumerate(deep_dives, 1):
+            if isinstance(d, dict):
+                topic = d.get("topic") or f"主题 {i}"
+                detail = d.get("detail") or ""
+                evidence = d.get("evidence") or ""
+                lines.append(f"\n### {i}. {topic}")
+                if detail:
+                    lines.append(detail)
+                if evidence:
+                    lines.append(f"\n> 依据：{evidence}")
+            else:
+                lines.append(f"- {d}")
+
     usage = report.get("context_usage") or {}
     if isinstance(usage, dict) and (
         usage.get("used_earlier_context")
@@ -1005,6 +1310,7 @@ def _insert_skip_report(
                 msg_count,
             ),
         )
+    prune_old_llm_reports()
 
 
 async def run_group_summary(
@@ -1188,9 +1494,7 @@ async def run_group_summary(
             "source": source,
         }
 
-    user_prompt_body = llm_cfg.prompt.strip() or (
-        "请总结并分析以下群聊，关注主题、风险、待办，并填写 appendix 附录。"
-    )
+    analysis_instructions = build_analysis_instructions(llm_cfg.prompt)
     configured_end = int(context_meta.get("configured_end") or end)
     # 总时间跨度上限 = 配置窗口 × 5
     min_allowed_ts = max(0, configured_end - minutes * 60 * MAX_WINDOW_MULTIPLIER)
@@ -1199,6 +1503,7 @@ async def run_group_summary(
     earlier_added_total = 0
     earlier_reasons: list[str] = []
     model_name = llm_cfg.model or provider.default_model
+    focus_forced_rounds = 0  # 检测到 GitHub/AI 时至少再向前补几轮
 
     def _build_meta_block() -> str:
         block = (
@@ -1228,10 +1533,27 @@ async def run_group_summary(
     # —— LLM 多轮：先判断是否完整，不完整则再向前取记录（最多 5 轮）——
     for round_i in range(1, MAX_LLM_CONTEXT_ROUNDS + 1):
         transcript = format_transcript(rows)
+        focus = detect_focus_topics(transcript)
+        if focus["hit"] and focus_forced_rounds == 0:
+            # 命中深挖主题：至少再强制向前审查/补文 2 轮（在上限内）
+            focus_forced_rounds = min(2, MAX_LLM_CONTEXT_ROUNDS - round_i + 1)
+            source = f"{source}；检测到{'、'.join(focus['labels'])}，将多轮深挖"
+        focus_hint = ""
+        if focus["hit"]:
+            focus_hint = (
+                f"当前片段已检测到：{'、'.join(focus['labels'])}。"
+                "若相关讨论可能跨越多条消息，必须 need_earlier=true，"
+                "suggested_earlier_count 建议 25~40。\n"
+            )
+        elif focus_forced_rounds > 0:
+            focus_hint = "仍在深挖主题补文阶段，优先 need_earlier=true。\n"
+
         check_user = (
             "请审查下列群聊是否完整、是否还需要更早前文才能理解。"
             "若需要，请设置 need_earlier=true；若已可分析，enough=true。"
             "只输出审查 JSON。\n\n"
+            f"{analysis_instructions}\n\n"
+            f"{focus_hint}"
             f"{_build_meta_block()}\n聊天记录:\n{transcript}"
         )
         try:
@@ -1265,17 +1587,25 @@ async def run_group_summary(
 
         enough = bool(check.get("enough"))
         need_earlier = bool(check.get("need_earlier")) and not enough
+        # 深挖主题：在强制轮次内，即使模型说 enough，也继续向前取一轮
+        if focus_forced_rounds > 0 and not need_earlier:
+            need_earlier = True
+            enough = False
+            earlier_reasons.append("深挖主题强制向前补文")
         need_ids = []
         if isinstance(check.get("need_reply_ids"), list):
             need_ids = [str(x) for x in check["need_reply_ids"] if str(x).strip()]
 
-        if enough and not need_ids:
+        if enough and not need_ids and focus_forced_rounds <= 0:
             break
 
         # 达到最早时间边界则停止
         first_ts = _msg_ts(rows[0]) if rows else start
         if first_ts <= min_allowed_ts and not need_ids:
             earlier_reasons.append("已达配置窗口×5 的最早时间边界")
+            break
+
+        if not need_earlier and not need_ids:
             break
 
         added_this_round = 0
@@ -1299,6 +1629,8 @@ async def run_group_summary(
                 take = int(suggest) if suggest is not None else 25
             except Exception:
                 take = 25
+            if focus["hit"] or focus_forced_rounds > 0:
+                take = max(take, 30)
             take = max(10, min(40, take))
             earlier = fetch_messages_before(group_id, first_ts, limit=take)
             kept = []
@@ -1327,8 +1659,10 @@ async def run_group_summary(
         context_meta["lookback_messages"] = int(context_meta.get("lookback_messages") or 0) + added_this_round
         context_meta.setdefault("lookback_reasons", []).append(reason)
         source = f"{source}；第{round_i}轮向前补了 {added_this_round} 条"
+        if focus_forced_rounds > 0:
+            focus_forced_rounds -= 1
 
-        if enough:
+        if enough and focus_forced_rounds <= 0:
             # 只为补引用，本轮后结束
             break
 
@@ -1387,10 +1721,20 @@ async def run_group_summary(
         )
 
     user_prompt = (
-        f"{user_prompt_body}\n\n"
+        f"{analysis_instructions}\n\n"
         f"{base_meta}\n"
-        "请输出完整分析 JSON（含 appendix 与 context_usage）。\n"
+        "请输出完整分析 JSON（必须含 deep_dives、appendix、context_usage）。\n"
+        "若检测到 GitHub/AI 主题或自定义要求深挖：deep_dives 至少 1～3 条长文，"
+        "appendix.links/nouns 写满相关条目，整体篇幅明显长于普通摘要。\n"
         f"\n聊天记录:\n{transcript}"
+    )
+
+    final_focus = detect_focus_topics(transcript)
+    final_max_tokens = 8192 if final_focus["hit"] or (llm_cfg.prompt or "").strip() else 4096
+    analysis_system = (
+        DEFAULT_SYSTEM
+        + "\n以下为本群分析要求，正式输出时必须落实：\n"
+        + analysis_instructions
     )
 
     with sqlite3.connect(db) as conn:
@@ -1407,10 +1751,11 @@ async def run_group_summary(
         raw, final_usage = await chat_complete(
             provider,
             model=model_name,
-            system=DEFAULT_SYSTEM,
+            system=analysis_system,
             user=user_prompt,
             history=history or None,
-            timeout_sec=120,
+            timeout_sec=180,
+            max_tokens=final_max_tokens,
         )
         tokens.add(final_usage)
         report = extract_json_object(raw)
@@ -1421,6 +1766,8 @@ async def run_group_summary(
             ap.setdefault("nouns", [])
             ap.setdefault("links", [])
             ap.setdefault("notes", [])
+        if not isinstance(report.get("deep_dives"), list):
+            report["deep_dives"] = []
 
         usage = report.get("context_usage")
         if not isinstance(usage, dict):
@@ -1456,6 +1803,8 @@ async def run_group_summary(
             "earlier_messages": earlier_added_total,
             "images_captioned": int(image_meta.get("captioned") or 0),
             "images_skipped": int(image_meta.get("skipped") or 0),
+            "focus_topics": final_focus.get("labels") or [],
+            "custom_prompt_applied": bool((llm_cfg.prompt or "").strip()),
             "source": source,
         }
         report["period"] = period
@@ -1480,10 +1829,17 @@ async def run_group_summary(
         if llm_context_rounds > 0:
             notes_head.append("> 本报告经多轮对话：先审查完整性，再取前文，最后输出分析与附录")
         if token_usage.get("total_tokens"):
+            est = "（估算）" if token_usage.get("estimated") else ""
             notes_head.append(
-                f"> Token 消耗：合计 {token_usage['total_tokens']}"
+                f"> Token 消耗{est}：合计 {token_usage['total_tokens']}"
                 f"（输入 {token_usage['prompt_tokens']} / 输出 {token_usage['completion_tokens']}）"
             )
+        logger.info(
+            "LLM 报告 tokens group=%s total=%s estimated=%s",
+            group_id,
+            token_usage.get("total_tokens"),
+            bool(token_usage.get("estimated")),
+        )
         if notes_head:
             md = "\n".join(notes_head) + "\n\n" + md
         with sqlite3.connect(db) as conn:
@@ -1517,6 +1873,7 @@ async def run_group_summary(
                     token_usage["total_tokens"],
                 ),
             )
+        prune_old_llm_reports()
         return {
             "status": "ok",
             "job_id": job_id,
@@ -1550,23 +1907,58 @@ async def run_group_summary(
 
 
 
-def list_reports(group_id: str | None = None, limit: int = 30) -> list[dict[str, Any]]:
+def list_reports(
+    group_id: str | None = None,
+    limit: int = 30,
+    *,
+    favorites_only: bool = False,
+) -> list[dict[str, Any]]:
     db = sqlite_path()
     ensure_llm_tables(db)
+    lim = max(1, min(1000, int(limit)))
     with sqlite3.connect(db) as conn:
         conn.row_factory = sqlite3.Row
-        if group_id:
+        if favorites_only:
             rows = conn.execute(
                 """
                 SELECT id, group_id, window_start, window_end, headline, sentiment,
                        risk_max, msg_count, created_at, report_md, report_json,
                        COALESCE(prompt_tokens, 0) AS prompt_tokens,
                        COALESCE(completion_tokens, 0) AS completion_tokens,
-                       COALESCE(total_tokens, 0) AS total_tokens
+                       COALESCE(total_tokens, 0) AS total_tokens,
+                       COALESCE(favorited, 0) AS favorited,
+                       favorited_at,
+                       CASE
+                         WHEN favorite_messages_json IS NOT NULL
+                          AND length(favorite_messages_json) > 2
+                         THEN 1 ELSE 0
+                       END AS has_favorite_messages
+                FROM llm_reports
+                WHERE COALESCE(favorited, 0) = 1
+                ORDER BY COALESCE(favorited_at, created_at) DESC, id DESC
+                LIMIT ?
+                """,
+                (lim,),
+            ).fetchall()
+        elif group_id:
+            rows = conn.execute(
+                """
+                SELECT id, group_id, window_start, window_end, headline, sentiment,
+                       risk_max, msg_count, created_at, report_md, report_json,
+                       COALESCE(prompt_tokens, 0) AS prompt_tokens,
+                       COALESCE(completion_tokens, 0) AS completion_tokens,
+                       COALESCE(total_tokens, 0) AS total_tokens,
+                       COALESCE(favorited, 0) AS favorited,
+                       favorited_at,
+                       CASE
+                         WHEN favorite_messages_json IS NOT NULL
+                          AND length(favorite_messages_json) > 2
+                         THEN 1 ELSE 0
+                       END AS has_favorite_messages
                 FROM llm_reports WHERE group_id=?
                 ORDER BY id DESC LIMIT ?
                 """,
-                (str(group_id), limit),
+                (str(group_id), lim),
             ).fetchall()
         else:
             rows = conn.execute(
@@ -1575,10 +1967,17 @@ def list_reports(group_id: str | None = None, limit: int = 30) -> list[dict[str,
                        risk_max, msg_count, created_at, report_md, report_json,
                        COALESCE(prompt_tokens, 0) AS prompt_tokens,
                        COALESCE(completion_tokens, 0) AS completion_tokens,
-                       COALESCE(total_tokens, 0) AS total_tokens
+                       COALESCE(total_tokens, 0) AS total_tokens,
+                       COALESCE(favorited, 0) AS favorited,
+                       favorited_at,
+                       CASE
+                         WHEN favorite_messages_json IS NOT NULL
+                          AND length(favorite_messages_json) > 2
+                         THEN 1 ELSE 0
+                       END AS has_favorite_messages
                 FROM llm_reports
                 ORDER BY id DESC LIMIT ?
                 """,
-                (limit,),
+                (lim,),
             ).fetchall()
     return [dict(r) for r in rows]

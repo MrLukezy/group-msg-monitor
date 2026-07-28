@@ -78,6 +78,7 @@ type AppSettings = {
   llm: {
     providers: LlmProvider[];
     activeProviderId: string;
+    reportKeepLimit?: number;
   };
   ui?: {
     compactModeEnabled?: boolean;
@@ -145,7 +146,13 @@ type ReportRow = {
     completionTokens?: number;
     totalTokens?: number;
   };
+  favorited?: boolean;
+  favoritedAt?: string;
+  hasFavoriteMessages?: boolean;
 };
+
+const FAVORITES_GROUP_ID = "__favorites__";
+let monitoredDetailReportId: number | null = null;
 
 const PROVIDER_PRESETS: Record<
   string,
@@ -1006,6 +1013,21 @@ function formatTokenCount(n?: number | null): string {
   return `${Math.round(v / 1000)}k`;
 }
 
+function clampReportKeepLimit(n: number): number {
+  if (!Number.isFinite(n)) return 100;
+  const stepped = Math.round(n / 10) * 10;
+  return Math.max(20, Math.min(500, stepped));
+}
+
+function syncReportKeepSlider(value?: number) {
+  const el = document.getElementById("s-llm-report-keep") as HTMLInputElement | null;
+  const label = document.getElementById("s-llm-report-keep-val");
+  if (!el) return;
+  const v = clampReportKeepLimit(Number(value ?? (el.value || 100)));
+  el.value = String(v);
+  if (label) label.textContent = String(v);
+}
+
 function reportTokenMeta(r: ReportRow): string {
   const total = reportTotalTokens(r);
   if (!total) return "";
@@ -1088,11 +1110,14 @@ function renderMonitoredReportList(reports: ReportRow[]) {
   }
   const shown = visibleReports(reports);
   if (!reports.length) {
+    const isFav = monitoredSelectedGroupId === FAVORITES_GROUP_ID;
     const g = groupsCache.find((x) => x.groupId === monitoredSelectedGroupId);
     box.innerHTML = `<div class="empty">${
-      g?.llmEnabled
-        ? "暂无 LLM 分析主题，可在群配置中「立即 LLM 分析」"
-        : "该群未开启 LLM 检测"
+      isFav
+        ? "暂无收藏。打开某次分析详情后点「收藏」，可永久保留分析与聊天记录。"
+        : g?.llmEnabled
+          ? "暂无 LLM 分析主题，可在群配置中「立即 LLM 分析」"
+          : "该群未开启 LLM 检测"
     }</div>`;
     return;
   }
@@ -1107,12 +1132,14 @@ function renderMonitoredReportList(reports: ReportRow[]) {
       const unread = !skipped && isReportUnread(r.id);
       return `<button class="report-title-item ${risk === "high" ? "high" : ""} ${
         skipped ? "skipped" : ""
-      } ${unread ? "is-unread" : ""}" type="button" data-id="${r.id}">
+      } ${unread ? "is-unread" : ""} ${r.favorited ? "is-favorited" : ""}" type="button" data-id="${r.id}">
         ${reportUnreadDotHtml(unread ? r.id : 0)}
-        <div class="report-title-text">${escapeHtml(r.headline || "(无标题)")}</div>
+        <div class="report-title-text">${r.favorited ? "★ " : ""}${escapeHtml(r.headline || "(无标题)")}</div>
         <div class="report-title-meta">${escapeHtml(r.createdAt || "")} · 风险 ${escapeHtml(
           r.riskMax || "-",
-        )} · ${r.msgCount ?? "-"} 条${escapeHtml(reportTokenMeta(r))}</div>
+        )} · ${r.msgCount ?? "-"} 条${escapeHtml(reportTokenMeta(r))}${
+          r.favorited ? " · 已收藏" : ""
+        }</div>
       </button>`;
     })
     .join("");
@@ -1126,14 +1153,27 @@ function renderMonitoredReportList(reports: ReportRow[]) {
 
 async function selectMonitoredGroup(groupId: string) {
   monitoredSelectedGroupId = groupId;
+  document.querySelectorAll<HTMLButtonElement>("#monitored-group-list .monitored-group-item").forEach((btn) => {
+    btn.classList.toggle("active", btn.dataset.id === groupId);
+  });
+
+  if (groupId === FAVORITES_GROUP_ID) {
+    $("monitored-reports-title").textContent = "收藏夹 · LLM 主题";
+    $("monitored-reports-hint").textContent = "已收藏的分析永久保留，不受清理影响";
+    const reports = await invoke<ReportRow[]>("api_list_reports", {
+      groupId: null,
+      limit: 500,
+      favoritesOnly: true,
+    }).catch(() => [] as ReportRow[]);
+    monitoredReportsCache = reports || [];
+    renderMonitoredReportList(monitoredReportsCache);
+    return;
+  }
+
   const g = groupsCache.find((x) => x.groupId === groupId);
   const name = groupDisplayName(groupId, g?.groupName);
   $("monitored-reports-title").textContent = `${name} · LLM 主题`;
   $("monitored-reports-hint").textContent = `群号 ${groupId}`;
-
-  document.querySelectorAll<HTMLButtonElement>("#monitored-group-list .monitored-group-item").forEach((btn) => {
-    btn.classList.toggle("active", btn.dataset.id === groupId);
-  });
 
   const reports = await invoke<ReportRow[]>("api_list_reports", {
     groupId,
@@ -1150,6 +1190,7 @@ async function openMonitoredReportDetail(reportId: number) {
     return;
   }
   markReportRead(reportId);
+  monitoredDetailReportId = reportId;
   $("monitored-master").classList.add("hidden");
   $("monitored-report-detail").classList.remove("hidden");
   animateViewEnter($("monitored-report-detail"));
@@ -1161,44 +1202,59 @@ async function openMonitoredReportDetail(reportId: number) {
         : ` · 含回溯前文 ${report.lookbackMessages} 条`
       : "";
   $("monitored-report-detail-meta").textContent =
-    `${formatReportWindow(report)} · 风险 ${report.riskMax || "-"} · ${report.msgCount ?? "-"} 条消息${lookbackNote}${reportTokenMeta(report)}`;
+    `${formatReportWindow(report)} · 风险 ${report.riskMax || "-"} · ${report.msgCount ?? "-"} 条消息${lookbackNote}${reportTokenMeta(report)}${
+      report.favorited ? " · 已收藏" : ""
+    }`;
+  syncFavoriteButton(!!report.favorited);
   const reportMd = (report.reportMd || "").trim() || "（无详细内容）";
   setReportDetailBody(reportMd);
 
   const msgsBox = $("monitored-report-detail-msgs");
   msgsBox.dataset.fp = "";
   msgsBox.innerHTML = `<div class="empty">加载相关对话…</div>`;
-  $("monitored-report-msgs-hint").textContent = report.windowExtended
-    ? report.llmContextRounds
-      ? `分析实际使用的消息（LLM 审查 ${report.llmContextRounds} 轮后补入前文）`
-      : "分析实际使用的消息（含向前回溯的前文）"
-    : "分析窗口内的原始消息";
+  $("monitored-report-msgs-hint").textContent = report.favorited
+    ? "收藏快照中的聊天记录（永久保留）"
+    : report.windowExtended
+      ? report.llmContextRounds
+        ? `分析实际使用的消息（LLM 审查 ${report.llmContextRounds} 轮后补入前文）`
+        : "分析实际使用的消息（含向前回溯的前文）"
+      : "分析窗口内的原始消息";
 
   const start = Number(report.windowStart || 0);
   const end = Number(report.windowEnd || 0);
-  if (!report.groupId || !start || !end) {
-    msgsBox.innerHTML = `<div class="empty">该报告缺少时间窗口，无法匹配对话</div>`;
-    return;
-  }
 
   try {
-    const rows = await invoke<MessageRow[]>("api_messages_in_window", {
-      groupId: report.groupId,
-      startTs: start,
-      endTs: end,
-      limit: 800,
-    });
+    let rows: MessageRow[] = [];
+    if (report.favorited || report.hasFavoriteMessages) {
+      rows = await invoke<MessageRow[]>("api_report_favorite_messages", {
+        reportId,
+      }).catch(() => [] as MessageRow[]);
+    }
+    if (!rows.length && report.groupId && start && end) {
+      rows = await invoke<MessageRow[]>("api_messages_in_window", {
+        groupId: report.groupId,
+        startTs: start,
+        endTs: end,
+        limit: 800,
+      });
+    }
     const reasons = (report.lookbackReasons || []).filter(Boolean).join("；");
     const roundBit = report.llmContextRounds
       ? `LLM 审查 ${report.llmContextRounds} 轮 · `
       : "";
-    $("monitored-report-msgs-hint").textContent = report.windowExtended
-      ? `共 ${rows.length} 条 · ${roundBit}已回溯前文${
-          report.lookbackMessages ? ` ${report.lookbackMessages} 条` : ""
-        }${reasons ? `（${reasons}）` : ""} · ${formatReportWindow(report)}`
-      : `共 ${rows.length} 条 · ${formatReportWindow(report)}`;
+    $("monitored-report-msgs-hint").textContent = report.favorited
+      ? `收藏快照 · 共 ${rows.length} 条 · ${formatReportWindow(report)}`
+      : report.windowExtended
+        ? `共 ${rows.length} 条 · ${roundBit}已回溯前文${
+            report.lookbackMessages ? ` ${report.lookbackMessages} 条` : ""
+          }${reasons ? `（${reasons}）` : ""} · ${formatReportWindow(report)}`
+        : `共 ${rows.length} 条 · ${formatReportWindow(report)}`;
     if (!rows.length) {
-      msgsBox.innerHTML = `<div class="empty">该时间窗内无落库消息（可能已被清理或分析时回退了其它窗口）</div>`;
+      msgsBox.innerHTML = `<div class="empty">${
+        report.favorited
+          ? "收藏时未能快照到聊天记录（可能当时窗内无消息）"
+          : "该时间窗内无落库消息（可能已被清理或分析时回退了其它窗口）"
+      }</div>`;
       return;
     }
     const senderNames = [
@@ -1212,6 +1268,57 @@ async function openMonitoredReportDetail(reportId: number) {
     msgsBox.innerHTML = `<div class="empty">加载对话失败：${escapeHtml(String(e))}</div>`;
   }
 }
+
+function syncFavoriteButton(favorited: boolean) {
+  const btn = document.getElementById("btn-favorite-report") as HTMLButtonElement | null;
+  if (!btn) return;
+  btn.classList.toggle("is-favorited", favorited);
+  btn.textContent = favorited ? "★ 已收藏" : "☆ 收藏";
+  btn.title = favorited
+    ? "取消收藏后，该报告将重新纳入自动清理"
+    : "收藏后永久保留分析与当时的聊天记录快照";
+}
+
+async function toggleFavoriteCurrentReport() {
+  if (!monitoredDetailReportId) {
+    toast("未打开分析报告", true);
+    return;
+  }
+  const report = monitoredReportsCache.find((r) => r.id === monitoredDetailReportId);
+  const next = !report?.favorited;
+  try {
+    const res = await invoke<{ ok?: boolean; favorited?: boolean; messageCount?: number }>(
+      "api_set_report_favorite",
+      {
+        reportId: monitoredDetailReportId,
+        favorited: next,
+      },
+    );
+    if (report) {
+      report.favorited = !!res.favorited;
+      report.hasFavoriteMessages = !!res.favorited;
+    }
+    syncFavoriteButton(!!res.favorited);
+    const meta = $("monitored-report-detail-meta");
+    if (report && meta) {
+      const base = meta.textContent || "";
+      meta.textContent = res.favorited
+        ? base.includes("已收藏")
+          ? base
+          : `${base} · 已收藏`
+        : base.replace(/\s*·\s*已收藏/g, "");
+    }
+    renderMonitoredReportList(monitoredReportsCache);
+    toast(
+      res.favorited
+        ? `已收藏（快照 ${res.messageCount ?? 0} 条聊天，清理时不删除）`
+        : "已取消收藏",
+    );
+  } catch (e) {
+    toast(String(e), true);
+  }
+}
+
 
 async function refreshMonitored() {
   showMonitoredMaster();
@@ -1230,11 +1337,12 @@ async function refreshMonitored() {
   if (enabled.length) {
     const allReports = await invoke<ReportRow[]>("api_list_reports", {
       groupId: null,
-      limit: 200,
+      limit: 500,
     }).catch(() => [] as ReportRow[]);
     const seen = new Set<string>();
     for (const r of allReports || []) {
       if (r.groupId) seen.add(r.groupId);
+      totalTokens += reportTotalTokens(r);
     }
     withReport = enabled.filter((g) => seen.has(g.groupId)).length;
   }
@@ -1244,9 +1352,11 @@ async function refreshMonitored() {
       promptTokens?: number;
       completionTokens?: number;
     }>("api_token_stats", { groupId: null });
-    totalTokens = Number(tok?.totalTokens || 0) || 0;
+    const fromDb = Number(tok?.totalTokens || 0) || 0;
+    // DB 汇总更完整；列表仅最近 N 条，作兜底
+    if (fromDb > 0) totalTokens = fromDb;
   } catch {
-    totalTokens = 0;
+    // 旧桌面端可能没有 api_token_stats，沿用列表累加
   }
 
   $("monitored-stats").innerHTML = `
@@ -1254,39 +1364,66 @@ async function refreshMonitored() {
     <div class="stat-card"><div class="stat-num">${totalMsg}</div><div class="stat-label">累计消息</div></div>
     <div class="stat-card"><div class="stat-num">${llm}</div><div class="stat-label">LLM 开启</div></div>
     <div class="stat-card"><div class="stat-num">${withReport}</div><div class="stat-label">已有分析</div></div>
-    <div class="stat-card"><div class="stat-num">${formatTokenCount(totalTokens)}</div><div class="stat-label">总 Token</div></div>
+    <div class="stat-card" title="${
+      totalTokens > 0
+        ? "含官方 usage 与缺失时的粗估"
+        : "需重启监听服务后重新分析才会累计"
+    }"><div class="stat-num">${formatTokenCount(totalTokens)}</div><div class="stat-label">总 Token</div></div>
   `;
 
   const box = $("monitored-group-list");
+  const favCount = await invoke<ReportRow[]>("api_list_reports", {
+    groupId: null,
+    limit: 500,
+    favoritesOnly: true,
+  })
+    .then((rows) => (rows || []).length)
+    .catch(() => 0);
+
   if (!enabled.length) {
-    monitoredSelectedGroupId = null;
+    monitoredSelectedGroupId = FAVORITES_GROUP_ID;
     monitoredReportsCache = [];
-    box.innerHTML = `<div class="empty">暂无启用监听的群。到「群列表」打开群配置并勾选「启用监听此群」。</div>`;
-    $("monitored-reports-title").textContent = "LLM 分析主题";
-    $("monitored-reports-hint").textContent = "请选择左侧群";
-    renderMonitoredReportList([]);
+    box.innerHTML = `
+      <button class="monitored-group-item favorites-item active" type="button" data-id="${FAVORITES_GROUP_ID}">
+        <div class="name">★ 收藏夹</div>
+        <div class="meta">${favCount} 条永久保留</div>
+      </button>
+      <div class="empty">暂无启用监听的群。到「群列表」打开群配置并勾选「启用监听此群」。</div>`;
+    box.querySelectorAll<HTMLButtonElement>(".monitored-group-item").forEach((btn) => {
+      btn.onclick = () => {
+        selectMonitoredGroup(btn.dataset.id || "").catch((e) => toast(String(e), true));
+      };
+    });
+    await selectMonitoredGroup(FAVORITES_GROUP_ID);
     return;
   }
 
   if (
     !monitoredSelectedGroupId ||
-    !enabled.some((g) => g.groupId === monitoredSelectedGroupId)
+    (monitoredSelectedGroupId !== FAVORITES_GROUP_ID &&
+      !enabled.some((g) => g.groupId === monitoredSelectedGroupId))
   ) {
     monitoredSelectedGroupId = enabled[0].groupId;
   }
 
-  box.innerHTML = enabled
-    .map((g) => {
-      const last = g.lastTime
-        ? new Date(g.lastTime * 1000).toLocaleString()
-        : "暂无消息";
-      const name = groupDisplayName(g.groupId, g.groupName);
-      const active = g.groupId === monitoredSelectedGroupId ? "active" : "";
-      const unread = groupUnreadCount(g.groupId);
-      const unreadCls = unread > 0 ? "has-unread" : "";
-      return `<button class="monitored-group-item ${active} ${unreadCls}" type="button" data-id="${escapeHtml(
-        g.groupId,
-      )}">
+  const favActive = monitoredSelectedGroupId === FAVORITES_GROUP_ID ? "active" : "";
+  box.innerHTML =
+    `<button class="monitored-group-item favorites-item ${favActive}" type="button" data-id="${FAVORITES_GROUP_ID}">
+        <div class="name">★ 收藏夹</div>
+        <div class="meta">${favCount} 条永久保留</div>
+      </button>` +
+    enabled
+      .map((g) => {
+        const last = g.lastTime
+          ? new Date(g.lastTime * 1000).toLocaleString()
+          : "暂无消息";
+        const name = groupDisplayName(g.groupId, g.groupName);
+        const active = g.groupId === monitoredSelectedGroupId ? "active" : "";
+        const unread = groupUnreadCount(g.groupId);
+        const unreadCls = unread > 0 ? "has-unread" : "";
+        return `<button class="monitored-group-item ${active} ${unreadCls}" type="button" data-id="${escapeHtml(
+          g.groupId,
+        )}">
         ${unreadBadgeHtml(unread)}
         <div class="name">${escapeHtml(name)}</div>
         <div class="meta">群号 ${escapeHtml(g.groupId)}</div>
@@ -1296,8 +1433,8 @@ async function refreshMonitored() {
           <span class="badge ${g.keywordEnabled ? "on" : ""}">关键词</span>
         </div>
       </button>`;
-    })
-    .join("");
+      })
+      .join("");
 
   box.querySelectorAll<HTMLButtonElement>(".monitored-group-item").forEach((btn) => {
     btn.onclick = () => {
@@ -1670,6 +1807,9 @@ async function persistSettingsFromForm(): Promise<AppSettings> {
     llm: {
       activeProviderId: settingsCache.llm.activeProviderId,
       providers: settingsCache.llm.providers,
+      reportKeepLimit: clampReportKeepLimit(
+        Number($<HTMLInputElement>("s-llm-report-keep")?.value || settingsCache.llm.reportKeepLimit || 100),
+      ),
     },
     ui: {
       compactModeEnabled: $<HTMLInputElement>("s-compact-mode").checked,
@@ -1914,6 +2054,7 @@ async function loadSettingsView() {
   $<HTMLInputElement>("s-compact-mode").checked = !!settingsCache.ui?.compactModeEnabled;
   applyTheme(settingsCache.ui?.theme || "midnight");
   renderChannelBindings(settingsCache);
+  syncReportKeepSlider(settingsCache.llm?.reportKeepLimit ?? 100);
   const active = activeProvider();
   settingsModelOptions = active?.defaultModel ? [{ id: active.defaultModel }] : [];
   fillModelSelect("s-default-model", settingsModelOptions, active?.defaultModel || "");
@@ -2207,11 +2348,18 @@ window.addEventListener("DOMContentLoaded", async () => {
   };
   $("btn-back-monitored-report").onclick = () => {
     showMonitoredMaster();
+    monitoredDetailReportId = null;
     animateViewEnter($("monitored-master"));
     if (monitoredSelectedGroupId) {
       selectMonitoredGroup(monitoredSelectedGroupId).catch(() => undefined);
     }
   };
+  const favBtn = document.getElementById("btn-favorite-report");
+  if (favBtn) {
+    favBtn.onclick = () => {
+      toggleFavoriteCurrentReport().catch((e) => toast(String(e), true));
+    };
+  }
   $("btn-goto-groups").onclick = () => {
     switchTab("groups");
     refreshGroups().catch((e) => toast(String(e), true));
@@ -2820,12 +2968,20 @@ window.addEventListener("DOMContentLoaded", async () => {
     }
   };
 
+  const reportKeepEl = document.getElementById("s-llm-report-keep") as HTMLInputElement | null;
+  if (reportKeepEl) {
+    reportKeepEl.oninput = () => syncReportKeepSlider(Number(reportKeepEl.value));
+    reportKeepEl.onchange = () => syncReportKeepSlider(Number(reportKeepEl.value));
+  }
+
   try {
     settingsCache = await invoke<AppSettings>("api_get_settings");
     applyTheme(settingsCache.ui?.theme || "midnight");
     $<HTMLInputElement>("s-compact-mode").checked = !!settingsCache.ui?.compactModeEnabled;
+    syncReportKeepSlider(settingsCache.llm?.reportKeepLimit ?? 100);
   } catch {
     applyTheme("midnight");
+    syncReportKeepSlider(100);
   }
 
   try {

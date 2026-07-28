@@ -147,6 +147,9 @@
                 <h2 id="monitored-report-detail-title">LLM 分析详情</h2>
                 <p id="monitored-report-detail-meta"></p>
               </div>
+              <div class="page-head-actions">
+                <button id="btn-favorite-report" class="btn ghost favorite-btn" type="button" title="收藏后永久保留分析与聊天记录">☆ 收藏</button>
+              </div>
             </header>
             <div class="report-detail-split fill">
               <div class="panel fill scroll report-detail-panel">
@@ -277,7 +280,8 @@
                     </label>
                     <label>
                       分析提示词
-                      <textarea id="g-llm-prompt" rows="6"></textarea>
+                      <textarea id="g-llm-prompt" rows="6" placeholder="会作用于多轮前文审查与最终分析。例如：出现 GitHub/AI 名词时深入展开…"></textarea>
+                      <p class="field-hint">保存后下次分析即生效。会参与多轮前文审查与最终报告；内置也会对 GitHub/AI 名词强制深挖并扩充 deep_dives。</p>
                     </label>
                   </div>
                 </div>
@@ -498,6 +502,17 @@
                   <button id="btn-test-provider" class="btn ghost" type="button">测试 LLM 连通性</button>
                 </div>
                 <div id="llm-test-result" class="test-result" hidden></div>
+              </div>
+
+              <div class="setting-item">
+                <label>LLM 分析记录保留条数</label>
+                <p class="settings-desc">全局只保留最近 N 条「未收藏」分析报告，超出后自动删除更早记录；已收藏永久保留。范围 20–500，默认 100。</p>
+                <div class="range-row">
+                  <span class="range-min">20</span>
+                  <input id="s-llm-report-keep" type="range" min="20" max="500" step="10" value="100" />
+                  <span class="range-max">500</span>
+                  <strong id="s-llm-report-keep-val" class="range-val">100</strong>
+                </div>
               </div>
             </div>
 

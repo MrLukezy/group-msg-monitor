@@ -14,7 +14,14 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-from app.llm.service import list_reports, run_group_summary, sqlite_path, sum_report_tokens  # noqa: E402
+from app.llm.service import (  # noqa: E402
+    get_report_favorite_messages,
+    list_reports,
+    run_group_summary,
+    set_report_favorited,
+    sqlite_path,
+    sum_report_tokens,
+)
 from app.settings_store import (  # noqa: E402
     AppSettings,
     GroupConfig,
@@ -241,6 +248,11 @@ def cmd_save_settings(raw: str) -> None:
     llm = mapped.get("llm") or {}
     if "activeProviderId" in llm:
         llm["active_provider_id"] = llm.pop("activeProviderId")
+    if "reportKeepLimit" in llm:
+        llm["report_keep_limit"] = llm.pop("reportKeepLimit")
+    elif "report_keep_limit" not in llm:
+        llm["report_keep_limit"] = 100
+    llm["report_keep_limit"] = int(llm.get("report_keep_limit") or 100)
     providers = []
     for p in llm.get("providers") or []:
         providers.append(
@@ -899,8 +911,8 @@ def cmd_pull_history(group_id: str, count: int) -> None:
     out(result)
 
 
-def cmd_list_reports(group_id: str | None, limit: int) -> None:
-    rows = list_reports(group_id, limit)
+def cmd_list_reports(group_id: str | None, limit: int, favorites_only: bool = False) -> None:
+    rows = list_reports(group_id, limit, favorites_only=favorites_only)
     items = []
     for r in rows:
         period: dict = {}
@@ -954,9 +966,22 @@ def cmd_list_reports(group_id: str | None, limit: int) -> None:
                     "completionTokens": token_usage["completion_tokens"],
                     "totalTokens": token_usage["total_tokens"],
                 },
+                "favorited": bool(r.get("favorited")),
+                "favoritedAt": r.get("favorited_at") or "",
+                "hasFavoriteMessages": bool(r.get("has_favorite_messages")),
             }
         )
     out(items)
+
+
+def cmd_set_report_favorite(report_id: int, favorited: bool) -> None:
+    result = set_report_favorited(int(report_id), bool(favorited))
+    out(result)
+
+
+def cmd_report_favorite_messages(report_id: int) -> None:
+    rows = get_report_favorite_messages(int(report_id))
+    out(rows)
 
 
 def token_usage_from_row(r: dict, payload: dict) -> dict[str, int]:
@@ -1235,6 +1260,14 @@ def main() -> None:
     p7 = sub.add_parser("list-reports")
     p7.add_argument("--group-id", default="")
     p7.add_argument("--limit", type=int, default=20)
+    p7.add_argument("--favorites-only", action="store_true")
+
+    p_fav = sub.add_parser("set-report-favorite")
+    p_fav.add_argument("--report-id", type=int, required=True)
+    p_fav.add_argument("--favorited", type=int, choices=[0, 1], required=True)
+
+    p_fav_msgs = sub.add_parser("report-favorite-messages")
+    p_fav_msgs.add_argument("--report-id", type=int, required=True)
 
     p_tok = sub.add_parser("token-stats")
     p_tok.add_argument("--group-id", default="")
@@ -1292,7 +1325,15 @@ def main() -> None:
     elif args.cmd == "pull-history":
         cmd_pull_history(args.group_id, args.count)
     elif args.cmd == "list-reports":
-        cmd_list_reports(args.group_id or None, args.limit)
+        cmd_list_reports(
+            args.group_id or None,
+            args.limit,
+            favorites_only=bool(getattr(args, "favorites_only", False)),
+        )
+    elif args.cmd == "set-report-favorite":
+        cmd_set_report_favorite(args.report_id, bool(args.favorited))
+    elif args.cmd == "report-favorite-messages":
+        cmd_report_favorite_messages(args.report_id)
     elif args.cmd == "token-stats":
         cmd_token_stats(args.group_id or None)
     elif args.cmd == "cache-groups":
