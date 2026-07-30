@@ -629,6 +629,20 @@ async function pollLlmTipsAndUnread() {
   await refreshUnreadBadge();
 }
 
+async function refreshVisibleMonitoredReports() {
+  if (
+    document.hidden ||
+    !$("view-monitored").classList.contains("active") ||
+    !$("monitored-report-detail").classList.contains("hidden")
+  ) {
+    return;
+  }
+  await refreshUnreadBadge();
+  if (monitoredSelectedGroupId) {
+    await selectMonitoredGroup(monitoredSelectedGroupId);
+  }
+}
+
 function setPill(key: string, on: boolean, label: string) {
   const el = document.querySelector(`.pill[data-key="${key}"]`) as HTMLButtonElement;
   if (!el) return;
@@ -2973,6 +2987,7 @@ function startIndependentRefreshLoops() {
   repeat(async () => {
     if (!document.hidden) await pollLlmTipsAndUnread();
   }, 15_000);
+  repeat(refreshVisibleMonitoredReports, 10_000);
   repeat(async () => {
     if (document.hidden) return;
     if ($("view-live").classList.contains("active")) {
@@ -3917,6 +3932,8 @@ window.addEventListener("DOMContentLoaded", async () => {
       if (currentGroupId === groupId) {
         await openGroup(groupId);
       }
+      await refreshUnreadBadge().catch(() => undefined);
+      await refreshVisibleMonitoredReports().catch(() => undefined);
     } catch (e) {
       toast(String(e), true);
     } finally {
