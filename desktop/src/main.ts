@@ -4,6 +4,7 @@ import { openUrl } from "@tauri-apps/plugin-opener";
 import gsap from "gsap";
 import QRCode from "qrcode";
 import { formatTime, renderMsgHtml } from "./cq";
+import { setupUiSounds } from "./ui-sounds";
 
 type StatusInfo = {
   napcatInstalled: boolean;
@@ -294,6 +295,10 @@ let settingsModelOptions: { id: string }[] = [];
 let groupModelOptions: { id: string }[] = [];
 let imageModelOptions: { id: string }[] = [];
 let toastTimer = 0;
+let settingsAutoSaveTimer = 0;
+let settingsAutoSaveReady = false;
+let settingsSaveGeneration = 0;
+let settingsSaveChain: Promise<unknown> = Promise.resolve();
 let reduceMotion = false;
 let groupNameMap = new Map<string, string>();
 let groupsCache: GroupItem[] = [];
@@ -503,7 +508,10 @@ function renderThemePicker() {
     </button>`;
   }).join("");
   box.querySelectorAll<HTMLButtonElement>(".theme-card").forEach((btn) => {
-    btn.onclick = () => applyTheme(btn.dataset.themeId || "midnight");
+    btn.onclick = () => {
+      applyTheme(btn.dataset.themeId || "midnight");
+      scheduleSettingsAutoSave(150);
+    };
   });
 }
 
@@ -1746,6 +1754,12 @@ async function selectMonitoredGroup(groupId: string) {
   renderMonitoredReportList(monitoredReportsCache);
 }
 
+async function openMonitoredGroupConfig(groupId: string) {
+  if (!groupId || groupId === FAVORITES_GROUP_ID) return;
+  switchTab("groups");
+  await openGroup(groupId);
+}
+
 async function openMonitoredReportDetail(reportId: number) {
   const report = monitoredReportsCache.find((r) => r.id === reportId);
   if (!report) {
@@ -2060,24 +2074,36 @@ async function refreshMonitored() {
         const active = g.groupId === monitoredSelectedGroupId ? "active" : "";
         const unread = groupUnreadCount(g.groupId);
         const unreadCls = unread > 0 ? "has-unread" : "";
-        return `<button class="monitored-group-item ${active} ${unreadCls}" type="button" data-id="${escapeHtml(
-          g.groupId,
-        )}">
-        ${unreadBadgeHtml(unread)}
-        <div class="name">${escapeHtml(name)}</div>
-        <div class="meta">群号 ${escapeHtml(g.groupId)}</div>
-        <div class="meta">${escapeHtml(last)} · ${g.msgCount} 条</div>
-        <div class="badges">
-          <span class="badge ${g.llmEnabled ? "on" : ""}">LLM</span>
-          <span class="badge ${g.keywordEnabled ? "on" : ""}">关键词</span>
-        </div>
-      </button>`;
+        return `<div class="monitored-group-row">
+          <button class="monitored-group-item ${active} ${unreadCls}" type="button" data-id="${escapeHtml(
+            g.groupId,
+          )}">
+            ${unreadBadgeHtml(unread)}
+            <div class="name">${escapeHtml(name)}</div>
+            <div class="meta">群号 ${escapeHtml(g.groupId)}</div>
+            <div class="meta">${escapeHtml(last)} · ${g.msgCount} 条</div>
+            <div class="badges">
+              <span class="badge ${g.llmEnabled ? "on" : ""}">LLM</span>
+              <span class="badge ${g.keywordEnabled ? "on" : ""}">关键词</span>
+            </div>
+          </button>
+          <button class="monitored-group-config-btn" type="button" data-config-id="${escapeHtml(
+            g.groupId,
+          )}" title="打开本群配置">配置</button>
+        </div>`;
       })
       .join("");
 
   box.querySelectorAll<HTMLButtonElement>(".monitored-group-item").forEach((btn) => {
     btn.onclick = () => {
       selectMonitoredGroup(btn.dataset.id || "").catch((e) => toast(String(e), true));
+    };
+  });
+  box.querySelectorAll<HTMLButtonElement>(".monitored-group-config-btn").forEach((btn) => {
+    btn.onclick = () => {
+      openMonitoredGroupConfig(btn.dataset.configId || "").catch((e) =>
+        toast(`打开群配置失败：${e}`, true),
+      );
     };
   });
 
@@ -2476,7 +2502,60 @@ function showTestResult(elId: string, ok: boolean, text: string) {
   el.textContent = text;
 }
 
-async function persistSettingsFromForm(): Promise<AppSettings> {
+function setSettingsAutoSaveStatus(
+  state: "idle" | "saving" | "saved" | "error",
+  text: string,
+) {
+  const el = document.getElementById("settings-auto-save-status");
+  if (!el) return;
+  el.classList.remove("saving", "saved", "error");
+  if (state !== "idle") el.classList.add(state);
+  el.textContent = text;
+}
+
+function persistSettingsFromForm(): Promise<AppSettings> {
+  const generation = ++settingsSaveGeneration;
+  setSettingsAutoSaveStatus("saving", "正在自动保存…");
+  const task = settingsSaveChain
+    .catch(() => undefined)
+    .then(() => persistSettingsSnapshot());
+  settingsSaveChain = task;
+  task.then(
+    () => {
+      if (generation === settingsSaveGeneration) {
+        setSettingsAutoSaveStatus("saved", "已自动保存");
+      }
+    },
+    () => {
+      if (generation === settingsSaveGeneration) {
+        setSettingsAutoSaveStatus("error", "自动保存失败");
+      }
+    },
+  );
+  return task;
+}
+
+function scheduleSettingsAutoSave(delayMs = 700) {
+  if (!settingsAutoSaveReady || !settingsCache) return;
+  window.clearTimeout(settingsAutoSaveTimer);
+  setSettingsAutoSaveStatus("saving", "等待自动保存…");
+  settingsAutoSaveTimer = window.setTimeout(() => {
+    settingsAutoSaveTimer = 0;
+    persistSettingsFromForm().catch((e) => toast(`自动保存失败：${e}`, true));
+  }, delayMs);
+}
+
+async function flushSettingsAutoSave() {
+  if (settingsAutoSaveTimer) {
+    window.clearTimeout(settingsAutoSaveTimer);
+    settingsAutoSaveTimer = 0;
+    await persistSettingsFromForm();
+    return;
+  }
+  await settingsSaveChain.catch(() => undefined);
+}
+
+async function persistSettingsSnapshot(): Promise<AppSettings> {
   if (!settingsCache) settingsCache = await invoke<AppSettings>("api_get_settings");
   const globalProviderId =
     $<HTMLSelectElement>("s-global-provider").value || settingsCache.llm.activeProviderId;
@@ -2953,6 +3032,7 @@ function saveLightboxImage() {
 window.addEventListener("DOMContentLoaded", async () => {
   reduceMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
   loadHideSkippedToggle();
+  setupUiSounds();
 
   const hideSkippedEl = document.getElementById(
     "monitored-hide-skipped",
@@ -3020,6 +3100,7 @@ window.addEventListener("DOMContentLoaded", async () => {
   };
   $("win-close").onclick = async () => {
     try {
+      await flushSettingsAutoSave();
       await getCurrentWindow().close();
     } catch (e) {
       toast(String(e), true);
@@ -3827,14 +3908,16 @@ window.addEventListener("DOMContentLoaded", async () => {
     renderProviderList();
   };
 
-  $("btn-save-settings").onclick = async () => {
-    try {
-      await persistSettingsFromForm();
-      toast("总配置已保存");
-    } catch (e) {
-      toast(String(e), true);
-    }
+  const settingsView = document.getElementById("view-settings");
+  const onSettingsFormChanged = (event: Event) => {
+    const target = event.target as HTMLElement | null;
+    if (!target?.matches("input, select, textarea")) return;
+    if (target.closest("#provider-form")) return;
+    if (target.id === "s-wx-keys" || target.id === "s-tg-2fa") return;
+    scheduleSettingsAutoSave(event.type === "change" ? 250 : 700);
   };
+  settingsView?.addEventListener("input", onSettingsFormChanged);
+  settingsView?.addEventListener("change", onSettingsFormChanged);
 
   const reportKeepEl = document.getElementById("s-llm-report-keep") as HTMLInputElement | null;
   if (reportKeepEl) {
@@ -3850,6 +3933,8 @@ window.addEventListener("DOMContentLoaded", async () => {
     applyTheme("midnight");
     syncReportKeepSlider(100);
   }
+  settingsAutoSaveReady = true;
+  setSettingsAutoSaveStatus("idle", "修改后自动保存");
 
   try {
     const res = await invoke<{ groups: GroupItem[] }>("api_list_groups", {
