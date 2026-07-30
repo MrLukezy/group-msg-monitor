@@ -1374,6 +1374,10 @@ input::placeholder, textarea::placeholder {
   background: var(--bg-3);
   box-shadow: 0 0 20px color-mix(in srgb, var(--accent-2) 10%, transparent);
 }
+.group-item:focus-visible {
+  outline: 2px solid color-mix(in srgb, var(--accent) 65%, transparent);
+  outline-offset: 2px;
+}
 .group-item:active { transform: scale(0.995); }
 .group-item.has-unread {
   border-color: color-mix(in srgb, var(--red) 35%, var(--border));
@@ -1392,6 +1396,30 @@ input::placeholder, textarea::placeholder {
 .group-item .group-unread-badge {
   top: 10px;
   right: 10px;
+}
+.group-quick-actions {
+  align-self: center;
+  flex-wrap: nowrap;
+}
+.group-item.has-unread .group-quick-actions {
+  padding-right: 30px;
+}
+.group-quick-btn {
+  appearance: none;
+  font: inherit;
+  line-height: 1.2;
+  cursor: pointer;
+  transition: color 0.15s ease, border-color 0.15s ease, background 0.15s ease, transform 0.15s ease;
+}
+.group-quick-btn:hover:not(:disabled) {
+  transform: translateY(-1px);
+  color: var(--text);
+  border-color: color-mix(in srgb, var(--accent) 48%, var(--border));
+  background: color-mix(in srgb, var(--accent) 10%, var(--bg-1));
+}
+.group-quick-btn:disabled {
+  cursor: wait;
+  opacity: 0.55;
 }
 
 .monitored-split {

@@ -302,6 +302,7 @@ let settingsSaveChain: Promise<unknown> = Promise.resolve();
 let reduceMotion = false;
 let groupNameMap = new Map<string, string>();
 let groupsCache: GroupItem[] = [];
+const groupQuickSaveInFlight = new Set<string>();
 let liveScrollQuietUntil = 0;
 let liveSelectedGroupId: string | null = null;
 let liveGroupsRefreshAt = 0;
@@ -1432,6 +1433,55 @@ function updateGroupsFilterSummary(opts: {
   el.innerHTML = bits.join(" · ");
 }
 
+async function openGroupKeywordConfig(groupId: string) {
+  if (!groupId) return;
+  await openGroup(groupId);
+  window.requestAnimationFrame(() => {
+    const input = $<HTMLInputElement>("g-kw-enabled");
+    input.scrollIntoView({
+      behavior: reduceMotion ? "auto" : "smooth",
+      block: "center",
+    });
+    input.focus({ preventScroll: true });
+  });
+}
+
+async function toggleGroupQuickSetting(
+  groupId: string,
+  action: "monitor" | "llm",
+  sourceButton: HTMLButtonElement,
+) {
+  if (!groupId || groupQuickSaveInFlight.has(groupId)) return;
+  groupQuickSaveInFlight.add(groupId);
+  const item = sourceButton.closest<HTMLElement>(".group-item");
+  const buttons = Array.from(
+    item?.querySelectorAll<HTMLButtonElement>(".group-quick-btn") || [],
+  );
+  buttons.forEach((button) => {
+    button.disabled = true;
+  });
+
+  const nextEnabled = sourceButton.getAttribute("aria-pressed") !== "true";
+  try {
+    const config = await invoke<GroupConfig>("api_get_group", { groupId });
+    if (action === "monitor") {
+      config.enabled = nextEnabled;
+    } else {
+      config.llmMonitor.enabled = nextEnabled;
+    }
+    await invoke("api_save_group", { config });
+    toast(
+      `${action === "monitor" ? "群监听" : "LLM 分析"}已${nextEnabled ? "开启" : "关闭"}`,
+    );
+    await refreshGroups();
+  } finally {
+    groupQuickSaveInFlight.delete(groupId);
+    buttons.forEach((button) => {
+      button.disabled = false;
+    });
+  }
+}
+
 async function refreshGroups() {
   const box = $("groups-list");
   try {
@@ -1487,10 +1537,9 @@ async function refreshGroups() {
         const name = groupDisplayName(g.groupId, g.groupName);
         const ch = guessChannel(g.groupId, g.channel);
         const unread = g.enabled ? groupUnreadCount(g.groupId) : 0;
-        const statusBadge = `<span class="badge ${g.enabled ? "on" : ""}">${g.enabled ? "监听中" : "未启用"}</span>`;
-        return `<button class="group-item ${
+        return `<article class="group-item ${
           unread > 0 ? "has-unread" : ""
-        }" type="button" data-id="${escapeHtml(g.groupId)}">
+        }" role="button" tabindex="0" data-id="${escapeHtml(g.groupId)}">
         ${unreadBadgeHtml(unread)}
         <div>
           <div class="name">${escapeHtml(name)}</div>
@@ -1500,16 +1549,44 @@ async function refreshGroups() {
             Number(g.msgCount) || 0
           } 条</div>
         </div>
-        <div class="badges">
-          ${statusBadge}
-          <span class="badge ${g.keywordEnabled ? "on" : ""}">关键词</span>
-          <span class="badge ${g.llmEnabled ? "on" : ""}">LLM</span>
+        <div class="badges group-quick-actions">
+          <button class="badge group-quick-btn ${g.enabled ? "on" : ""}" type="button"
+            data-action="monitor" aria-pressed="${g.enabled}" title="点击${g.enabled ? "关闭" : "开启"}监听">
+            ${g.enabled ? "监听中" : "未启用"}
+          </button>
+          <button class="badge group-quick-btn ${g.keywordEnabled ? "on" : ""}" type="button"
+            data-action="keyword" title="打开关键词配置">关键词</button>
+          <button class="badge group-quick-btn ${g.llmEnabled ? "on" : ""}" type="button"
+            data-action="llm" aria-pressed="${g.llmEnabled}" title="点击${g.llmEnabled ? "关闭" : "开启"} LLM">
+            LLM
+          </button>
         </div>
-      </button>`;
+      </article>`;
       })
       .join("");
-    box.querySelectorAll<HTMLButtonElement>(".group-item").forEach((btn) => {
-      btn.onclick = () => openGroup(btn.dataset.id || "");
+    box.querySelectorAll<HTMLElement>(".group-item").forEach((item) => {
+      item.onclick = () => openGroup(item.dataset.id || "");
+      item.onkeydown = (event) => {
+        if ((event.target as HTMLElement | null)?.closest(".group-quick-btn")) return;
+        if (event.key !== "Enter" && event.key !== " ") return;
+        event.preventDefault();
+        openGroup(item.dataset.id || "").catch((e) => toast(String(e), true));
+      };
+    });
+    box.querySelectorAll<HTMLButtonElement>(".group-quick-btn").forEach((btn) => {
+      btn.onclick = (event) => {
+        event.stopPropagation();
+        const item = btn.closest<HTMLElement>(".group-item");
+        const groupId = item?.dataset.id || "";
+        const action = btn.dataset.action;
+        if (action === "keyword") {
+          openGroupKeywordConfig(groupId).catch((e) => toast(String(e), true));
+          return;
+        }
+        if (action === "monitor" || action === "llm") {
+          toggleGroupQuickSetting(groupId, action, btn).catch((e) => toast(String(e), true));
+        }
+      };
     });
   } catch (e) {
     console.error("refreshGroups failed", e);
