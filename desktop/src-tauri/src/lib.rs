@@ -1068,8 +1068,13 @@ fn api_save_group(config: Value) -> Result<Value, String> {
 }
 
 #[tauri::command]
-fn api_run_llm(group_id: String) -> Result<Value, String> {
-    let v = py_api_json(&["run-llm", "--group-id", &group_id])?;
+async fn api_run_llm(group_id: String) -> Result<Value, String> {
+    // Python 分析可能持续数分钟，必须放到阻塞线程，避免卡住 Tauri 主线程。
+    let v = tauri::async_runtime::spawn_blocking(move || {
+        py_api_json(&["run-llm", "--group-id", &group_id])
+    })
+    .await
+    .map_err(|e| format!("LLM 分析后台任务异常: {e}"))??;
     // normalize
     let mut out = v.clone();
     if let Some(obj) = out.as_object_mut() {

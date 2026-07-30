@@ -99,6 +99,12 @@ _GITHUB_TOPIC_RE = re.compile(
 MAX_LLM_CONTEXT_ROUNDS = 5
 MAX_WINDOW_MULTIPLIER = 5
 
+# 手动“立即分析”以快速返回为优先，不做多轮回溯，并限制输入规模。
+# 12000 中文字符约 7500 tokens，需为系统提示和模型输出预留上下文。
+MANUAL_MAX_MESSAGES = 100
+MANUAL_TRANSCRIPT_MAX_CHARS = 12000
+MANUAL_MAX_IMAGES = 4
+
 
 def detect_focus_topics(text: str) -> dict[str, Any]:
     """扫描记录中是否含 GitHub / AI 等需深挖主题。"""
@@ -126,6 +132,33 @@ def build_analysis_instructions(custom_prompt: str) -> str:
         parts.append("【本群自定义分析要求——必须遵守】\n" + custom)
     parts.append("【主题深挖规则——必须遵守】\n" + TOPIC_DEEP_DIVE_RULES)
     return "\n\n".join(parts)
+
+
+def limit_recent_rows(
+    rows: list[dict[str, Any]],
+    *,
+    max_messages: int = MANUAL_MAX_MESSAGES,
+    max_chars: int = MANUAL_TRANSCRIPT_MAX_CHARS,
+) -> tuple[list[dict[str, Any]], int]:
+    """从末尾保留最近消息，并按近似格式化长度限制输入规模。"""
+    if not rows:
+        return [], 0
+
+    candidates = rows[-max(1, int(max_messages)) :]
+    selected: list[dict[str, Any]] = []
+    used = 0
+    budget = max(1, int(max_chars))
+    for row in reversed(candidates):
+        content = str(row.get("content") or "[空消息]")
+        sender = str(row.get("sender_name") or row.get("user_id") or "?")
+        estimated_chars = len(content) + len(sender) + 80
+        if selected and used + estimated_chars > budget:
+            break
+        selected.append(row)
+        used += estimated_chars
+
+    limited = list(reversed(selected))
+    return limited, max(0, len(rows) - len(limited))
 
 
 def sqlite_path() -> Path:
@@ -1316,6 +1349,33 @@ def fetch_messages(group_id: str, start_ts: int, end_ts: int, limit: int = 800) 
     return [dict(r) for r in rows]
 
 
+def fetch_recent_messages_in_window(
+    group_id: str,
+    start_ts: int,
+    end_ts: int,
+    limit: int = MANUAL_MAX_MESSAGES,
+) -> list[dict[str, Any]]:
+    """取时间窗内最新的若干条消息，并按时间正序返回。"""
+    db = sqlite_path()
+    if not db.exists():
+        return []
+    with sqlite3.connect(db) as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            """
+            SELECT group_id, user_id, sender_name, content, event_time, message_id
+            FROM messages
+            WHERE group_id = ?
+              AND COALESCE(event_time, 0) >= ?
+              AND COALESCE(event_time, 0) <= ?
+            ORDER BY event_time DESC, id DESC
+            LIMIT ?
+            """,
+            (str(group_id), start_ts, end_ts, max(1, int(limit))),
+        ).fetchall()
+    return list(reversed([dict(r) for r in rows]))
+
+
 def fetch_recent_messages(group_id: str, limit: int = 80) -> list[dict[str, Any]]:
     db = sqlite_path()
     if not db.exists():
@@ -1742,7 +1802,15 @@ async def run_group_summary(
     db = sqlite_path()
     ensure_llm_tables(db)
 
-    rows = fetch_messages(group_id, start, end)
+    if job_type == "manual":
+        rows = fetch_recent_messages_in_window(
+            group_id,
+            start,
+            end,
+            limit=MANUAL_MAX_MESSAGES + 1,
+        )
+    else:
+        rows = fetch_messages(group_id, start, end)
     configured_start = start
     source = f"时间窗 {minutes} 分钟"
     context_meta: dict[str, Any] = {
@@ -1752,12 +1820,25 @@ async def run_group_summary(
     }
     if not rows and job_type == "manual":
         # 手动执行：窗口为空时回退到最近消息，避免空记录仍调模型
-        rows = fetch_recent_messages(group_id, limit=80)
+        rows = fetch_recent_messages(group_id, limit=MANUAL_MAX_MESSAGES + 1)
         if rows:
             source = f"时间窗 {minutes} 分钟无消息，已回退最近 {len(rows)} 条"
             start = int(rows[0].get("event_time") or start)
             end = int(rows[-1].get("event_time") or end)
             configured_start = start
+
+    if rows and job_type == "manual":
+        rows, dropped = limit_recent_rows(rows)
+        start = int(rows[0].get("event_time") or start)
+        end = int(rows[-1].get("event_time") or end)
+        if dropped:
+            source = (
+                f"{source}；为避免超过上下文，仅分析最近 {len(rows)} 条"
+            )
+        elif len(format_transcript(rows, max_chars=MANUAL_TRANSCRIPT_MAX_CHARS)) >= (
+            MANUAL_TRANSCRIPT_MAX_CHARS
+        ):
+            source = f"{source}；已按上下文预算裁剪"
 
     # 轻量确定性补齐：当前窗内引用 id（不扩展时间窗）
     if rows:
@@ -1783,8 +1864,15 @@ async def run_group_summary(
                     ) + added
                     context_meta.setdefault("lookback_reasons", []).append("补齐被引用消息")
 
+    if rows and job_type == "manual":
+        rows, dropped = limit_recent_rows(rows)
+        start = int(rows[0].get("event_time") or start)
+        end = int(rows[-1].get("event_time") or end)
+        if dropped:
+            source = f"{source}；引用补全后再次按预算保留最近 {len(rows)} 条"
+
     # 启发式向前接话补全（小幅），正式大规模向前补文由下方 LLM 多轮驱动
-    if rows:
+    if rows and job_type != "manual":
         rows, start, end, look_meta = extend_messages_with_context(
             group_id,
             rows,
@@ -1874,6 +1962,7 @@ async def run_group_summary(
     earlier_added_total = 0
     earlier_reasons: list[str] = []
     focus_forced_rounds = 0  # 检测到 GitHub/AI 时至少再向前补几轮
+    context_round_limit = 0 if job_type == "manual" else MAX_LLM_CONTEXT_ROUNDS
 
     def _build_meta_block() -> str:
         block = (
@@ -1883,7 +1972,7 @@ async def run_group_summary(
             f"配置时间窗: {datetime.fromtimestamp(configured_start)} ~ {datetime.fromtimestamp(configured_end)}\n"
             f"当前实际范围: {datetime.fromtimestamp(start)} ~ {datetime.fromtimestamp(end)}\n"
             f"消息数: {len(rows)}\n"
-            f"已向前补轮次: {llm_context_rounds}/{MAX_LLM_CONTEXT_ROUNDS}\n"
+            f"已向前补轮次: {llm_context_rounds}/{context_round_limit}\n"
             f"时间跨度上限: 配置窗口×{MAX_WINDOW_MULTIPLIER}（最早可到 {datetime.fromtimestamp(min_allowed_ts)}）\n"
         )
         if earlier_added_total:
@@ -1901,7 +1990,7 @@ async def run_group_summary(
     tokens = TokenUsage()
 
     # —— LLM 多轮：先判断是否完整，不完整则再向前取记录（最多 5 轮）——
-    for round_i in range(1, MAX_LLM_CONTEXT_ROUNDS + 1):
+    for round_i in range(1, context_round_limit + 1):
         transcript = format_transcript(rows)
         focus = detect_focus_topics(transcript)
         if focus["hit"] and focus_forced_rounds == 0:
@@ -2048,7 +2137,7 @@ async def run_group_summary(
                 rows,
                 provider=image_provider,
                 model=image_model_name,
-                max_images=8,
+                max_images=MANUAL_MAX_IMAGES if job_type == "manual" else 8,
             )
             img_tu = image_meta.get("token_usage")
             if isinstance(img_tu, dict):
@@ -2075,7 +2164,12 @@ async def run_group_summary(
                 r["content"] = new_c
         source = f"{source}；图片分析已关闭"
 
-    transcript = format_transcript(rows)
+    transcript = format_transcript(
+        rows,
+        max_chars=(
+            MANUAL_TRANSCRIPT_MAX_CHARS if job_type == "manual" else 24000
+        ),
+    )
     base_meta = _build_meta_block()
     if llm_context_rounds or earlier_added_total:
         base_meta += (
@@ -2100,7 +2194,11 @@ async def run_group_summary(
     )
 
     final_focus = detect_focus_topics(transcript)
-    final_max_tokens = 8192 if final_focus["hit"] or analysis_prompt.strip() else 4096
+    final_max_tokens = (
+        4096
+        if job_type == "manual"
+        else (8192 if final_focus["hit"] or analysis_prompt.strip() else 4096)
+    )
     analysis_system = (
         DEFAULT_SYSTEM
         + "\n以下为本群分析要求，正式输出时必须落实：\n"

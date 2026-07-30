@@ -530,6 +530,7 @@ async function refreshUnreadBadge() {
       r.id &&
       !read.has(r.id) &&
       !isSkippedReport(r) &&
+      !isFailedReport(r) &&
       (!enabledIds.size || enabledIds.has(r.groupId)),
   );
   unreadCount = unread.length;
@@ -3877,8 +3878,13 @@ window.addEventListener("DOMContentLoaded", async () => {
   };
   $("btn-run-llm").onclick = async () => {
     if (!currentGroupId) return;
+    const groupId = currentGroupId;
+    const button = $<HTMLButtonElement>("btn-run-llm");
+    const originalText = button.textContent || "立即 LLM 分析";
+    button.disabled = true;
+    button.textContent = "LLM 分析中…";
     try {
-      toast("正在执行 LLM 分析…");
+      toast("LLM 已在后台分析，可继续操作其他页面…");
       const result = await invoke<{
         status: string;
         riskMax?: string;
@@ -3890,7 +3896,7 @@ window.addEventListener("DOMContentLoaded", async () => {
         completionTokens?: number;
         error?: string;
       }>("api_run_llm", {
-        groupId: currentGroupId,
+        groupId,
       });
       if (result.status === "skipped") {
         toast(result.reason || "已跳过（消息不足）", true);
@@ -3908,9 +3914,14 @@ window.addEventListener("DOMContentLoaded", async () => {
           } 条${tok}${extra}`,
         );
       }
-      await openGroup(currentGroupId);
+      if (currentGroupId === groupId) {
+        await openGroup(groupId);
+      }
     } catch (e) {
       toast(String(e), true);
+    } finally {
+      button.disabled = false;
+      button.textContent = originalText;
     }
   };
 
