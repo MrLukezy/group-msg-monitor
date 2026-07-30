@@ -1,5 +1,5 @@
 <!doctype html>
-<html lang="zh-CN">
+<html lang="zh-CN" data-theme="midnight" data-theme-mode="dark" data-theme-category="achievement">
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
@@ -26,23 +26,6 @@
           <button id="win-close" class="win-btn win-close" type="button" title="关闭">✕</button>
         </div>
       </header>
-
-      <div id="compact-view" class="compact-view hidden">
-        <div class="compact-main" data-tauri-drag-region>
-          <div class="compact-brand" data-tauri-drag-region>
-            <span class="titlebar-mark" aria-hidden="true"></span>
-            <div>
-              <div class="compact-title">群消息监听 · 缩略</div>
-              <div class="compact-sub" id="compact-status">等待 LLM 分析…</div>
-            </div>
-          </div>
-          <div class="compact-actions">
-            <button id="btn-exit-compact" class="btn primary compact-expand" type="button">展开</button>
-            <button id="win-close-compact" class="win-btn win-close" type="button" title="关闭">✕</button>
-          </div>
-        </div>
-        <div id="compact-tips" class="compact-tips" aria-live="polite"></div>
-      </div>
 
       <div id="app" class="app">
       <aside class="sidebar">
@@ -80,6 +63,7 @@
             <button class="pill" data-key="onebot" type="button">OneBot</button>
             <button class="pill" data-key="monitor" type="button" title="指本机 Python 监听服务（python -m app.main）：收群消息、落库、定时 LLM">监听服务</button>
           </div>
+          <button id="btn-reconnect-all" class="reconnect-all-btn hidden" type="button">一键重连</button>
         </div>
       </aside>
 
@@ -118,7 +102,7 @@
           <header class="page-head">
             <div>
               <h2>监听群消息流</h2>
-              <p>仅展示已启用监听的群 · 约 2.5s 刷新</p>
+              <p>后台同时监听所有已启用群 · 左侧切换仅影响显示 · 约 2.5s 刷新</p>
             </div>
             <div class="row actions">
               <button id="btn-start-monitor" class="btn primary" type="button">启动监听</button>
@@ -126,8 +110,24 @@
               <button id="btn-start-napcat" class="btn" type="button">启动 NapCat</button>
             </div>
           </header>
-          <div class="panel fill">
-            <div id="live-messages" class="messages tall"></div>
+          <div class="monitored-split live-split fill">
+            <aside class="panel monitored-groups-pane">
+              <h3 class="pane-title" id="live-groups-title">监听群</h3>
+              <p class="field-hint live-groups-hint">
+                仅展示在「群列表」中勾选了「启用监听此群」的群
+              </p>
+              <div id="live-group-list" class="monitored-group-list"></div>
+            </aside>
+            <div class="panel fill live-messages-pane">
+              <div class="live-messages-head">
+                <div>
+                  <h3 class="pane-title" id="live-messages-title">实时消息</h3>
+                  <p class="field-hint" id="live-messages-hint">请选择左侧群</p>
+                </div>
+                <span class="live-status-dot" title="实时刷新"></span>
+              </div>
+              <div id="live-messages" class="messages tall"></div>
+            </div>
           </div>
         </section>
 
@@ -162,6 +162,26 @@
                     忽略定时跳过
                   </label>
                 </div>
+                <div class="report-kind-tabs" role="tablist" aria-label="LLM 记录分类">
+                  <button
+                    id="monitored-tab-success"
+                    class="report-kind-tab active"
+                    type="button"
+                    role="tab"
+                    aria-selected="true"
+                  >
+                    分析结果 <span id="monitored-success-count">0</span>
+                  </button>
+                  <button
+                    id="monitored-tab-errors"
+                    class="report-kind-tab error"
+                    type="button"
+                    role="tab"
+                    aria-selected="false"
+                  >
+                    错误记录 <span id="monitored-error-count">0</span>
+                  </button>
+                </div>
                 <div id="monitored-report-list" class="report-title-list"></div>
               </div>
             </div>
@@ -175,6 +195,7 @@
                 <p id="monitored-report-detail-meta"></p>
               </div>
               <div class="page-head-actions">
+                <button id="btn-report-issue" class="btn danger hidden" type="button">上报 Issue</button>
                 <button id="btn-favorite-report" class="btn ghost favorite-btn" type="button" title="收藏后永久保留分析与聊天记录">☆ 收藏</button>
               </div>
             </header>
@@ -213,7 +234,6 @@
                   <option value="90">近 90 天有消息</option>
                 </select>
                 <input id="groups-q" type="search" placeholder="搜索群名 / 群号" />
-                <label class="check toolbar-check"><input id="groups-show-blocked" type="checkbox" /> 显示已屏蔽</label>
                 <label class="check toolbar-check" title="监听中的群即使不满足活跃条件也保留">
                   <input id="groups-keep-enabled" type="checkbox" checked /> 始终显示监听中
                 </label>
@@ -246,10 +266,8 @@
             <div class="detail-grid fill">
               <div class="panel scroll">
                 <h3>基础配置</h3>
-                <label class="check"><input id="g-blocked" type="checkbox" /> 屏蔽此群（不落库、不处理）</label>
-                <p class="field-hint">屏蔽后不会进入消息流，也不会做关键词 / LLM。与「启用监听」互斥。</p>
                 <label class="check"><input id="g-enabled" type="checkbox" /> 启用监听此群</label>
-                <p class="field-hint">启用后才会实时落库；首次启用会自动从 OneBot 补拉最近历史。监听服务需保持运行。</p>
+                <p class="field-hint">未启用的群不会进入实时消息流、落库或执行关键词 / LLM；首次启用会自动从 OneBot 补拉最近历史。监听服务需保持运行。</p>
                 <label class="check"><input id="g-log-all" type="checkbox" /> 记录全部消息</label>
                 <label class="check"><input id="g-storage" type="checkbox" /> SQLite 落库</label>
                 <label>
@@ -271,23 +289,31 @@
 
                 <h3>LLM 检测</h3>
                 <label class="check"><input id="g-llm-enabled" type="checkbox" /> 启用定时 LLM 分析</label>
-                <label>
-                  执行间隔（分钟）
-                  <input id="g-llm-every" type="number" min="1" step="1" />
-                  <span class="field-hint">需保持「启动监听」运行；定时任务由监听进程调度。</span>
+                <label class="check">
+                  <input id="g-llm-use-global" type="checkbox" checked /> 使用全局默认配置
                 </label>
-                <label>
-                  分析窗口（分钟）
-                  <input id="g-llm-window" type="number" min="1" step="1" />
-                  <span class="field-hint">只分析「最近 N 分钟」内消息。</span>
-                </label>
-                <label>
-                  最少消息数（少于此则跳过定时任务）
-                  <input id="g-llm-min" type="number" min="1" step="1" />
-                  <span class="field-hint">短窗口请设为 1；设太大可能导致定时一直跳过。</span>
-                </label>
+                <p id="g-llm-global-hint" class="field-hint">默认继承「总配置 → 语言模型 → 默认配置」中的调度参数、代理、模型和提示词；取消勾选后可配置本群参数。</p>
 
-                <div class="llm-subpanel">
+                <div id="g-llm-custom-config" class="hidden">
+                  <div class="llm-subpanel">
+                    <h4 class="llm-subpanel-heading">本群调度参数</h4>
+                    <label>
+                      执行间隔（分钟）
+                      <input id="g-llm-every" type="number" min="1" step="1" />
+                      <span class="field-hint">需保持「启动监听」运行；定时任务由监听进程调度。</span>
+                    </label>
+                    <label>
+                      分析窗口（分钟）
+                      <input id="g-llm-window" type="number" min="1" step="1" />
+                      <span class="field-hint">只分析「最近 N 分钟」内消息。</span>
+                    </label>
+                    <label>
+                      最少消息数（少于此则跳过定时任务）
+                      <input id="g-llm-min" type="number" min="1" step="1" />
+                      <span class="field-hint">短窗口请设为 1；设太大可能导致定时一直跳过。</span>
+                    </label>
+                  </div>
+                  <div class="llm-subpanel">
                   <label class="check llm-subpanel-title">
                     <input id="g-llm-text-enabled" type="checkbox" checked /> 文本分析
                   </label>
@@ -311,9 +337,9 @@
                       <p class="field-hint">保存后下次分析即生效。会参与多轮前文审查与最终报告；内置也会对 GitHub/AI 名词强制深挖并扩充 deep_dives。</p>
                     </label>
                   </div>
-                </div>
+                  </div>
 
-                <div class="llm-subpanel">
+                  <div class="llm-subpanel">
                   <label class="check llm-subpanel-title">
                     <input id="g-llm-image-enabled" type="checkbox" checked /> 图片分析
                   </label>
@@ -337,6 +363,7 @@
                         </div>
                       </label>
                     </div>
+                  </div>
                   </div>
                 </div>
               </div>
@@ -379,18 +406,23 @@
               <div class="channel-card" data-channel="qq">
                 <div class="channel-card-head">
                   <div>
-                    <h3 class="channel-title">QQ（NapCat / OneBot）</h3>
+                    <h3 class="channel-title">QQ</h3>
                     <p class="channel-status" id="ch-qq-status">未绑定</p>
                   </div>
                   <span class="channel-badge" id="ch-qq-badge">未绑定</span>
                 </div>
-                <div class="setting-item">
-                  <label>OneBot WS 地址</label>
-                  <input id="s-ws" placeholder="ws://127.0.0.1:3001" />
-                </div>
-                <div class="setting-item">
-                  <label>Access Token</label>
-                  <input id="s-token" type="password" placeholder="与 NapCat 一致" />
+                <p class="settings-desc" id="qq-mode-hint">
+                  当前仅支持 NapCat / OneBot 完整监听。
+                </p>
+                <div id="qq-onebot-fields">
+                  <div class="setting-item">
+                    <label>OneBot WS 地址</label>
+                    <input id="s-ws" placeholder="ws://127.0.0.1:3001" />
+                  </div>
+                  <div class="setting-item">
+                    <label>Access Token</label>
+                    <input id="s-token" type="password" placeholder="与 NapCat 一致" />
+                  </div>
                 </div>
                 <div class="channel-actions">
                   <button id="btn-bind-qq" class="btn primary" type="button">绑定 QQ</button>
@@ -438,7 +470,8 @@
                 <div id="wechat-bind-result" class="test-result" hidden></div>
               </div>
 
-              <div class="channel-card" data-channel="telegram">
+              <!-- Telegram 暂不支持：保留配置 DOM，功能开关恢复后可直接重新启用。 -->
+              <div class="channel-card" data-channel="telegram" hidden>
                 <div class="channel-card-head">
                   <div>
                     <h3 class="channel-title">Telegram（用户扫码）</h3>
@@ -512,14 +545,47 @@
                 </div>
               </div>
 
-              <div class="setting-item">
-                <label>默认模型</label>
-                <p class="settings-desc">点击刷新拉取当前活跃代理的模型列表，再下拉选择。</p>
-                <div class="model-setting-row">
-                  <select id="s-default-model">
-                    <option value="">先点右侧刷新获取模型</option>
+              <div class="llm-subpanel">
+                <h3>默认配置</h3>
+                <p class="settings-desc">勾选“使用全局默认配置”的群会继承以下调度参数、代理、模型和提示词。</p>
+                <div class="setting-item">
+                  <label>默认执行间隔（分钟）</label>
+                  <input id="s-global-every" type="number" min="1" step="1" />
+                </div>
+                <div class="setting-item">
+                  <label>默认分析窗口（分钟）</label>
+                  <input id="s-global-window" type="number" min="1" step="1" />
+                </div>
+                <div class="setting-item">
+                  <label>默认最少消息数</label>
+                  <input id="s-global-min" type="number" min="1" step="1" />
+                  <p class="settings-desc">定时分析少于此消息数时跳过；短窗口建议设置为 1。</p>
+                </div>
+                <div class="setting-item">
+                  <label>默认代理</label>
+                  <select id="s-global-provider"></select>
+                  <p class="settings-desc">请在已添加的代理中明确选择一个作为群分析默认代理。</p>
+                </div>
+                <div class="setting-item">
+                  <label>默认文本模型</label>
+                  <div class="model-setting-row">
+                    <select id="s-default-model">
+                      <option value="">先点右侧刷新获取模型</option>
+                    </select>
+                    <button id="btn-refresh-models" class="refresh-models-btn" type="button" title="从 API 拉取模型">⟳</button>
+                  </div>
+                </div>
+                <div class="setting-item">
+                  <label>默认图片模型</label>
+                  <select id="s-default-image-model">
+                    <option value="">未选择时复用默认文本模型</option>
                   </select>
-                  <button id="btn-refresh-models" class="refresh-models-btn" type="button" title="从 API 拉取模型">⟳</button>
+                  <p class="settings-desc">图片模型使用同一个默认代理；未选择时复用文本模型。</p>
+                </div>
+                <div class="setting-item">
+                  <label>默认分析提示词</label>
+                  <textarea id="s-global-prompt" rows="7" placeholder="填写所有默认群共用的分析要求"></textarea>
+                  <p class="settings-desc">会用于多轮上下文审查和最终 LLM 分析。</p>
                 </div>
               </div>
               <div class="setting-item">
@@ -545,11 +611,6 @@
 
             <div id="stab-appearance" class="settings-body hidden">
               <div class="setting-item">
-                <label>缩略模式</label>
-                <p class="settings-desc">开启后，点标题栏「缩小」会进入置顶缩略窗；LLM 分析完成后以气泡提示。</p>
-                <label class="check"><input id="s-compact-mode" type="checkbox" /> 启用缩略模式</label>
-              </div>
-              <div class="setting-item">
                 <label>皮肤配色</label>
                 <p class="settings-desc">选择一套配色方案，立即预览，保存后持久生效。</p>
                 <div id="theme-picker" class="theme-picker"></div>
@@ -560,7 +621,27 @@
       </main>
       </div>
     </div>
-    <div id="tip-stack" class="tip-stack" aria-live="polite"></div>
+    <div id="issue-report-modal" class="issue-report-modal hidden" role="dialog" aria-modal="true" aria-labelledby="issue-report-title">
+      <div class="issue-report-backdrop" data-issue-report-close></div>
+      <section class="issue-report-card">
+        <header class="issue-report-head">
+          <div>
+            <h3 id="issue-report-title">上报 GitHub Issue</h3>
+            <p id="issue-report-repo">正在读取当前仓库…</p>
+          </div>
+          <button id="btn-close-issue-report" class="icon-btn" type="button" aria-label="关闭">✕</button>
+        </header>
+        <div class="issue-report-body">
+          <p class="field-hint">以下内容已脱敏，不包含群聊原文、用户消息或访问凭据。确认后将发送到当前 GitHub 仓库。</p>
+          <label>Issue 标题<input id="issue-report-preview-title" readonly /></label>
+          <label>Issue 正文<textarea id="issue-report-preview-body" rows="18" readonly></textarea></label>
+        </div>
+        <footer class="issue-report-actions">
+          <button id="btn-cancel-issue-report" class="btn ghost" type="button">取消</button>
+          <button id="btn-confirm-issue-report" class="btn danger" type="button">确认创建 Issue</button>
+        </footer>
+      </section>
+    </div>
     <div id="image-lightbox" class="image-lightbox hidden" hidden>
       <div class="image-lightbox-backdrop" data-lightbox-close="1"></div>
       <div class="image-lightbox-panel" role="dialog" aria-modal="true" aria-label="图片预览">

@@ -10,6 +10,11 @@ type StatusInfo = {
   napcatWebuiUp: boolean;
   onebotWsUp: boolean;
   monitorRunning: boolean;
+  qqMode?: string;
+  officialQqRunning?: boolean;
+  napcatProcessRunning?: boolean;
+  notificationAccess?: string;
+  uiaReady?: boolean;
 };
 
 type GroupItem = {
@@ -17,9 +22,9 @@ type GroupItem = {
   groupName: string;
   channel?: string;
   enabled: boolean;
-  blocked?: boolean;
   lastTime?: number | null;
   msgCount: number;
+  activityCount?: number;
   keywordEnabled: boolean;
   llmEnabled: boolean;
   memberCount?: number | null;
@@ -35,6 +40,7 @@ type MessageRow = {
   content: string;
   eventTime?: number | null;
   createdAt: string;
+  liveCursor?: number | null;
 };
 
 type LlmProvider = {
@@ -47,8 +53,18 @@ type LlmProvider = {
 };
 
 const WECHAT_CHANNEL_ENABLED = false;
+const TELEGRAM_CHANNEL_ENABLED = false;
 
-type ChannelBindQQ = { bound: boolean; label?: string; lastError?: string };
+type ChannelBindQQ = {
+  bound: boolean;
+  label?: string;
+  lastError?: string;
+  mode?: "onebot" | "passive" | string;
+  notificationAccess?: string;
+  uiaReady?: boolean;
+  pollSeconds?: number;
+  groupNameMap?: Record<string, string>;
+};
 type ChannelBindWechat = {
   bound: boolean;
   label?: string;
@@ -79,10 +95,14 @@ type AppSettings = {
   llm: {
     providers: LlmProvider[];
     activeProviderId: string;
+    defaultImageModel?: string;
+    defaultPrompt?: string;
+    defaultEveryMinutes?: number;
+    defaultWindowMinutes?: number;
+    defaultMinMessages?: number;
     reportKeepLimit?: number;
   };
   ui?: {
-    compactModeEnabled?: boolean;
     theme?: string;
   };
 };
@@ -92,7 +112,6 @@ type GroupConfig = {
   groupName: string;
   channel?: string;
   enabled: boolean;
-  blocked?: boolean;
   basic: { logAll: boolean; storageEnabled: boolean };
   keywordMonitor: {
     enabled: boolean;
@@ -102,6 +121,7 @@ type GroupConfig = {
   };
   llmMonitor: {
     enabled: boolean;
+    useGlobalDefaults?: boolean;
     textEnabled?: boolean;
     providerId: string;
     model: string;
@@ -118,6 +138,7 @@ type GroupConfig = {
 
 type ReportRow = {
   id: number;
+  jobId?: number | null;
   groupId: string;
   headline?: string | null;
   riskMax?: string | null;
@@ -139,6 +160,15 @@ type ReportRow = {
   lookbackReasons?: string[];
   source?: string;
   skipped?: boolean;
+  failed?: boolean;
+  error?: {
+    stage?: string;
+    type?: string;
+    summary?: string;
+    detail?: string;
+    log_excerpt?: string;
+  };
+  githubIssueUrl?: string;
   promptTokens?: number;
   completionTokens?: number;
   totalTokens?: number;
@@ -200,22 +230,61 @@ const PROVIDER_PRESETS: Record<
 const THEMES: {
   id: string;
   name: string;
+  tagline: string;
+  mode: "dark" | "light";
+  atmosphere?: string;
   swatches: [string, string, string];
 }[] = [
-  { id: "midnight", name: "午夜青金", swatches: ["#080b12", "#2dd4bf", "#f0b429"] },
-  { id: "daylight", name: "日光纸感", swatches: ["#f4f1ea", "#c45c26", "#2a6f6a"] },
-  { id: "ocean", name: "深海青蓝", swatches: ["#07151f", "#38bdf8", "#22d3ee"] },
-  { id: "forest", name: "林间翠绿", swatches: ["#0c1410", "#4ade80", "#86efac"] },
-  { id: "rose", name: "蔷薇暗粉", swatches: ["#160b12", "#f472b6", "#fb7185"] },
-  { id: "graphite", name: "石墨灰阶", swatches: ["#121212", "#e5e5e5", "#a3a3a3"] },
+  {
+    id: "midnight",
+    name: "星渚",
+    tagline: "星沉沧海，灯火孤洲",
+    mode: "dark",
+    atmosphere: "/theme-atmospheres/midnight.webp",
+    swatches: ["#0a0d12", "#d4a574", "#6b9e9a"],
+  },
+  {
+    id: "daylight",
+    name: "素笺",
+    tagline: "素纸落墨，清光入卷",
+    mode: "light",
+    atmosphere: "/theme-atmospheres/dawn.webp",
+    swatches: ["#f6f3ec", "#5a7a72", "#b08958"],
+  },
+  {
+    id: "ocean",
+    name: "秩序工坊",
+    tagline: "旧线拆解，结构重新归位",
+    mode: "dark",
+    atmosphere: "/theme-atmospheres/refactor.webp",
+    swatches: ["#081015", "#63a5a0", "#728fa8"],
+  },
+  {
+    id: "forest",
+    name: "竹影",
+    tagline: "翠叶筛光，静影沉璧",
+    mode: "light",
+    swatches: ["#f0f5ef", "#5a8a68", "#8aaa7a"],
+  },
+  {
+    id: "rose",
+    name: "杏雨",
+    tagline: "细雨湿春，杏花微照",
+    mode: "light",
+    swatches: ["#f8f1ec", "#c4886a", "#8a9e8a"],
+  },
+  {
+    id: "graphite",
+    name: "无限月读",
+    tagline: "虚空生白，万象皆寂",
+    mode: "dark",
+    atmosphere: "/theme-atmospheres/void.webp",
+    swatches: ["#040408", "#9a7ac8", "#6a98c4"],
+  },
 ];
 
 const READ_IDS_KEY = "gmm_read_report_ids";
-const LAST_TIP_ID_KEY = "gmm_last_tip_report_id";
 const HIDE_SKIPPED_KEY = "gmm_hide_skipped_reports";
-const NORMAL_SIZE = { width: 1280, height: 820 };
-const COMPACT_SIZE = { width: 420, height: 168 };
-
 const $ = <T extends HTMLElement>(id: string) => document.getElementById(id) as T;
 
 let currentGroupId: string | null = null;
@@ -229,13 +298,18 @@ let reduceMotion = false;
 let groupNameMap = new Map<string, string>();
 let groupsCache: GroupItem[] = [];
 let liveScrollQuietUntil = 0;
-let tickInFlight = false;
-let statusTick = 0;
+let liveSelectedGroupId: string | null = null;
+let liveGroupsRefreshAt = 0;
+const liveMessageCache = new Map<string, MessageRow[]>();
+const liveMessageCursors = new Map<string, number>();
+let liveRenderFrame = 0;
+let liveActivityInitialized = false;
+const liveActivityWatermarks = new Map<string, number>();
+const liveUnreadGroups = new Set<string>();
 let monitoredSelectedGroupId: string | null = null;
 let monitoredReportsCache: ReportRow[] = [];
-let isCompactView = false;
+let monitoredReportTab: "success" | "errors" = "success";
 let selectedTheme = "midnight";
-let lastTipReportId = Number(localStorage.getItem(LAST_TIP_ID_KEY) || "0");
 let unreadCount = 0;
 let unreadByGroup = new Map<string, number>();
 let unreadReportIds = new Set<number>();
@@ -325,7 +399,7 @@ async function clearAllUnread() {
     limit: 200,
   }).catch(() => [] as ReportRow[]);
   const enabledIds = new Set(
-    groupsCache.filter((g) => g.enabled && !g.blocked).map((g) => g.groupId),
+    groupsCache.filter((g) => g.enabled).map((g) => g.groupId),
   );
   const ids = loadReadIds();
   let added = 0;
@@ -347,6 +421,12 @@ function isSkippedReport(r: ReportRow): boolean {
   if (r.skipped) return true;
   const h = r.headline || "";
   return h.includes("[定时跳过]") || h.includes("[跳过]");
+}
+
+function isFailedReport(r: ReportRow): boolean {
+  // list-reports 会为正常报告返回 error: {}；空对象在 JS 中也是真值，
+  // 不能据此判断失败。失败以服务端明确标记为准，标题判断仅兼容旧记录。
+  return r.failed === true || (r.headline || "").includes("[分析失败]");
 }
 
 function hideSkippedReportsEnabled(): boolean {
@@ -372,11 +452,36 @@ function visibleReports(reports: ReportRow[]): ReportRow[] {
   return reports.filter((r) => !isSkippedReport(r));
 }
 
+function syncMonitoredReportTabs(reports: ReportRow[]) {
+  const visible = visibleReports(reports);
+  const successCount = visible.filter((r) => !isFailedReport(r)).length;
+  const errorCount = reports.filter(isFailedReport).length;
+  $("monitored-success-count").textContent = String(successCount);
+  $("monitored-error-count").textContent = String(errorCount);
+
+  const successTab = $<HTMLButtonElement>("monitored-tab-success");
+  const errorTab = $<HTMLButtonElement>("monitored-tab-errors");
+  const showingErrors = monitoredReportTab === "errors";
+  successTab.classList.toggle("active", !showingErrors);
+  errorTab.classList.toggle("active", showingErrors);
+  successTab.setAttribute("aria-selected", String(!showingErrors));
+  errorTab.setAttribute("aria-selected", String(showingErrors));
+
+  document
+    .querySelector<HTMLElement>(".monitored-reports-head .toolbar-check")
+    ?.classList.toggle("hidden", showingErrors);
+}
+
 function applyTheme(themeId: string) {
-  const id = THEMES.some((t) => t.id === themeId) ? themeId : "midnight";
-  selectedTheme = id;
-  document.body.setAttribute("data-theme", id);
-  document.documentElement.setAttribute("data-theme", id);
+  const theme = THEMES.find((t) => t.id === themeId) || THEMES[0];
+  selectedTheme = theme.id;
+  document.body.setAttribute("data-theme", theme.id);
+  document.documentElement.setAttribute("data-theme", theme.id);
+  document.documentElement.setAttribute("data-theme-mode", theme.mode);
+  document.documentElement.setAttribute(
+    "data-theme-category",
+    theme.atmosphere ? "achievement" : "palette",
+  );
   renderThemePicker();
 }
 
@@ -386,67 +491,20 @@ function renderThemePicker() {
   box.innerHTML = THEMES.map((t) => {
     const active = t.id === selectedTheme ? "active" : "";
     return `<button class="theme-card ${active}" type="button" data-theme-id="${t.id}">
-      <div class="theme-swatches">
+      <div class="theme-swatches ${t.atmosphere ? "has-wall" : ""}" ${
+        t.atmosphere ? `style="background-image:url(${t.atmosphere})"` : ""
+      }>
         <span style="background:${t.swatches[0]}"></span>
         <span style="background:${t.swatches[1]}"></span>
         <span style="background:${t.swatches[2]}"></span>
       </div>
       <div class="theme-card-name">${escapeHtml(t.name)}</div>
+      <div class="theme-card-tagline">${escapeHtml(t.tagline)}</div>
     </button>`;
   }).join("");
   box.querySelectorAll<HTMLButtonElement>(".theme-card").forEach((btn) => {
     btn.onclick = () => applyTheme(btn.dataset.themeId || "midnight");
   });
-}
-
-function compactModeEnabled(): boolean {
-  return !!settingsCache?.ui?.compactModeEnabled || $<HTMLInputElement>("s-compact-mode")?.checked;
-}
-
-function pushTipBubble(title: string, meta: string, target: "stack" | "compact" = "stack") {
-  const host =
-    target === "compact" ? $("compact-tips") : ($("tip-stack") as HTMLElement);
-  if (!host) return;
-  const el = document.createElement("div");
-  el.className = "tip-bubble";
-  el.innerHTML = `<div class="tip-title">${escapeHtml(title)}</div><div class="tip-meta">${escapeHtml(meta)}</div>`;
-  host.prepend(el);
-  while (host.children.length > 5) host.lastElementChild?.remove();
-  window.setTimeout(() => el.remove(), 12000);
-}
-
-async function enterCompactView() {
-  if (isCompactView) return;
-  isCompactView = true;
-  document.body.classList.add("is-compact");
-  $("compact-view").classList.remove("hidden");
-  $("compact-status").textContent = unreadCount
-    ? `未读 LLM 总结 ${unreadCount} 条`
-    : "缩略模式 · 等待新的 LLM 分析";
-  try {
-    const win = getCurrentWindow();
-    await win.setAlwaysOnTop(true);
-    await win.setMinSize(new LogicalSize(360, 120));
-    await win.setSize(new LogicalSize(COMPACT_SIZE.width, COMPACT_SIZE.height));
-  } catch {
-    /* browser preview */
-  }
-}
-
-async function exitCompactView() {
-  if (!isCompactView) return;
-  isCompactView = false;
-  document.body.classList.remove("is-compact");
-  $("compact-view").classList.add("hidden");
-  try {
-    const win = getCurrentWindow();
-    await win.setAlwaysOnTop(false);
-    await win.setMinSize(new LogicalSize(960, 680));
-    await win.setSize(new LogicalSize(NORMAL_SIZE.width, NORMAL_SIZE.height));
-    await win.center();
-  } catch {
-    /* ignore */
-  }
 }
 
 async function refreshUnreadBadge() {
@@ -456,7 +514,7 @@ async function refreshUnreadBadge() {
     limit: 200,
   }).catch(() => [] as ReportRow[]);
   const enabledIds = new Set(
-    groupsCache.filter((g) => g.enabled && !g.blocked).map((g) => g.groupId),
+    groupsCache.filter((g) => g.enabled).map((g) => g.groupId),
   );
   const unread = (reports || []).filter(
     (r) =>
@@ -489,11 +547,6 @@ async function refreshUnreadBadge() {
   }
   if (clearBtn) {
     clearBtn.hidden = unreadCount <= 0;
-  }
-  if (isCompactView) {
-    $("compact-status").textContent = unreadCount
-      ? `未读 LLM 总结 ${unreadCount} 条`
-      : "缩略模式 · 等待新的 LLM 分析";
   }
   updateMonitoredGroupUnreadBadges();
   updateReportTitleUnreadBadges();
@@ -563,27 +616,7 @@ function updateMonitoredGroupUnreadBadges() {
 }
 
 async function pollLlmTipsAndUnread() {
-  const unread = (await refreshUnreadBadge()) || [];
-  if (!unread.length) return;
-  const newest = unread[0];
-  if (!newest?.id || newest.id <= lastTipReportId) return;
-  // 初始化：只记录水位，不刷历史 tips
-  if (lastTipReportId <= 0) {
-    lastTipReportId = newest.id;
-    localStorage.setItem(LAST_TIP_ID_KEY, String(lastTipReportId));
-    return;
-  }
-  const fresh = unread.filter((r) => r.id > lastTipReportId).reverse();
-  lastTipReportId = newest.id;
-  localStorage.setItem(LAST_TIP_ID_KEY, String(lastTipReportId));
-  for (const r of fresh.slice(-3)) {
-    const gname = groupDisplayName(r.groupId);
-    const title = r.headline || "新的 LLM 分析";
-    const meta = `${gname} · ${r.createdAt || ""}`;
-    if (isCompactView) {
-      pushTipBubble(title, meta, "compact");
-    }
-  }
+  await refreshUnreadBadge();
 }
 
 function setPill(key: string, on: boolean, label: string) {
@@ -605,6 +638,153 @@ function setPill(key: string, on: boolean, label: string) {
   el.classList.toggle("on", on);
   el.classList.toggle("off", !on);
   el.textContent = next;
+}
+
+let lastStatus: StatusInfo | null = null;
+let reconnectAllInFlight = false;
+let reconnectAllStep = "";
+
+function currentQqMode(settings?: AppSettings | null): "onebot" | "passive" {
+  void settings;
+  return "onebot";
+}
+
+function syncQqModeFields(settings?: AppSettings | null) {
+  const mode = currentQqMode(settings);
+  const select = document.getElementById("s-qq-mode") as HTMLSelectElement | null;
+  if (select && select.value !== mode) select.value = mode;
+  const onebotFields = document.getElementById("qq-onebot-fields");
+  const passiveFields = document.getElementById("qq-passive-fields");
+  const hint = document.getElementById("qq-mode-hint");
+  const btnTest = document.getElementById("btn-test-onebot") as HTMLButtonElement | null;
+  const btnPull = document.getElementById("btn-pull-onebot-groups") as HTMLButtonElement | null;
+  const btnDetect = document.getElementById("btn-detect-qq-passive") as HTMLButtonElement | null;
+  const passive = mode === "passive";
+  onebotFields?.classList.toggle("hidden", passive);
+  passiveFields?.classList.toggle("hidden", !passive);
+  btnTest?.classList.toggle("hidden", passive);
+  btnPull?.classList.toggle("hidden", passive);
+  btnDetect?.classList.toggle("hidden", !passive);
+  if (hint) {
+    hint.textContent = passive
+      ? "被动模式：主号只跑官方 QQ。用系统通知采集后台消息，用当前聊天窗口补采；静音群/历史/原图可能缺失。"
+      : "当前仅支持 NapCat / OneBot 完整监听。";
+  }
+  const qq = (settings || settingsCache)?.channels?.qq;
+  const poll = document.getElementById("s-qq-poll") as HTMLInputElement | null;
+  if (poll && qq?.pollSeconds) poll.value = String(qq.pollSeconds);
+  const passiveStatus = document.getElementById("qq-passive-status");
+  if (passiveStatus && passive) {
+    const access = qq?.notificationAccess || "unknown";
+    const mapCount = Object.keys(qq?.groupNameMap || {}).length;
+    passiveStatus.textContent =
+      `通知权限: ${access} · UIA: ${qq?.uiaReady ? "可用" : "待探测"} · 已映射群名 ${mapCount} 个。` +
+      " 静音群/关闭通知/未打开历史可能漏消息；请勿同时运行 NapCat。";
+  }
+}
+
+function napcatOnline(status: StatusInfo): boolean {
+  return status.napcatInstalled && (status.napcatWebuiUp || status.onebotWsUp);
+}
+
+function syncReconnectAllButton(status?: StatusInfo | null, step = "") {
+  const btn = document.getElementById("btn-reconnect-all") as HTMLButtonElement | null;
+  if (!btn) return;
+  const current = status || lastStatus;
+  const mode = current?.qqMode || currentQqMode();
+  const needsRepair =
+    !!current &&
+    (mode === "passive"
+      ? !current.officialQqRunning || !current.monitorRunning || !!current.napcatProcessRunning
+      : !napcatOnline(current) || !current.onebotWsUp || !current.monitorRunning);
+  if (step) reconnectAllStep = step;
+  btn.classList.toggle("hidden", !reconnectAllInFlight && !needsRepair);
+  btn.disabled = reconnectAllInFlight;
+  btn.textContent = reconnectAllInFlight ? step || reconnectAllStep || "正在重连…" : "一键重连";
+}
+
+async function waitForStatus(
+  predicate: (status: StatusInfo) => boolean,
+  timeoutMs: number,
+  step: string,
+): Promise<StatusInfo> {
+  const deadline = Date.now() + timeoutMs;
+  let status = await refreshStatus();
+  while (!predicate(status) && Date.now() < deadline) {
+    syncReconnectAllButton(status, step);
+    await new Promise((resolve) => window.setTimeout(resolve, 1200));
+    status = await refreshStatus();
+  }
+  if (!predicate(status)) throw new Error(`${step}超时，请检查登录授权或端口占用`);
+  return status;
+}
+
+async function reconnectAll() {
+  if (reconnectAllInFlight) return;
+  reconnectAllInFlight = true;
+  syncReconnectAllButton(lastStatus, "正在检测…");
+  try {
+    let status = await refreshStatus();
+    const mode = status.qqMode || currentQqMode();
+
+    if (mode === "passive") {
+      if (status.napcatProcessRunning) {
+        throw new Error("被动模式下检测到 NapCat 仍在运行，请先关闭 NapCat 再重连官方 QQ");
+      }
+      if (!status.officialQqRunning) {
+        syncReconnectAllButton(status, "1/2 打开官方 QQ…");
+        await invoke<string>("show_qq_window");
+        status = await waitForStatus((s) => !!s.officialQqRunning, 60_000, "1/2 等待官方 QQ…");
+      }
+      if (!status.monitorRunning) {
+        syncReconnectAllButton(status, "2/2 启动监听…");
+        try {
+          await invoke<string>("start_monitor");
+        } catch (e) {
+          status = await refreshStatus();
+          if (!status.monitorRunning) throw e;
+        }
+        status = await waitForStatus((s) => s.monitorRunning, 15_000, "2/2 等待监听服务…");
+      }
+      toast("重连完成：官方 QQ 与被动监听服务已在线");
+    } else {
+      if (!napcatOnline(status) || !status.onebotWsUp) {
+        syncReconnectAllButton(status, "1/3 启动 NapCat…");
+        try {
+          await invoke<string>("start_napcat");
+        } catch (e) {
+          status = await refreshStatus();
+          if (!napcatOnline(status)) throw e;
+        }
+        status = await refreshStatus();
+        if (!status.onebotWsUp) {
+          openNapcatLogin();
+          toast("NapCat 已启动，请完成 QQ 扫码授权，随后会自动继续重连");
+        }
+        status = await waitForStatus((s) => s.onebotWsUp, 120_000, "2/3 等待 OneBot…");
+      }
+
+      if (!status.monitorRunning) {
+        syncReconnectAllButton(status, "3/3 启动监听…");
+        try {
+          await invoke<string>("start_monitor");
+        } catch (e) {
+          status = await refreshStatus();
+          if (!status.monitorRunning) throw e;
+        }
+        status = await waitForStatus((s) => s.monitorRunning, 15_000, "3/3 等待监听服务…");
+      }
+
+      toast("重连完成：NapCat、OneBot、监听服务均已在线");
+    }
+    await refreshStatus();
+  } catch (e) {
+    toast(`一键重连失败：${e}`, true);
+  } finally {
+    reconnectAllInFlight = false;
+    reconnectAllStep = "";
+    syncReconnectAllButton(lastStatus);
+  }
 }
 
 type NapcatLoginStatus = {
@@ -693,9 +873,19 @@ function openNapcatLogin() {
 async function repairStatus(key: string) {
   const el = document.querySelector(`.pill[data-key="${key}"]`) as HTMLButtonElement | null;
   if (!el) return;
-  const label = key === "monitor" ? "监听服务" : key === "onebot" ? "OneBot" : "NapCat";
+  const passive = currentQqMode() === "passive";
+  const label =
+    key === "monitor"
+      ? "监听服务"
+      : key === "onebot"
+        ? passive
+          ? "官方QQ"
+          : "OneBot"
+        : passive
+          ? "无NapCat"
+          : "NapCat";
   if (el.dataset.online === "true") {
-    toast(`${label} 当前在线，无需重连`);
+    toast(`${label} 当前正常，无需重连`);
     return;
   }
   if (el.dataset.repairing === "true") return;
@@ -703,10 +893,26 @@ async function repairStatus(key: string) {
   el.dataset.repairing = "true";
   setPill(key, false, label);
   try {
-    const command = key === "monitor" ? "start_monitor" : "start_napcat";
-    const message = await invoke<string>(command);
-    toast(`${message}，正在等待 ${label} 恢复连接…`);
-    if (key !== "monitor") openNapcatLogin();
+    if (passive) {
+      if (key === "napcat") {
+        toast("被动模式下不应启动 NapCat；请关闭 NapCat 后使用官方 QQ", true);
+        el.dataset.repairing = "false";
+        await refreshStatus();
+        return;
+      }
+      if (key === "onebot") {
+        const message = await invoke<string>("show_qq_window");
+        toast(`${message}，正在等待官方 QQ…`);
+      } else {
+        const message = await invoke<string>("start_monitor");
+        toast(`${message}，正在等待监听服务…`);
+      }
+    } else {
+      const command = key === "monitor" ? "start_monitor" : "start_napcat";
+      const message = await invoke<string>(command);
+      toast(`${message}，正在等待 ${label} 恢复连接…`);
+      if (key !== "monitor") openNapcatLogin();
+    }
   } catch (e) {
     el.dataset.repairing = "false";
     setPill(key, false, label);
@@ -786,6 +992,8 @@ function renderChannelBindings(settings?: AppSettings | null) {
 
   const wxCard = document.querySelector<HTMLElement>('.channel-card[data-channel="wechat"]');
   if (wxCard) wxCard.hidden = !WECHAT_CHANNEL_ENABLED;
+  const tgCard = document.querySelector<HTMLElement>('.channel-card[data-channel="telegram"]');
+  if (tgCard) tgCard.hidden = !TELEGRAM_CHANNEL_ENABLED;
 
   const setBadge = (id: string, bound: boolean) => {
     const el = document.getElementById(id);
@@ -803,14 +1011,15 @@ function renderChannelBindings(settings?: AppSettings | null) {
       badge.classList.remove("on");
     }
   }
-  setBadge("ch-tg-badge", !!tg?.bound);
+  setBadge("ch-tg-badge", TELEGRAM_CHANNEL_ENABLED && !!tg?.bound);
 
   const qqStatus = document.getElementById("ch-qq-status");
   if (qqStatus) {
     qqStatus.textContent = qq?.bound
-      ? `已绑定${qq.label ? ` · ${qq.label}` : ""}`
-      : "未绑定 · 需 NapCat OneBot WS";
+      ? `已绑定 · OneBot${qq.label ? ` · ${qq.label}` : ""}${qq.lastError ? ` · ${qq.lastError}` : ""}`
+      : "未绑定 · 当前仅支持 NapCat / OneBot";
   }
+  syncQqModeFields(s);
   const wxStatus = document.getElementById("ch-wx-status");
   if (wxStatus) {
     if (!WECHAT_CHANNEL_ENABLED) {
@@ -825,17 +1034,26 @@ function renderChannelBindings(settings?: AppSettings | null) {
   }
   const tgStatus = document.getElementById("ch-tg-status");
   if (tgStatus) {
-    tgStatus.textContent = tg?.bound
+    tgStatus.textContent = TELEGRAM_CHANNEL_ENABLED && tg?.bound
       ? `已绑定${tg.label ? ` · ${tg.label}` : ""} · 用户账号`
-      : "未绑定 · 扫码登录个人号（非 Bot）";
+      : "暂不支持";
   }
 }
 
-async function refreshStatus() {
+async function refreshStatus(): Promise<StatusInfo> {
   const s = await invoke<StatusInfo>("get_status");
-  setPill("napcat", s.napcatInstalled && (s.napcatWebuiUp || s.onebotWsUp), "NapCat");
-  setPill("onebot", s.onebotWsUp, "OneBot");
+  lastStatus = s;
+  const passive = (s.qqMode || currentQqMode()) === "passive";
+  if (passive) {
+    setPill("napcat", !s.napcatProcessRunning, s.napcatProcessRunning ? "NapCat占用" : "无NapCat");
+    setPill("onebot", !!s.officialQqRunning, s.officialQqRunning ? "官方QQ" : "官方QQ");
+  } else {
+    setPill("napcat", s.napcatInstalled && (s.napcatWebuiUp || s.onebotWsUp), "NapCat");
+    setPill("onebot", s.onebotWsUp, "OneBot");
+  }
   setPill("monitor", s.monitorRunning, "监听服务");
+  syncReconnectAllButton(s);
+  return s;
 }
 
 function messageArticleHtml(
@@ -891,10 +1109,11 @@ function renderMessages(
     const newIds = rows.map((r) => String(r.id));
     const oldHead = prevIds[0];
     const cut = oldHead ? newIds.indexOf(oldHead) : -1;
+    const retained = cut > 0 ? newIds.length - cut : 0;
     if (
       cut > 0 &&
-      newIds.length >= prevIds.length &&
-      newIds.slice(cut).join(",") === prevIds.join(",")
+      retained > 0 &&
+      newIds.slice(cut).join(",") === prevIds.slice(0, retained).join(",")
     ) {
       const atTop = box.scrollTop < 48;
       const prevHeight = box.scrollHeight;
@@ -921,16 +1140,212 @@ function renderMessages(
   box.scrollTop = scrollTop;
 }
 
-async function refreshLive() {
-  if (Date.now() < liveScrollQuietUntil) return;
-  const rows = await invoke<MessageRow[]>("api_recent_messages", {
-    groupId: null,
-    limit: 40,
+function scheduleLiveRender(rows: MessageRow[]) {
+  if (liveRenderFrame) cancelAnimationFrame(liveRenderFrame);
+  liveRenderFrame = requestAnimationFrame(() => {
+    liveRenderFrame = 0;
+    renderMessages("live-messages", rows, { hideGroup: true });
   });
+}
+
+function liveActivityValue(group: GroupItem): number {
+  return Math.max(
+    Number(group.activityCount) || 0,
+    Number(group.msgCount) || 0,
+  );
+}
+
+function updateLiveUnreadGroups(groups: GroupItem[]) {
+  for (const group of groups) {
+    const current = liveActivityValue(group);
+    const previous = liveActivityWatermarks.get(group.groupId);
+    if (
+      liveActivityInitialized &&
+      previous !== undefined &&
+      current > previous &&
+      group.groupId !== liveSelectedGroupId
+    ) {
+      liveUnreadGroups.add(group.groupId);
+    }
+    liveActivityWatermarks.set(group.groupId, current);
+  }
+  if (liveSelectedGroupId) liveUnreadGroups.delete(liveSelectedGroupId);
+  liveActivityInitialized = true;
+}
+
+function renderLiveGroupList(groups: GroupItem[]) {
+  const box = $("live-group-list");
+  const fp = groups
+    .map((g) => `${g.groupId}:${g.lastTime || 0}:${g.activityCount || 0}:${g.msgCount || 0}`)
+    .join("|");
+  const unreadFp = Array.from(liveUnreadGroups).sort().join(",");
+  const fullFp = `${liveSelectedGroupId || ""}::${unreadFp}::${fp}`;
+  if (box.dataset.fp === fullFp) return;
+  box.dataset.fp = fullFp;
+  $("live-groups-title").textContent = `监听群 · ${groups.length}`;
+
+  if (!groups.length) {
+    box.innerHTML = `<div class="empty">暂无已启用监听的群。请到「群列表」打开群配置，并勾选「启用监听此群」。</div>`;
+    return;
+  }
+
+  box.innerHTML = groups
+    .map((g) => {
+      const active = g.groupId === liveSelectedGroupId;
+      const unread = liveUnreadGroups.has(g.groupId);
+      const name = groupDisplayName(g.groupId, g.groupName);
+      const lastTs = normalizeGroupLastTs(g);
+      const last = lastTs ? formatTime("", lastTs) : "暂无消息";
+      return `<button class="monitored-group-item ${active ? "active" : ""} ${
+        unread ? "has-live-unread" : ""
+      }" type="button" data-id="${escapeHtml(g.groupId)}">
+        ${unread ? `<span class="live-unread-dot" title="有新群消息"></span>` : ""}
+        <span class="name">${escapeHtml(name)}</span>
+        <span class="meta">${escapeHtml(g.groupId)} · ${escapeHtml(last)} · ${
+          Number(g.activityCount) || Number(g.msgCount) || 0
+        } 条</span>
+      </button>`;
+    })
+    .join("");
+
+  box.querySelectorAll<HTMLButtonElement>(".monitored-group-item").forEach((btn) => {
+    btn.onclick = () => {
+      const groupId = btn.dataset.id || "";
+      if (!groupId || groupId === liveSelectedGroupId) return;
+      liveSelectedGroupId = groupId;
+      liveUnreadGroups.delete(groupId);
+      liveScrollQuietUntil = 0;
+      const messages = $("live-messages");
+      messages.dataset.fp = "";
+      messages.scrollTop = 0;
+      messages.innerHTML = `<div class="empty">正在加载消息…</div>`;
+      renderLiveGroupList(groups);
+      refreshLive(false, true).catch((e) => toast(String(e), true));
+    };
+  });
+}
+
+async function refreshLive(forceGroups = false, reloadMessages = false) {
+  const now = Date.now();
+  if (forceGroups || !groupsCache.length || now >= liveGroupsRefreshAt) {
+    const res = await invoke<{ groups: GroupItem[] }>("api_list_groups", {
+      sort: "recent",
+      q: "",
+    });
+    groupsCache = res.groups || [];
+    rememberGroupNames(groupsCache);
+    liveGroupsRefreshAt = Date.now() + 30_000;
+    liveGroupsRefreshAt = now + 30_000;
+  }
+
+  const liveGroups = groupsCache
+    .filter((g) => g.enabled)
+    .sort((a, b) => normalizeGroupLastTs(b) - normalizeGroupLastTs(a));
+  updateLiveUnreadGroups(liveGroups);
+  if (!liveGroups.some((g) => g.groupId === liveSelectedGroupId)) {
+    liveSelectedGroupId = liveGroups[0]?.groupId || null;
+    if (liveSelectedGroupId) liveUnreadGroups.delete(liveSelectedGroupId);
+    $("live-messages").dataset.fp = "";
+  }
+  renderLiveGroupList(liveGroups);
+
+  if (!liveSelectedGroupId) {
+    $("live-messages-title").textContent = "实时消息";
+    $("live-messages-hint").textContent = "暂无已勾选「启用监听此群」的群";
+    renderMessages("live-messages", []);
+    return;
+  }
+
+  const selected = liveGroups.find((g) => g.groupId === liveSelectedGroupId);
+  $("live-messages-title").textContent = groupDisplayName(
+    liveSelectedGroupId,
+    selected?.groupName,
+  );
+  $("live-messages-hint").textContent = `群号 ${liveSelectedGroupId} · 仅显示该群消息`;
+  const requestedGroupId = liveSelectedGroupId;
+  const cached = liveMessageCache.get(requestedGroupId);
+  if (cached && !reloadMessages && !forceGroups) {
+    scheduleLiveRender(cached);
+    return;
+  }
+  let rows: MessageRow[] = [];
+  try {
+    rows = await invoke<MessageRow[]>("api_recent_live_messages", {
+      groupId: requestedGroupId,
+      limit: 80,
+    });
+  } catch {
+    // 兼容未重启的旧桌面端：退回 messages 表
+    rows = await invoke<MessageRow[]>("api_recent_messages", {
+      groupId: requestedGroupId,
+      limit: 80,
+    });
+  }
+  if (requestedGroupId !== liveSelectedGroupId) return;
   for (const m of rows) {
     if (m.groupName) groupNameMap.set(m.groupId, m.groupName);
   }
-  renderMessages("live-messages", rows);
+  liveMessageCache.set(requestedGroupId, rows.slice(0, 80));
+  liveMessageCursors.set(
+    requestedGroupId,
+    rows.reduce((n, m) => Math.max(n, Number(m.liveCursor || 0)), 0),
+  );
+  if (!rows.length) {
+    $("live-messages-hint").textContent = `群号 ${requestedGroupId} · 暂无消息（等待该群新消息）`;
+  }
+  scheduleLiveRender(rows);
+}
+
+async function refreshLiveMessagesIncremental() {
+  if (
+    !liveSelectedGroupId ||
+    !$("view-live").classList.contains("active") ||
+    document.hidden ||
+    Date.now() < liveScrollQuietUntil
+  ) {
+    return;
+  }
+  const groupId = liveSelectedGroupId;
+  if (!liveMessageCache.has(groupId)) {
+    await refreshLive(false, true);
+    return;
+  }
+  const afterId = liveMessageCursors.get(groupId) || 0;
+  const result = await invoke<{ messages: MessageRow[]; cursor: number }>(
+    "api_live_messages_since",
+    { groupId, afterId, limit: 80 },
+  );
+  if (groupId !== liveSelectedGroupId) return;
+  const incoming = result.messages || [];
+  liveMessageCursors.set(groupId, Math.max(afterId, Number(result.cursor || 0)));
+  if (!incoming.length) return;
+
+  const previous = liveMessageCache.get(groupId) || [];
+  const seen = new Set<number>();
+  const merged = [...incoming, ...previous]
+    .filter((m) => {
+      if (seen.has(m.id)) return false;
+      seen.add(m.id);
+      return true;
+    })
+    .slice(0, 80);
+  liveMessageCache.set(groupId, merged);
+  scheduleLiveRender(merged);
+
+  const newestEvent = Math.max(...incoming.map((m) => Number(m.eventTime || 0)));
+  const displayDelayMs = newestEvent > 0 ? Date.now() - newestEvent * 1000 : 0;
+  if (displayDelayMs > 2000) {
+    console.warn("live message display delay", {
+      groupId,
+      displayDelayMs,
+      count: incoming.length,
+    });
+  }
+  const group = groupsCache.find((g) => g.groupId === groupId);
+  if (group && newestEvent > normalizeGroupLastTs(group)) {
+    group.lastTime = newestEvent;
+    group.activityCount = Number(group.activityCount || 0) + incoming.length;
+  }
 }
 
 const GROUPS_ACTIVE_FILTER_KEY = "gmm_groups_active_filter_v2";
@@ -982,33 +1397,29 @@ function groupMatchesActiveFilter(g: GroupItem, filter: GroupsActiveFilter): boo
 
 function activeFilterLabel(filter: GroupsActiveFilter): string {
   if (filter === "0") return "全部群";
-  if (filter === "any") return "有落库消息";
+  if (filter === "any") return "有接收活动";
   return `近 ${filter} 天内有消息`;
 }
 
 function updateGroupsFilterSummary(opts: {
   filter: GroupsActiveFilter;
   keepEnabled: boolean;
-  showBlocked: boolean;
   shown: number;
   total: number;
   hiddenInactive: number;
-  hiddenBlocked: number;
 }) {
   const el = document.getElementById("groups-filter-summary");
   if (!el) return;
   const bits = [
     `<strong>过滤</strong>：${activeFilterLabel(opts.filter)}`,
     opts.keepEnabled ? "始终显示监听中" : "监听中也按活跃过滤",
-    opts.showBlocked ? "含已屏蔽" : "隐藏已屏蔽",
     `显示 <strong>${opts.shown}</strong> / ${opts.total}`,
   ];
   if (opts.hiddenInactive > 0) {
     bits.push(`已隐藏不活跃/无落库 ${opts.hiddenInactive}`);
   }
-  if (opts.hiddenBlocked > 0) bits.push(`已隐藏屏蔽 ${opts.hiddenBlocked}`);
   if (opts.filter !== "0") {
-    bits.push("活跃度按本地落库消息判断");
+    bits.push("活跃度按最近接收事件判断");
   }
   el.innerHTML = bits.join(" · ");
 }
@@ -1018,7 +1429,6 @@ async function refreshGroups() {
   try {
     const sort = $<HTMLSelectElement>("groups-sort").value;
     const q = $<HTMLInputElement>("groups-q").value.trim();
-    const showBlocked = $<HTMLInputElement>("groups-show-blocked").checked;
     const activeSel = document.getElementById(
       "groups-active-filter",
     ) as HTMLSelectElement | null;
@@ -1033,17 +1443,11 @@ async function refreshGroups() {
     const res = await invoke<{ groups: GroupItem[] }>("api_list_groups", { sort, q });
     groupsCache = res.groups || [];
     rememberGroupNames(groupsCache);
-    await refreshUnreadBadge().catch(() => undefined);
 
-    let hiddenBlocked = 0;
     let hiddenInactive = 0;
     const visible = groupsCache.filter((g) => {
-      if (!showBlocked && g.blocked) {
-        hiddenBlocked += 1;
-        return false;
-      }
       if (!groupMatchesActiveFilter(g, filter)) {
-        if (keepEnabled && g.enabled && !g.blocked) return true;
+        if (keepEnabled && g.enabled) return true;
         hiddenInactive += 1;
         return false;
       }
@@ -1053,11 +1457,9 @@ async function refreshGroups() {
     updateGroupsFilterSummary({
       filter,
       keepEnabled,
-      showBlocked,
       shown: visible.length,
       total: groupsCache.length,
       hiddenInactive,
-      hiddenBlocked,
     });
 
     if (!visible.length) {
@@ -1073,14 +1475,12 @@ async function refreshGroups() {
         const lastTs = normalizeGroupLastTs(g);
         const last = lastTs
           ? new Date(lastTs * 1000).toLocaleString()
-          : "暂无落库消息";
+          : "暂无接收记录";
         const name = groupDisplayName(g.groupId, g.groupName);
         const ch = guessChannel(g.groupId, g.channel);
-        const unread = g.enabled && !g.blocked ? groupUnreadCount(g.groupId) : 0;
-        const statusBadge = g.blocked
-          ? `<span class="badge blocked">已屏蔽</span>`
-          : `<span class="badge ${g.enabled ? "on" : ""}">${g.enabled ? "监听中" : "未启用"}</span>`;
-        return `<button class="group-item ${g.blocked ? "is-blocked" : ""} ${
+        const unread = g.enabled ? groupUnreadCount(g.groupId) : 0;
+        const statusBadge = `<span class="badge ${g.enabled ? "on" : ""}">${g.enabled ? "监听中" : "未启用"}</span>`;
+        return `<button class="group-item ${
           unread > 0 ? "has-unread" : ""
         }" type="button" data-id="${escapeHtml(g.groupId)}">
         ${unreadBadgeHtml(unread)}
@@ -1088,7 +1488,9 @@ async function refreshGroups() {
           <div class="name">${escapeHtml(name)}</div>
           <div class="meta"><span class="channel-tag">${escapeHtml(channelLabel(ch))}</span> · ${escapeHtml(
             g.groupId,
-          )} · 最近 ${escapeHtml(last)} · ${Number(g.msgCount) || 0} 条</div>
+          )} · 最近接收 ${escapeHtml(last)} · 接收 ${Number(g.activityCount) || 0} / 入库 ${
+            Number(g.msgCount) || 0
+          } 条</div>
         </div>
         <div class="badges">
           ${statusBadge}
@@ -1195,7 +1597,7 @@ function renderReportMdHtml(md: string, extraUserNames: string[] = []): string {
     ),
   ].sort((a, b) => b.length - a.length);
 
-  const paintText = (text: string): string => {
+  const paintPlainText = (text: string): string => {
     if (!known.length || !text) return escapeHtml(text);
     const hits: string[] = [];
     let out = text;
@@ -1209,6 +1611,25 @@ function renderReportMdHtml(md: string, extraUserNames: string[] = []): string {
       const name = hits[Number(i)] || "";
       return `<span class="report-user-name">${escapeHtml(name)}</span>`;
     });
+  };
+
+  const paintText = (text: string): string => {
+    if (!text) return "";
+    const linkRe =
+      /\[([^\]\n]+)\]\((https?:\/\/[^\s)]+)\)|(https?:\/\/[^\s<>"'\])}，。！？、；：]+)/gi;
+    let out = "";
+    let lastIndex = 0;
+    let link: RegExpExecArray | null;
+    while ((link = linkRe.exec(text))) {
+      out += paintPlainText(text.slice(lastIndex, link.index));
+      const url = link[2] || link[3] || "";
+      const label = link[1] || url;
+      const safeUrl = escapeHtml(url);
+      out += `<a class="report-link" href="${safeUrl}" data-ext-url="${safeUrl}" title="${safeUrl}">${paintPlainText(label)}</a>`;
+      lastIndex = link.index + link[0].length;
+    }
+    out += paintPlainText(text.slice(lastIndex));
+    return out;
   };
 
   return toks
@@ -1232,11 +1653,16 @@ function setReportDetailBody(md: string, extraUserNames: string[] = []) {
 
 function renderMonitoredReportList(reports: ReportRow[]) {
   const box = $("monitored-report-list");
+  syncMonitoredReportTabs(reports);
   if (!monitoredSelectedGroupId) {
     box.innerHTML = `<div class="empty">请选择左侧群查看分析主题</div>`;
     return;
   }
-  const shown = visibleReports(reports);
+  const visible = visibleReports(reports);
+  const shown =
+    monitoredReportTab === "errors"
+      ? reports.filter(isFailedReport)
+      : visible.filter((r) => !isFailedReport(r));
   if (!reports.length) {
     const isFav = monitoredSelectedGroupId === FAVORITES_GROUP_ID;
     const g = groupsCache.find((x) => x.groupId === monitoredSelectedGroupId);
@@ -1250,24 +1676,33 @@ function renderMonitoredReportList(reports: ReportRow[]) {
     return;
   }
   if (!shown.length) {
-    box.innerHTML = `<div class="empty">当前仅有定时跳过记录；可关闭「忽略定时跳过」查看</div>`;
+    if (monitoredReportTab === "errors") {
+      box.innerHTML = `<div class="empty">暂无 LLM 错误记录</div>`;
+    } else if (reports.some((r) => !isFailedReport(r) && isSkippedReport(r))) {
+      box.innerHTML = `<div class="empty">当前仅有定时跳过记录；可关闭「忽略定时跳过」查看</div>`;
+    } else {
+      box.innerHTML = `<div class="empty">暂无成功的 LLM 分析结果；错误记录请切换到「错误记录」分栏查看</div>`;
+    }
     return;
   }
   box.innerHTML = shown
     .map((r) => {
       const risk = (r.riskMax || "none").toLowerCase();
       const skipped = isSkippedReport(r);
+      const failed = isFailedReport(r);
       const unread = !skipped && isReportUnread(r.id);
       return `<button class="report-title-item ${risk === "high" ? "high" : ""} ${
         skipped ? "skipped" : ""
-      } ${unread ? "is-unread" : ""} ${r.favorited ? "is-favorited" : ""}" type="button" data-id="${r.id}">
+      } ${failed ? "failed" : ""} ${unread ? "is-unread" : ""} ${
+        r.favorited ? "is-favorited" : ""
+      }" type="button" data-id="${r.id}">
         ${reportUnreadDotHtml(unread ? r.id : 0)}
         <div class="report-title-text">${r.favorited ? "★ " : ""}${escapeHtml(r.headline || "(无标题)")}</div>
         <div class="report-title-meta">${escapeHtml(r.createdAt || "")} · 风险 ${escapeHtml(
           r.riskMax || "-",
-        )} · ${r.msgCount ?? "-"} 条${escapeHtml(reportTokenMeta(r))}${
+        )} · ${failed ? "分析失败" : `${r.msgCount ?? "-"} 条`}${escapeHtml(reportTokenMeta(r))}${
           r.favorited ? " · 已收藏" : ""
-        }</div>
+        }${r.githubIssueUrl ? " · 已上报 Issue" : ""}</div>
       </button>`;
     })
     .join("");
@@ -1334,6 +1769,7 @@ async function openMonitoredReportDetail(reportId: number) {
       report.favorited ? " · 已收藏" : ""
     }`;
   syncFavoriteButton(!!report.favorited);
+  syncIssueButton(report);
   const reportMd = (report.reportMd || "").trim() || "（无详细内容）";
   setReportDetailBody(reportMd);
 
@@ -1407,6 +1843,81 @@ function syncFavoriteButton(favorited: boolean) {
     : "收藏后永久保留分析与当时的聊天记录快照";
 }
 
+function syncIssueButton(report?: ReportRow) {
+  const btn = document.getElementById("btn-report-issue") as HTMLButtonElement | null;
+  if (!btn) return;
+  const visible = !!report?.failed;
+  btn.classList.toggle("hidden", !visible);
+  btn.textContent = report?.githubIssueUrl ? "查看 Issue" : "上报 Issue";
+  btn.title = report?.githubIssueUrl || "预览脱敏错误与日志后创建 GitHub Issue";
+}
+
+function closeIssueReportModal() {
+  $("issue-report-modal").classList.add("hidden");
+}
+
+async function openIssueReportModal() {
+  if (!monitoredDetailReportId) {
+    toast("未打开分析失败主题", true);
+    return;
+  }
+  const report = monitoredReportsCache.find((r) => r.id === monitoredDetailReportId);
+  if (!report?.failed) {
+    toast("仅分析失败主题可以上报", true);
+    return;
+  }
+  if (report.githubIssueUrl) {
+    await openUrl(report.githubIssueUrl);
+    return;
+  }
+  try {
+    const preview = await invoke<{
+      repo: string;
+      title: string;
+      body: string;
+      issueUrl?: string;
+    }>("api_github_issue_preview", { reportId: report.id });
+    if (preview.issueUrl) {
+      report.githubIssueUrl = preview.issueUrl;
+      syncIssueButton(report);
+      await openUrl(preview.issueUrl);
+      return;
+    }
+    $("issue-report-repo").textContent = `目标仓库：${preview.repo}`;
+    $<HTMLInputElement>("issue-report-preview-title").value = preview.title || "";
+    $<HTMLTextAreaElement>("issue-report-preview-body").value = preview.body || "";
+    $("issue-report-modal").classList.remove("hidden");
+  } catch (e) {
+    toast(String(e), true);
+  }
+}
+
+async function confirmIssueReport() {
+  if (!monitoredDetailReportId) return;
+  const btn = $<HTMLButtonElement>("btn-confirm-issue-report");
+  btn.disabled = true;
+  btn.textContent = "正在创建…";
+  try {
+    const result = await invoke<{ ok: boolean; issueUrl: string }>("api_report_github_issue", {
+      reportId: monitoredDetailReportId,
+    });
+    const report = monitoredReportsCache.find((r) => r.id === monitoredDetailReportId);
+    if (report) {
+      report.githubIssueUrl = result.issueUrl;
+      syncIssueButton(report);
+    }
+    closeIssueReportModal();
+    renderMonitoredReportList(monitoredReportsCache);
+    toast("GitHub Issue 已创建");
+    if (result.issueUrl) await openUrl(result.issueUrl);
+  } catch (e) {
+    toast(String(e), true);
+  } finally {
+    btn.disabled = false;
+    btn.textContent = "确认创建 Issue";
+  }
+}
+
 async function toggleFavoriteCurrentReport() {
   if (!monitoredDetailReportId) {
     toast("未打开分析报告", true);
@@ -1456,7 +1967,7 @@ async function refreshMonitored() {
   });
   groupsCache = res.groups || [];
   rememberGroupNames(groupsCache);
-  const enabled = groupsCache.filter((g) => g.enabled && !g.blocked);
+  const enabled = groupsCache.filter((g) => g.enabled);
   const llm = enabled.filter((g) => g.llmEnabled).length;
   const totalMsg = enabled.reduce((n, g) => n + (g.msgCount || 0), 0);
 
@@ -1604,14 +2115,62 @@ function fillProvidersSelect(selected?: string, selectId = "g-llm-provider") {
   if (selected) sel.value = selected;
 }
 
+function fillGlobalDefaultConfig() {
+  if (!settingsCache) return;
+  const provider = activeProvider();
+  if (provider) settingsCache.llm.activeProviderId = provider.id;
+  fillProvidersSelect(provider?.id || "", "s-global-provider");
+  settingsModelOptions = provider?.defaultModel ? [{ id: provider.defaultModel }] : [];
+  fillModelSelect("s-default-model", settingsModelOptions, provider?.defaultModel || "");
+  fillModelSelect(
+    "s-default-image-model",
+    settingsModelOptions,
+    settingsCache.llm.defaultImageModel || "",
+    "未选择时复用默认文本模型",
+    true,
+  );
+  $<HTMLTextAreaElement>("s-global-prompt").value = settingsCache.llm.defaultPrompt || "";
+  $<HTMLInputElement>("s-global-every").value = String(
+    settingsCache.llm.defaultEveryMinutes ?? 60,
+  );
+  $<HTMLInputElement>("s-global-window").value = String(
+    settingsCache.llm.defaultWindowMinutes ?? 60,
+  );
+  $<HTMLInputElement>("s-global-min").value = String(
+    settingsCache.llm.defaultMinMessages ?? 8,
+  );
+}
+
 function syncLlmAnalysisPanels() {
+  const useGlobalEl = document.getElementById("g-llm-use-global") as HTMLInputElement | null;
+  const customConfig = document.getElementById("g-llm-custom-config");
   const textEl = document.getElementById("g-llm-text-enabled") as HTMLInputElement | null;
   const imageEl = document.getElementById("g-llm-image-enabled") as HTMLInputElement | null;
   const sameEl = document.getElementById("g-llm-image-same") as HTMLInputElement | null;
   const textCfg = document.getElementById("g-llm-text-config");
   const imageWrap = document.getElementById("g-llm-image-wrap");
   const imageCfg = document.getElementById("g-llm-image-config");
-  if (!textEl || !imageEl || !sameEl || !textCfg || !imageWrap || !imageCfg) return;
+  if (
+    !useGlobalEl ||
+    !customConfig ||
+    !textEl ||
+    !imageEl ||
+    !sameEl ||
+    !textCfg ||
+    !imageWrap ||
+    !imageCfg
+  )
+    return;
+  customConfig.classList.toggle("hidden", useGlobalEl.checked);
+  const globalHint = document.getElementById("g-llm-global-hint");
+  if (globalHint) {
+    globalHint.textContent =
+      useGlobalEl.checked && settingsCache
+        ? `当前全局参数：每 ${settingsCache.llm.defaultEveryMinutes ?? 60} 分钟执行，分析最近 ${
+            settingsCache.llm.defaultWindowMinutes ?? 60
+          } 分钟，至少 ${settingsCache.llm.defaultMinMessages ?? 8} 条消息。`
+        : "当前使用本群自己的调度参数、代理、模型和提示词。";
+  }
   const textOn = textEl.checked;
   const imageOn = imageEl.checked;
   const sameAsText = sameEl.checked;
@@ -1668,8 +2227,7 @@ async function switchActiveProvider(id: string) {
   if (!p) return;
   if (settingsCache.llm.activeProviderId === id) return;
   settingsCache.llm.activeProviderId = id;
-  settingsModelOptions = p.defaultModel ? [{ id: p.defaultModel }] : [];
-  fillModelSelect("s-default-model", settingsModelOptions, p.defaultModel || "");
+  fillGlobalDefaultConfig();
   renderProviderList();
   try {
     await persistSettingsFromForm();
@@ -1756,8 +2314,7 @@ async function saveProviderForm() {
   }
   const active = activeProvider();
   if (active) {
-    settingsModelOptions = active.defaultModel ? [{ id: active.defaultModel }] : settingsModelOptions;
-    fillModelSelect("s-default-model", settingsModelOptions, active.defaultModel || "");
+    fillGlobalDefaultConfig();
   }
   renderProviderList();
   closeProviderForm();
@@ -1777,8 +2334,7 @@ async function deleteProvider(id: string) {
   }
   renderProviderList();
   const active = activeProvider();
-  settingsModelOptions = active?.defaultModel ? [{ id: active.defaultModel }] : [];
-  fillModelSelect("s-default-model", settingsModelOptions, active?.defaultModel || "");
+  if (active) fillGlobalDefaultConfig();
   try {
     await persistSettingsFromForm();
     toast("代理已删除");
@@ -1792,6 +2348,7 @@ function fillModelSelect(
   models: { id: string }[],
   current?: string,
   emptyHint = "先点右侧刷新获取模型",
+  allowEmpty = false,
 ) {
   const sel = $<HTMLSelectElement>(selectId);
   const cur = (current ?? sel.value).trim();
@@ -1802,10 +2359,10 @@ function fillModelSelect(
     sel.value = "";
     return;
   }
-  sel.innerHTML = ids
-    .map((id) => `<option value="${escapeHtml(id)}">${escapeHtml(id)}</option>`)
-    .join("");
-  sel.value = cur && ids.includes(cur) ? cur : ids[0];
+  sel.innerHTML =
+    (allowEmpty ? `<option value="">${escapeHtml(emptyHint)}</option>` : "") +
+    ids.map((id) => `<option value="${escapeHtml(id)}">${escapeHtml(id)}</option>`).join("");
+  sel.value = cur && ids.includes(cur) ? cur : allowEmpty ? "" : ids[0];
 }
 
 async function fetchModelsByProviderId(providerId: string): Promise<{ id: string }[]> {
@@ -1819,7 +2376,8 @@ async function fetchModelsByProviderId(providerId: string): Promise<{ id: string
 }
 
 async function refreshSettingsModels() {
-  const active = activeProvider();
+  const providerId = $<HTMLSelectElement>("s-global-provider").value;
+  const active = settingsCache?.llm.providers.find((p) => p.id === providerId);
   if (!active) {
     toast("请先添加并选择代理", true);
     return;
@@ -1834,6 +2392,14 @@ async function refreshSettingsModels() {
     }
     const keep = $<HTMLSelectElement>("s-default-model").value || active.defaultModel || "";
     fillModelSelect("s-default-model", settingsModelOptions, keep);
+    const imageKeep = $<HTMLSelectElement>("s-default-image-model").value;
+    fillModelSelect(
+      "s-default-image-model",
+      settingsModelOptions,
+      imageKeep,
+      "未选择时复用默认文本模型",
+      true,
+    );
     const chosen = $<HTMLSelectElement>("s-default-model").value;
     if (chosen && settingsCache) {
       settingsCache.llm.providers = settingsCache.llm.providers.map((p) =>
@@ -1912,6 +2478,9 @@ function showTestResult(elId: string, ok: boolean, text: string) {
 
 async function persistSettingsFromForm(): Promise<AppSettings> {
   if (!settingsCache) settingsCache = await invoke<AppSettings>("api_get_settings");
+  const globalProviderId =
+    $<HTMLSelectElement>("s-global-provider").value || settingsCache.llm.activeProviderId;
+  settingsCache.llm.activeProviderId = globalProviderId;
   const active = activeProvider();
   const model = $<HTMLSelectElement>("s-default-model").value.trim();
   if (active) {
@@ -1920,6 +2489,8 @@ async function persistSettingsFromForm(): Promise<AppSettings> {
     );
   }
   const prev = settingsCache.channels || {};
+  const qqMode = "onebot";
+  const prevMode = "onebot";
   const next: AppSettings = {
     onebotWsUrl: $<HTMLInputElement>("s-ws").value.trim(),
     onebotAccessToken: $<HTMLInputElement>("s-token").value.trim(),
@@ -1928,6 +2499,11 @@ async function persistSettingsFromForm(): Promise<AppSettings> {
         bound: !!prev.qq?.bound,
         label: prev.qq?.label || "",
         lastError: prev.qq?.lastError || "",
+        mode: qqMode,
+        notificationAccess: prev.qq?.notificationAccess || "",
+        uiaReady: !!prev.qq?.uiaReady,
+        pollSeconds: Number($<HTMLInputElement>("s-qq-poll")?.value || prev.qq?.pollSeconds || 1.5),
+        groupNameMap: prev.qq?.groupNameMap || {},
       },
       wechat: {
         bound: WECHAT_CHANNEL_ENABLED ? !!prev.wechat?.bound : false,
@@ -1943,9 +2519,11 @@ async function persistSettingsFromForm(): Promise<AppSettings> {
         pollSeconds: prev.wechat?.pollSeconds ?? 1,
       },
       telegram: {
-        bound: !!prev.telegram?.bound,
-        label: prev.telegram?.label || "",
-        lastError: prev.telegram?.lastError || "",
+        bound: TELEGRAM_CHANNEL_ENABLED ? !!prev.telegram?.bound : false,
+        label: TELEGRAM_CHANNEL_ENABLED ? prev.telegram?.label || "" : "",
+        lastError: TELEGRAM_CHANNEL_ENABLED
+          ? prev.telegram?.lastError || ""
+          : "Telegram 通道暂不支持",
         apiId: Number($<HTMLInputElement>("s-tg-api-id").value.trim() || 0),
         apiHash: $<HTMLInputElement>("s-tg-api-hash").value.trim(),
         botToken: "",
@@ -1953,14 +2531,27 @@ async function persistSettingsFromForm(): Promise<AppSettings> {
       },
     },
     llm: {
-      activeProviderId: settingsCache.llm.activeProviderId,
+      activeProviderId: globalProviderId,
       providers: settingsCache.llm.providers,
+      defaultImageModel: $<HTMLSelectElement>("s-default-image-model").value.trim(),
+      defaultPrompt: $<HTMLTextAreaElement>("s-global-prompt").value,
+      defaultEveryMinutes: Math.max(
+        1,
+        Number($<HTMLInputElement>("s-global-every").value || 60),
+      ),
+      defaultWindowMinutes: Math.max(
+        1,
+        Number($<HTMLInputElement>("s-global-window").value || 60),
+      ),
+      defaultMinMessages: Math.max(
+        1,
+        Number($<HTMLInputElement>("s-global-min").value || 8),
+      ),
       reportKeepLimit: clampReportKeepLimit(
         Number($<HTMLInputElement>("s-llm-report-keep")?.value || settingsCache.llm.reportKeepLimit || 100),
       ),
     },
     ui: {
-      compactModeEnabled: $<HTMLInputElement>("s-compact-mode").checked,
       theme: selectedTheme,
     },
   };
@@ -1968,6 +2559,16 @@ async function persistSettingsFromForm(): Promise<AppSettings> {
   settingsCache = next;
   applyTheme(selectedTheme);
   renderChannelBindings(next);
+  if (prevMode !== qqMode && next.channels?.qq?.bound) {
+    try {
+      await invoke("stop_monitor");
+      await invoke("start_monitor");
+      toast(`已切换到 ${qqMode === "passive" ? "官方 QQ 被动" : "OneBot"} 模式并重启监听`);
+      await refreshStatus();
+    } catch (e) {
+      toast(`模式已保存，但重启监听失败：${e}`, true);
+    }
+  }
   return next;
 }
 
@@ -2040,17 +2641,17 @@ async function openGroup(groupId: string) {
   $("detail-title").textContent = displayName;
   $("detail-sub").textContent = `${channelLabel(guessChannel(groupId, cfg.channel))} · ${groupId}`;
 
-  $<HTMLInputElement>("g-blocked").checked = !!cfg.blocked;
-  $<HTMLInputElement>("g-enabled").checked = !!cfg.enabled && !cfg.blocked;
+  $<HTMLInputElement>("g-enabled").checked = !!cfg.enabled;
   $<HTMLInputElement>("g-log-all").checked = !!cfg.basic?.logAll;
   $<HTMLInputElement>("g-storage").checked = !!cfg.basic?.storageEnabled;
   $<HTMLInputElement>("g-name").value = cfg.groupName || "";
-  syncBlockEnableUi();
   $<HTMLInputElement>("g-kw-enabled").checked = !!cfg.keywordMonitor?.enabled;
   $<HTMLInputElement>("g-keywords").value = (cfg.keywordMonitor?.keywords || []).join(",");
   $<HTMLInputElement>("g-kw-alert").checked = !!cfg.keywordMonitor?.alertEnabled;
   $<HTMLInputElement>("g-kw-webhook").value = cfg.keywordMonitor?.webhookUrl || "";
   $<HTMLInputElement>("g-llm-enabled").checked = !!cfg.llmMonitor?.enabled;
+  $<HTMLInputElement>("g-llm-use-global").checked =
+    cfg.llmMonitor?.useGlobalDefaults !== false;
   $<HTMLInputElement>("g-llm-text-enabled").checked = cfg.llmMonitor?.textEnabled !== false;
   $<HTMLInputElement>("g-llm-image-enabled").checked = cfg.llmMonitor?.imageEnabled !== false;
   $<HTMLInputElement>("g-llm-image-same").checked = cfg.llmMonitor?.imageSameAsText !== false;
@@ -2098,11 +2699,16 @@ async function openGroup(groupId: string) {
   renderMessages("detail-messages", msgs, { hideGroup: true });
   const reports = await invoke<ReportRow[]>("api_list_reports", { groupId, limit: 30 });
   const box = $("detail-reports");
-  const shown = visibleReports(reports || []);
+  const shown = visibleReports(reports || []).filter((r) => !isFailedReport(r));
   if (!reports.length) {
     box.innerHTML = `<div class="empty">暂无 LLM 报告，可点「立即执行」</div>`;
   } else if (!shown.length) {
-    box.innerHTML = `<div class="empty">当前仅有定时跳过记录；可在「监听中」关闭「忽略定时跳过」查看</div>`;
+    const hasErrors = reports.some(isFailedReport);
+    box.innerHTML = `<div class="empty">${
+      hasErrors
+        ? "暂无成功的 LLM 分析结果；错误记录请到「监听中 → 错误记录」查看"
+        : "当前仅有定时跳过记录；可在「监听中」关闭「忽略定时跳过」查看"
+    }</div>`;
   } else {
     box.innerHTML = shown
       .map((r) => {
@@ -2136,28 +2742,14 @@ async function openGroup(groupId: string) {
   }
 }
 
-function syncBlockEnableUi() {
-  const blocked = $<HTMLInputElement>("g-blocked").checked;
-  const enabledEl = $<HTMLInputElement>("g-enabled");
-  if (blocked) {
-    enabledEl.checked = false;
-    enabledEl.disabled = true;
-  } else {
-    enabledEl.disabled = false;
-  }
-}
-
 function readGroupForm(): GroupConfig {
   const groupId = currentGroupId || "";
-  const blocked = $<HTMLInputElement>("g-blocked").checked;
-  const enabled = !blocked && $<HTMLInputElement>("g-enabled").checked;
   const cached = groupsCache.find((g) => g.groupId === groupId);
   return {
     groupId,
     groupName: $<HTMLInputElement>("g-name").value.trim(),
     channel: guessChannel(groupId, cached?.channel),
-    enabled,
-    blocked,
+    enabled: $<HTMLInputElement>("g-enabled").checked,
     basic: {
       logAll: $<HTMLInputElement>("g-log-all").checked,
       storageEnabled: $<HTMLInputElement>("g-storage").checked,
@@ -2173,6 +2765,7 @@ function readGroupForm(): GroupConfig {
     },
     llmMonitor: {
       enabled: $<HTMLInputElement>("g-llm-enabled").checked,
+      useGlobalDefaults: $<HTMLInputElement>("g-llm-use-global").checked,
       textEnabled: $<HTMLInputElement>("g-llm-text-enabled").checked,
       providerId: $<HTMLSelectElement>("g-llm-provider").value,
       model: $<HTMLSelectElement>("g-llm-model").value.trim(),
@@ -2192,6 +2785,10 @@ async function loadSettingsView() {
   settingsCache = await invoke<AppSettings>("api_get_settings");
   $<HTMLInputElement>("s-ws").value = settingsCache.onebotWsUrl || "";
   $<HTMLInputElement>("s-token").value = settingsCache.onebotAccessToken || "";
+  const qqModeEl = document.getElementById("s-qq-mode") as HTMLSelectElement | null;
+  if (qqModeEl) qqModeEl.value = settingsCache.channels?.qq?.mode === "passive" ? "passive" : "onebot";
+  const pollEl = document.getElementById("s-qq-poll") as HTMLInputElement | null;
+  if (pollEl) pollEl.value = String(settingsCache.channels?.qq?.pollSeconds || 1.5);
   $<HTMLInputElement>("s-wx-dir").value = settingsCache.channels?.wechat?.dataDir || "";
   $<HTMLInputElement>("s-wx-decrypted").value =
     settingsCache.channels?.wechat?.decryptedDir || "";
@@ -2199,37 +2796,46 @@ async function loadSettingsView() {
   $<HTMLInputElement>("s-wx-keys").value = "";
   $<HTMLInputElement>("s-tg-api-id").value = String(settingsCache.channels?.telegram?.apiId || "");
   $<HTMLInputElement>("s-tg-api-hash").value = settingsCache.channels?.telegram?.apiHash || "";
-  $<HTMLInputElement>("s-compact-mode").checked = !!settingsCache.ui?.compactModeEnabled;
   applyTheme(settingsCache.ui?.theme || "midnight");
   renderChannelBindings(settingsCache);
   syncReportKeepSlider(settingsCache.llm?.reportKeepLimit ?? 100);
-  const active = activeProvider();
-  settingsModelOptions = active?.defaultModel ? [{ id: active.defaultModel }] : [];
-  fillModelSelect("s-default-model", settingsModelOptions, active?.defaultModel || "");
+  fillGlobalDefaultConfig();
   renderProviderList();
   switchSettingsTab("channels");
 }
 
-async function tick() {
-  if (tickInFlight) return;
-  tickInFlight = true;
-  try {
-    // 状态检测含 TCP，降频到约每 2 次
-    statusTick += 1;
-    if (statusTick % 2 === 1) {
-      await refreshStatus();
-    }
-    if (statusTick % 2 === 0) {
-      await pollLlmTipsAndUnread();
-    }
-    if ($("view-live").classList.contains("active") && !isCompactView) {
+function startIndependentRefreshLoops() {
+  const repeat = (work: () => Promise<void>, delayMs: number) => {
+    const run = async () => {
+      try {
+        await work();
+      } catch (e) {
+        console.error(e);
+      } finally {
+        window.setTimeout(run, document.hidden ? Math.max(delayMs, 5000) : delayMs);
+      }
+    };
+    void run();
+  };
+
+  repeat(refreshLiveMessagesIncremental, 1000);
+  repeat(async () => {
+    if (!document.hidden) await refreshStatus();
+  }, 15_000);
+  repeat(async () => {
+    if (!document.hidden) await pollLlmTipsAndUnread();
+  }, 15_000);
+  repeat(async () => {
+    if (document.hidden) return;
+    if ($("view-live").classList.contains("active")) {
       await refreshLive();
+    } else if (
+      $("view-groups").classList.contains("active") &&
+      !$("groups-master").classList.contains("hidden")
+    ) {
+      await refreshGroups();
     }
-  } catch (e) {
-    console.error(e);
-  } finally {
-    tickInFlight = false;
-  }
+  }, 15_000);
 }
 
 type LightboxState = {
@@ -2357,6 +2963,14 @@ window.addEventListener("DOMContentLoaded", async () => {
       renderMonitoredReportList(monitoredReportsCache);
     };
   }
+  $("monitored-tab-success").onclick = () => {
+    monitoredReportTab = "success";
+    renderMonitoredReportList(monitoredReportsCache);
+  };
+  $("monitored-tab-errors").onclick = () => {
+    monitoredReportTab = "errors";
+    renderMonitoredReportList(monitoredReportsCache);
+  };
 
   document.getElementById("btn-lightbox-close")?.addEventListener("click", () => {
     closeImageLightbox();
@@ -2379,6 +2993,7 @@ window.addEventListener("DOMContentLoaded", async () => {
     (btn as HTMLButtonElement).onclick = () => {
       const name = (btn as HTMLElement).dataset.tab || "live";
       switchTab(name);
+      if (name === "live") refreshLive(true).catch((e) => toast(String(e), true));
       if (name === "groups") refreshGroups().catch((e) => toast(String(e), true));
       if (name === "monitored") {
         refreshMonitored()
@@ -2391,11 +3006,7 @@ window.addEventListener("DOMContentLoaded", async () => {
 
   $("win-min").onclick = async () => {
     try {
-      if (compactModeEnabled()) {
-        await enterCompactView();
-      } else {
-        await getCurrentWindow().minimize();
-      }
+      await getCurrentWindow().minimize();
     } catch (e) {
       toast(String(e), true);
     }
@@ -2414,17 +3025,6 @@ window.addEventListener("DOMContentLoaded", async () => {
       toast(String(e), true);
     }
   };
-  $("win-close-compact").onclick = async () => {
-    try {
-      await getCurrentWindow().close();
-    } catch (e) {
-      toast(String(e), true);
-    }
-  };
-  $("btn-exit-compact").onclick = () => {
-    exitCompactView().catch((e) => toast(String(e), true));
-  };
-
   document.addEventListener("click", (ev) => {
     const t = ev.target as HTMLElement | null;
     const imgA = t?.closest?.("a[data-image-url]") as HTMLAnchorElement | null;
@@ -2460,6 +3060,9 @@ window.addEventListener("DOMContentLoaded", async () => {
   document.querySelectorAll<HTMLButtonElement>(".pill[data-key]").forEach((pill) => {
     pill.onclick = () => repairStatus(pill.dataset.key || "").catch((e) => toast(String(e), true));
   });
+  $("btn-reconnect-all").onclick = () => {
+    reconnectAll().catch((e) => toast(String(e), true));
+  };
   $("btn-close-napcat-login").onclick = closeNapcatLogin;
   $("btn-done-napcat-login").onclick = closeNapcatLogin;
   document.querySelectorAll("[data-napcat-login-close]").forEach((el) => {
@@ -2527,13 +3130,22 @@ window.addEventListener("DOMContentLoaded", async () => {
       toggleFavoriteCurrentReport().catch((e) => toast(String(e), true));
     };
   }
+  $("btn-report-issue").onclick = () => {
+    openIssueReportModal().catch((e) => toast(String(e), true));
+  };
+  $("btn-confirm-issue-report").onclick = () => {
+    confirmIssueReport().catch((e) => toast(String(e), true));
+  };
+  $("btn-close-issue-report").onclick = closeIssueReportModal;
+  $("btn-cancel-issue-report").onclick = closeIssueReportModal;
+  document.querySelectorAll("[data-issue-report-close]").forEach((el) => {
+    (el as HTMLElement).onclick = closeIssueReportModal;
+  });
   $("btn-goto-groups").onclick = () => {
     switchTab("groups");
     refreshGroups().catch((e) => toast(String(e), true));
   };
   $("groups-sort").onchange = () => refreshGroups().catch((e) => toast(String(e), true));
-  $("groups-show-blocked").onchange = () =>
-    refreshGroups().catch((e) => toast(String(e), true));
   const activeFilterEl = document.getElementById(
     "groups-active-filter",
   ) as HTMLSelectElement | null;
@@ -2558,6 +3170,9 @@ window.addEventListener("DOMContentLoaded", async () => {
     if (ev.key === "Enter") refreshGroups().catch((e) => toast(String(e), true));
   };
   $("btn-pull-channel-groups").onclick = async () => {
+    const button = $<HTMLButtonElement>("btn-pull-channel-groups");
+    button.disabled = true;
+    toast("正在拉取 QQ 群列表，并同步每群最近 10 条消息…");
     try {
       const parts: string[] = [];
       if (settingsCache?.channels?.qq?.bound || !settingsCache?.channels) {
@@ -2571,7 +3186,7 @@ window.addEventListener("DOMContentLoaded", async () => {
         const res = await invoke<{ ok?: boolean; message?: string }>("api_pull_wechat_groups");
         parts.push(res.message || (res.ok ? "微信群已拉取" : "微信拉取失败"));
       }
-      if (settingsCache?.channels?.telegram?.bound) {
+      if (TELEGRAM_CHANNEL_ENABLED && settingsCache?.channels?.telegram?.bound) {
         const res = await invoke<{ ok?: boolean; message?: string }>("api_pull_telegram_groups");
         parts.push(res.message || (res.ok ? "TG 群已拉取" : "TG 拉取失败"));
       }
@@ -2579,28 +3194,103 @@ window.addEventListener("DOMContentLoaded", async () => {
       await refreshGroups();
     } catch (e) {
       toast(String(e), true);
+    } finally {
+      button.disabled = false;
     }
   };
   $("btn-bind-qq").onclick = async () => {
     try {
       await persistSettingsFromForm();
-      const res = await invoke<{ ok?: boolean; message?: string; channels?: AppSettings["channels"] }>(
-        "api_bind_qq",
-        {
-          payload: {
-            onebotWsUrl: $<HTMLInputElement>("s-ws").value.trim(),
-            onebotAccessToken: $<HTMLInputElement>("s-token").value.trim(),
-          },
+      const mode = currentQqMode();
+      const res = await invoke<{
+        ok?: boolean;
+        message?: string;
+        channels?: AppSettings["channels"];
+        detect?: Record<string, unknown>;
+      }>("api_bind_qq", {
+        payload: {
+          mode,
+          onebotWsUrl: $<HTMLInputElement>("s-ws").value.trim(),
+          onebotAccessToken: $<HTMLInputElement>("s-token").value.trim(),
+          pollSeconds: Number($<HTMLInputElement>("s-qq-poll")?.value || 1.5),
         },
-      );
+      });
       if (res.channels && settingsCache) settingsCache.channels = res.channels;
       renderChannelBindings(settingsCache);
       showTestResult("onebot-test-result", !!res.ok, res.message || "");
       toast(res.message || "QQ 已绑定", !res.ok);
+      try {
+        await invoke("stop_monitor");
+        await invoke("start_monitor");
+      } catch {
+        /* 未运行时可忽略 stop */
+        try {
+          await invoke("start_monitor");
+        } catch (e) {
+          toast(`绑定成功，但启动监听失败：${e}`, true);
+        }
+      }
+      await refreshStatus();
+      await refreshGroups();
     } catch (e) {
       toast(String(e), true);
     }
   };
+  const qqModeSelect = document.getElementById("s-qq-mode") as HTMLSelectElement | null;
+  if (qqModeSelect) {
+    qqModeSelect.onchange = () => {
+      syncQqModeFields({
+        ...(settingsCache as AppSettings),
+        channels: {
+          ...(settingsCache?.channels || {}),
+          qq: {
+            ...(settingsCache?.channels?.qq || { bound: false }),
+            mode: qqModeSelect.value === "passive" ? "passive" : "onebot",
+          },
+        },
+      });
+    };
+  }
+  const btnDetectPassive = document.getElementById("btn-detect-qq-passive");
+  if (btnDetectPassive) {
+    btnDetectPassive.onclick = async () => {
+      try {
+        showTestResult("onebot-test-result", true, "正在探测官方 QQ / 通知 / UIA…");
+        const res = await invoke<{
+          ok?: boolean;
+          message?: string;
+          channels?: AppSettings["channels"];
+          detect?: {
+            officialQqRunning?: boolean;
+            napcatRunning?: boolean;
+            notificationAccess?: string;
+            uiaOk?: boolean;
+            uiaGroupName?: string;
+            limitations?: string[];
+          };
+        }>("api_detect_qq_passive");
+        if (res.channels && settingsCache) settingsCache.channels = res.channels;
+        renderChannelBindings(settingsCache);
+        const d = res.detect || {};
+        const detail = [
+          res.message || "探测完成",
+          `官方QQ=${d.officialQqRunning ? "是" : "否"}`,
+          `NapCat=${d.napcatRunning ? "仍在运行" : "未运行"}`,
+          `通知=${d.notificationAccess || "unknown"}`,
+          `UIA=${d.uiaOk ? "可用" : "不可用"}`,
+          d.uiaGroupName ? `当前会话=${d.uiaGroupName}` : "",
+        ]
+          .filter(Boolean)
+          .join(" · ");
+        showTestResult("onebot-test-result", !!res.ok && !d.napcatRunning, detail);
+        toast(detail, !res.ok || !!d.napcatRunning);
+        await refreshStatus();
+      } catch (e) {
+        showTestResult("onebot-test-result", false, String(e));
+        toast(String(e), true);
+      }
+    };
+  }
   $("btn-unbind-qq").onclick = async () => {
     try {
       const res = await invoke<{ ok?: boolean; message?: string; channels?: AppSettings["channels"] }>(
@@ -2968,7 +3658,7 @@ window.addEventListener("DOMContentLoaded", async () => {
     try {
       const form = readGroupForm();
       const wasEnabled = !!groupsCache.find((g) => g.groupId === form.groupId)?.enabled;
-      if (form.enabled && !wasEnabled && !form.blocked) {
+      if (form.enabled && !wasEnabled) {
         toast("正在保存并补拉历史消息…");
       }
       const res = await invoke<{
@@ -2983,14 +3673,6 @@ window.addEventListener("DOMContentLoaded", async () => {
           message?: string;
         } | null;
       }>("api_save_group", { config: form });
-      if (form.blocked) {
-        toast("已屏蔽此群");
-        $("group-detail").classList.add("hidden");
-        $("groups-master").classList.remove("hidden");
-        currentGroupId = null;
-        await refreshGroups();
-        return;
-      }
       const hist = res.history;
       if (res.newlyEnabled && hist) {
         if (hist.ok === false) {
@@ -3010,13 +3692,6 @@ window.addEventListener("DOMContentLoaded", async () => {
       await refreshGroups().catch(() => undefined);
     } catch (e) {
       toast(String(e), true);
-    }
-  };
-  $("g-blocked").onchange = () => syncBlockEnableUi();
-  $("g-enabled").onchange = () => {
-    if ($<HTMLInputElement>("g-enabled").checked) {
-      $<HTMLInputElement>("g-blocked").checked = false;
-      syncBlockEnableUi();
     }
   };
   $("btn-pull-history").onclick = async () => {
@@ -3059,11 +3734,14 @@ window.addEventListener("DOMContentLoaded", async () => {
         totalTokens?: number;
         promptTokens?: number;
         completionTokens?: number;
+        error?: string;
       }>("api_run_llm", {
         groupId: currentGroupId,
       });
       if (result.status === "skipped") {
         toast(result.reason || "已跳过（消息不足）", true);
+      } else if (result.status === "failed") {
+        toast(`LLM 分析失败，已归入「错误记录」分栏：${result.error || "请查看详情"}`, true);
       } else {
         const extra = result.source ? ` · ${result.source}` : "";
         const tok =
@@ -3104,6 +3782,7 @@ window.addEventListener("DOMContentLoaded", async () => {
   bindToggle("g-llm-text-enabled");
   bindToggle("g-llm-image-enabled");
   bindToggle("g-llm-image-same");
+  bindToggle("g-llm-use-global");
   $("g-llm-provider").onchange = () => {
     const providerId = $<HTMLSelectElement>("g-llm-provider").value;
     const provider = settingsCache?.llm.providers.find((p) => p.id === providerId);
@@ -3127,6 +3806,26 @@ window.addEventListener("DOMContentLoaded", async () => {
       p.id === active.id ? { ...p, defaultModel: model } : p,
     );
   };
+  $("s-global-provider").onchange = () => {
+    if (!settingsCache) return;
+    settingsCache.llm.defaultPrompt = $<HTMLTextAreaElement>("s-global-prompt").value;
+    settingsCache.llm.defaultEveryMinutes = Math.max(
+      1,
+      Number($<HTMLInputElement>("s-global-every").value || 60),
+    );
+    settingsCache.llm.defaultWindowMinutes = Math.max(
+      1,
+      Number($<HTMLInputElement>("s-global-window").value || 60),
+    );
+    settingsCache.llm.defaultMinMessages = Math.max(
+      1,
+      Number($<HTMLInputElement>("s-global-min").value || 8),
+    );
+    settingsCache.llm.defaultImageModel = "";
+    settingsCache.llm.activeProviderId = $<HTMLSelectElement>("s-global-provider").value;
+    fillGlobalDefaultConfig();
+    renderProviderList();
+  };
 
   $("btn-save-settings").onclick = async () => {
     try {
@@ -3146,7 +3845,6 @@ window.addEventListener("DOMContentLoaded", async () => {
   try {
     settingsCache = await invoke<AppSettings>("api_get_settings");
     applyTheme(settingsCache.ui?.theme || "midnight");
-    $<HTMLInputElement>("s-compact-mode").checked = !!settingsCache.ui?.compactModeEnabled;
     syncReportKeepSlider(settingsCache.llm?.reportKeepLimit ?? 100);
   } catch {
     applyTheme("midnight");
@@ -3175,9 +3873,15 @@ window.addEventListener("DOMContentLoaded", async () => {
     gsap.from(".main", { y: 12, autoAlpha: 0, duration: 0.4, delay: 0.06, ease: "power2.out" });
   }
 
-  await tick();
+  await refreshStatus().catch(() => undefined);
+  await refreshLive(false, true).catch(() => undefined);
   await refreshUnreadBadge().catch(() => undefined);
-  window.setInterval(tick, 4000);
+  startIndependentRefreshLoops();
+  document.addEventListener("visibilitychange", () => {
+    if (document.hidden) return;
+    refreshStatus().catch(() => undefined);
+    refreshLiveMessagesIncremental().catch(() => undefined);
+  });
 
   try {
     await getCurrentWindow().show();

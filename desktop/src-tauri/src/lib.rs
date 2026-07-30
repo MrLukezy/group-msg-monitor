@@ -1,4 +1,5 @@
 use std::fs;
+use std::io::Write;
 use std::net::TcpStream;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
@@ -23,6 +24,35 @@ fn project_root() -> PathBuf {
     p.pop(); // desktop
     p.pop(); // project root
     p
+}
+
+fn current_github_repo() -> Result<String, String> {
+    let output = Command::new("git")
+        .args(["remote", "get-url", "origin"])
+        .current_dir(project_root())
+        .output()
+        .map_err(|e| format!("无法读取 Git origin: {e}"))?;
+    if !output.status.success() {
+        return Err("当前项目未配置 Git origin".into());
+    }
+    let remote = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let path = if let Some(rest) = remote.strip_prefix("git@github.com:") {
+        rest
+    } else if let Some(rest) = remote.strip_prefix("https://github.com/") {
+        rest
+    } else if let Some(rest) = remote.strip_prefix("http://github.com/") {
+        rest
+    } else {
+        return Err("当前 origin 不是 GitHub 仓库".into());
+    };
+    let repo = path.trim_end_matches(".git").trim_matches('/');
+    let mut parts = repo.split('/');
+    let owner = parts.next().unwrap_or("");
+    let name = parts.next().unwrap_or("");
+    if owner.is_empty() || name.is_empty() || parts.next().is_some() {
+        return Err("无法从 origin 解析 GitHub owner/repo".into());
+    }
+    Ok(format!("{owner}/{name}"))
 }
 
 fn napcat_dir() -> PathBuf {
@@ -53,6 +83,29 @@ fn read_webui_port() -> u16 {
         .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
         .and_then(|v| v.get("port").and_then(|p| p.as_u64()))
         .unwrap_or(6099) as u16
+}
+
+fn read_onebot_endpoint() -> (String, u16) {
+    let url = fs::read_to_string(project_root().join("data").join("app_settings.json"))
+        .ok()
+        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+        .and_then(|v| {
+            v.get("onebot_ws_url")
+                .and_then(Value::as_str)
+                .map(ToString::to_string)
+        })
+        .unwrap_or_else(|| "ws://127.0.0.1:3001".into());
+    let authority = url
+        .split_once("://")
+        .map(|(_, rest)| rest)
+        .unwrap_or(url.as_str())
+        .split('/')
+        .next()
+        .unwrap_or("127.0.0.1:3001");
+    let mut parts = authority.rsplitn(2, ':');
+    let port = parts.next().and_then(|p| p.parse().ok()).unwrap_or(3001);
+    let host = parts.next().unwrap_or("127.0.0.1").trim_matches(['[', ']']);
+    (host.to_string(), port)
 }
 
 fn read_webui_config() -> Result<(u16, String), String> {
@@ -197,6 +250,10 @@ fn monitor_lock_path() -> PathBuf {
     project_root().join("data").join("monitor.lock")
 }
 
+fn monitor_stop_path() -> PathBuf {
+    project_root().join("data").join("monitor.stop")
+}
+
 fn pid_alive(pid: u32) -> bool {
     if pid == 0 {
         return false;
@@ -286,16 +343,41 @@ struct StatusInfo {
     napcat_webui_up: bool,
     onebot_ws_up: bool,
     monitor_running: bool,
+    qq_mode: String,
+    official_qq_running: bool,
+    napcat_process_running: bool,
+    notification_access: String,
+    uia_ready: bool,
+}
+
+fn qq_mode_from_settings() -> String {
+    "onebot".into()
+}
+
+fn process_running(image_name: &str) -> bool {
+    let output = Command::new("tasklist")
+        .args(["/FI", &format!("IMAGENAME eq {image_name}")])
+        .output();
+    match output {
+        Ok(out) => String::from_utf8_lossy(&out.stdout).contains(image_name),
+        Err(_) => false,
+    }
 }
 
 #[tauri::command]
 fn get_status(state: tauri::State<'_, AppState>) -> StatusInfo {
+    let (onebot_host, onebot_port) = read_onebot_endpoint();
     StatusInfo {
         napcat_installed: napcat_dir().join("launcher-user.bat").exists()
             || napcat_dir().join("launcher.bat").exists(),
         napcat_webui_up: port_open("127.0.0.1", read_webui_port()),
-        onebot_ws_up: port_open("127.0.0.1", 3001),
+        onebot_ws_up: port_open(&onebot_host, onebot_port),
         monitor_running: monitor_service_running(&state),
+        qq_mode: "onebot".into(),
+        official_qq_running: false,
+        napcat_process_running: false,
+        notification_access: String::new(),
+        uia_ready: false,
     }
 }
 
@@ -319,6 +401,112 @@ fn start_napcat() -> Result<String, String> {
         .spawn()
         .map_err(|e| e.to_string())?;
     Ok("已请求启动 NapCat".into())
+}
+
+/// 按当前 QQ 模式打开窗口：
+/// - onebot：尝试唤起已有 QQ（多为 NapCat Shell 无界面进程，会给出明确提示）
+/// - passive：激活或启动系统安装的官方 QQ
+#[tauri::command]
+fn show_qq_window() -> Result<String, String> {
+    #[cfg(not(windows))]
+    {
+        return Err("当前平台不支持唤起 QQ 窗口".into());
+    }
+    #[cfg(windows)]
+    {
+        let mode = qq_mode_from_settings();
+        if mode == "passive" {
+            return start_or_show_official_qq();
+        }
+        let script = project_root().join("scripts").join("show_qq_window.ps1");
+        if !script.exists() {
+            return Err("未找到 scripts/show_qq_window.ps1".into());
+        }
+        let mut command = Command::new("powershell");
+        command
+            .args([
+                "-NoProfile",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+                &script.display().to_string(),
+            ])
+            .current_dir(project_root());
+        command.creation_flags(0x08000000);
+        let output = command
+            .output()
+            .map_err(|e| format!("唤起 QQ 窗口失败: {e}"))?;
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        if stdout.contains("activated") {
+            Ok("已找到 QQ 进程窗口。注意：NapCat Shell 模式没有可聊天界面，日常聊天请使用手机 QQ".into())
+        } else if stdout.contains("tray-only") {
+            Err("QQ 进程在跑但无可见主面板。NapCat Shell 本身不提供聊天界面，日常聊天请使用手机 QQ".into())
+        } else {
+            Err("未找到 QQ 窗口。请先启动 NapCat".into())
+        }
+    }
+}
+
+#[cfg(windows)]
+fn start_or_show_official_qq() -> Result<String, String> {
+    if process_running("NapCatWinBootMain.exe") {
+        return Err("检测到 NapCat 仍在运行。请先关闭 NapCat，再启动官方 QQ，避免重复登录".into());
+    }
+    let script = project_root().join("scripts").join("show_qq_window.ps1");
+    if script.exists() {
+        let mut command = Command::new("powershell");
+        command
+            .args([
+                "-NoProfile",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+                &script.display().to_string(),
+            ])
+            .current_dir(project_root());
+        command.creation_flags(0x08000000);
+        if let Ok(output) = command.output() {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            if stdout.contains("activated") {
+                return Ok("已唤起官方 QQ 窗口".into());
+            }
+            if stdout.contains("tray-only") {
+                return Err("官方 QQ 在托盘中，请点击系统托盘的 QQ 图标恢复主面板".into());
+            }
+        }
+    }
+    // 启动系统安装的官方 QQ
+    let mut command = Command::new("powershell");
+    command.args([
+        "-NoProfile",
+        "-Command",
+        r#"
+$p = $null
+$u = (Get-ItemProperty 'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\QQ' -ErrorAction SilentlyContinue).UninstallString
+if ($u) { $p = Join-Path (Split-Path $u) 'QQ.exe' }
+if (-not $p -or -not (Test-Path $p)) {
+  $cands = @(
+    "$env:ProgramFiles\Tencent\QQNT\QQ.exe",
+    "${env:ProgramFiles(x86)}\Tencent\QQNT\QQ.exe",
+    "$env:LOCALAPPDATA\Programs\Tencent\QQNT\QQ.exe"
+  )
+  $p = $cands | Where-Object { Test-Path $_ } | Select-Object -First 1
+}
+if (-not $p) { Write-Output 'missing'; exit 1 }
+Start-Process $p
+Write-Output "started:$p"
+"#,
+    ]);
+    command.creation_flags(0x08000000);
+    let output = command
+        .output()
+        .map_err(|e| format!("启动官方 QQ 失败: {e}"))?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    if stdout.contains("started:") {
+        Ok("已启动官方 QQ".into())
+    } else {
+        Err("未找到系统安装的官方 QQ，请先安装腾讯 QQ".into())
+    }
 }
 
 #[derive(Serialize)]
@@ -399,6 +587,7 @@ fn start_monitor(state: tauri::State<'_, AppState>) -> Result<String, String> {
     if monitor_service_running(&state) {
         return Err("检测到本机已有监听服务在运行（请先点「停止」，或结束多余的 python -m app.main）".into());
     }
+    let _ = fs::remove_file(monitor_stop_path());
     let root = project_root();
     let mut child = Command::new(python_exe())
         .arg("-m")
@@ -422,17 +611,39 @@ fn start_monitor(state: tauri::State<'_, AppState>) -> Result<String, String> {
 
 #[tauri::command]
 fn stop_monitor(state: tauri::State<'_, AppState>) -> Result<String, String> {
+    fs::write(monitor_stop_path(), b"stop")
+        .map_err(|e| format!("写入停止请求失败: {e}"))?;
     let mut guard = state.monitor_child.lock().map_err(|e| e.to_string())?;
     if let Some(mut child) = guard.take() {
+        for _ in 0..200 {
+            match child.try_wait() {
+                Ok(Some(_)) => {
+                    let _ = child.wait();
+                    let _ = fs::remove_file(monitor_stop_path());
+                    return Ok("监听服务已优雅停止，消息队列已排空".into());
+                }
+                Ok(None) => std::thread::sleep(Duration::from_millis(100)),
+                Err(_) => break,
+            }
+        }
         let _ = child.kill();
         let _ = child.wait();
-        Ok("监听服务已停止".into())
+        let _ = fs::remove_file(monitor_stop_path());
+        Ok("监听服务停止超时，已强制结束".into())
     } else if let Some(pid) = read_monitor_lock_pid().filter(|p| pid_alive(*p)) {
+        for _ in 0..80 {
+            std::thread::sleep(Duration::from_millis(250));
+            if !pid_alive(pid) {
+                let _ = fs::remove_file(monitor_stop_path());
+                return Ok(format!("外部监听服务已优雅停止 PID={pid}"));
+            }
+        }
         let status = Command::new("taskkill")
             .args(["/PID", &pid.to_string(), "/F"])
             .status()
             .map_err(|e| format!("结束监听进程失败: {e}"))?;
         if status.success() {
+            let _ = fs::remove_file(monitor_stop_path());
             Ok(format!("已结束外部监听进程 PID={pid}"))
         } else {
             Err(format!("结束外部监听进程失败 PID={pid}"))
@@ -450,7 +661,83 @@ fn api_list_groups(sort: String, q: String) -> Result<Value, String> {
 #[tauri::command]
 fn api_recent_messages(group_id: Option<String>, limit: i64) -> Result<Value, String> {
     // 热路径：Rust 直读 SQLite，避免每次轮询拉起 Python
-    recent_messages_from_db(group_id, limit)
+    recent_messages_from_db(group_id, limit, false)
+}
+
+#[tauri::command]
+fn api_recent_live_messages(group_id: Option<String>, limit: i64) -> Result<Value, String> {
+    // 实时面板使用独立滚动表，可覆盖未单独启用分析/持久化的群。
+    recent_messages_from_db(group_id, limit, true)
+}
+
+#[tauri::command]
+fn api_live_messages_since(group_id: String, after_id: i64, limit: i64) -> Result<Value, String> {
+    use rusqlite::Connection;
+
+    let path = messages_db_path();
+    if !path.exists() || group_id.is_empty() {
+        return Ok(serde_json::json!({"messages": [], "cursor": after_id.max(0)}));
+    }
+    let conn = Connection::open_with_flags(
+        &path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+            | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .map_err(|e| format!("打开 messages.db 失败: {e}"))?;
+    conn.busy_timeout(std::time::Duration::from_millis(250))
+        .map_err(|e| e.to_string())?;
+    if !table_exists(&conn, "live_messages")? {
+        return Ok(serde_json::json!({"messages": [], "cursor": after_id.max(0)}));
+    }
+    let lim = limit.clamp(1, 200);
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, group_id, COALESCE(user_id,''), COALESCE(sender_name,''),
+                    COALESCE(content,''), event_time, COALESCE(created_at,'')
+             FROM live_messages
+             WHERE group_id=? AND id>?
+             ORDER BY id ASC
+             LIMIT ?",
+        )
+        .map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map(rusqlite::params![group_id, after_id.max(0), lim], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
+                r.get::<_, String>(4)?,
+                r.get::<_, Option<i64>>(5)?,
+                r.get::<_, String>(6)?,
+            ))
+        })
+        .map_err(|e| e.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())?;
+    let cursor = rows
+        .iter()
+        .map(|r| r.0)
+        .max()
+        .unwrap_or_else(|| after_id.max(0));
+    let messages = rows
+        .into_iter()
+        .rev()
+        .map(|r| {
+            serde_json::json!({
+                "id": -r.0.abs(),
+                "groupId": r.1,
+                "groupName": "",
+                "userId": r.2,
+                "senderName": r.3,
+                "content": r.4,
+                "eventTime": r.5,
+                "createdAt": r.6,
+                "liveCursor": r.0,
+            })
+        })
+        .collect::<Vec<_>>();
+    Ok(serde_json::json!({"messages": messages, "cursor": cursor}))
 }
 
 fn messages_db_path() -> PathBuf {
@@ -484,7 +771,120 @@ fn blocked_group_ids_from_disk() -> std::collections::HashSet<String> {
     out
 }
 
-fn recent_messages_from_db(group_id: Option<String>, limit: i64) -> Result<Value, String> {
+fn table_exists(conn: &rusqlite::Connection, table: &str) -> Result<bool, String> {
+    conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?)",
+        [table],
+        |r| r.get(0),
+    )
+    .map_err(|e| e.to_string())
+}
+
+#[derive(Clone)]
+struct DbMessageRow {
+    id: i64,
+    group_id: String,
+    user_id: String,
+    sender_name: String,
+    content: String,
+    message_id: String,
+    event_time: Option<i64>,
+    created_at: String,
+    from_live: bool,
+}
+
+fn query_message_table(
+    conn: &rusqlite::Connection,
+    table: &str,
+    group_id: Option<&str>,
+    limit: i64,
+    from_live: bool,
+) -> Result<Vec<DbMessageRow>, String> {
+    if !table_exists(conn, table)? {
+        return Ok(vec![]);
+    }
+    let sql = if group_id.is_some() {
+        format!(
+            "SELECT id, group_id, COALESCE(user_id,''), COALESCE(sender_name,''),
+                    COALESCE(content,''), COALESCE(message_id,''), event_time,
+                    COALESCE(created_at,'')
+             FROM {table} WHERE group_id=? ORDER BY id DESC LIMIT ?"
+        )
+    } else {
+        format!(
+            "SELECT id, group_id, COALESCE(user_id,''), COALESCE(sender_name,''),
+                    COALESCE(content,''), COALESCE(message_id,''), event_time,
+                    COALESCE(created_at,'')
+             FROM {table} ORDER BY id DESC LIMIT ?"
+        )
+    };
+    let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
+    let map_row = |r: &rusqlite::Row<'_>| -> rusqlite::Result<DbMessageRow> {
+        Ok(DbMessageRow {
+            id: r.get(0)?,
+            group_id: r.get(1)?,
+            user_id: r.get(2)?,
+            sender_name: r.get(3)?,
+            content: r.get(4)?,
+            message_id: r.get(5)?,
+            event_time: r.get(6)?,
+            created_at: r.get(7)?,
+            from_live,
+        })
+    };
+    let rows = if let Some(gid) = group_id {
+        stmt.query_map(rusqlite::params![gid, limit], map_row)
+            .map_err(|e| e.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())?
+    } else {
+        stmt.query_map(rusqlite::params![limit], map_row)
+            .map_err(|e| e.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())?
+    };
+    Ok(rows)
+}
+
+fn merge_message_rows(mut rows: Vec<DbMessageRow>, limit: i64) -> Vec<DbMessageRow> {
+    // 先按时间/id 新到旧，再按 message_id（或内容指纹）去重
+    rows.sort_by(|a, b| {
+        let ta = a.event_time.unwrap_or(0);
+        let tb = b.event_time.unwrap_or(0);
+        tb.cmp(&ta)
+            .then_with(|| b.created_at.cmp(&a.created_at))
+            .then_with(|| b.id.cmp(&a.id))
+    });
+    let mut out = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for row in rows {
+        let key = if !row.message_id.is_empty() {
+            format!("mid:{}:{}", row.group_id, row.message_id)
+        } else {
+            format!(
+                "fp:{}:{}:{}:{}",
+                row.group_id,
+                row.sender_name,
+                row.event_time.unwrap_or(0),
+                row.content
+            )
+        };
+        if !seen.insert(key) {
+            continue;
+        }
+        out.push(row);
+        if out.len() as i64 >= limit {
+            break;
+        }
+    }
+    out
+}
+
+fn recent_messages_from_db(
+    group_id: Option<String>,
+    limit: i64,
+    live: bool,
+) -> Result<Value, String> {
     use rusqlite::Connection;
 
     let path = messages_db_path();
@@ -495,106 +895,76 @@ fn recent_messages_from_db(group_id: Option<String>, limit: i64) -> Result<Value
     let blocked = blocked_group_ids_from_disk();
     let conn = Connection::open(&path).map_err(|e| format!("打开 messages.db 失败: {e}"))?;
 
-    let mut rows_out: Vec<Value> = Vec::new();
-
-    let mut push_row = |id: i64,
-                        group_id: String,
-                        user_id: String,
-                        sender_name: String,
-                        content: String,
-                        event_time: Option<i64>,
-                        created_at: String| {
-        rows_out.push(serde_json::json!({
-            "id": id,
-            "groupId": group_id,
-            "groupName": "",
-            "userId": user_id,
-            "senderName": sender_name,
-            "content": content,
-            "eventTime": event_time,
-            "createdAt": created_at,
-        }));
-    };
-
-    if let Some(gid) = group_id.filter(|s| !s.is_empty()) {
-        if blocked.contains(&gid) {
+    let gid = group_id.filter(|s| !s.is_empty());
+    if let Some(ref id) = gid {
+        if blocked.contains(id) {
             return Ok(Value::Array(vec![]));
         }
-        let mut stmt = conn
-            .prepare(
-                "SELECT id, group_id, COALESCE(user_id,''), COALESCE(sender_name,''),
-                        COALESCE(content,''), event_time, COALESCE(created_at,'')
-                 FROM messages WHERE group_id=? ORDER BY id DESC LIMIT ?",
-            )
-            .map_err(|e| e.to_string())?;
-        let rows = stmt
-            .query_map(rusqlite::params![gid, lim], |r| {
-                Ok((
-                    r.get::<_, i64>(0)?,
-                    r.get::<_, String>(1)?,
-                    r.get::<_, String>(2)?,
-                    r.get::<_, String>(3)?,
-                    r.get::<_, String>(4)?,
-                    r.get::<_, Option<i64>>(5)?,
-                    r.get::<_, String>(6)?,
-                ))
-            })
-            .map_err(|e| e.to_string())?;
-        for row in rows {
-            let (id, group_id, user_id, sender_name, content, event_time, created_at) =
-                row.map_err(|e| e.to_string())?;
-            push_row(
-                id,
-                group_id,
-                user_id,
-                sender_name,
-                content,
-                event_time,
-                created_at,
-            );
-        }
+    }
+
+    let fetch_lim = if live {
+        (lim.saturating_mul(3)).clamp(lim, 500)
+    } else if gid.is_none() {
+        (lim.saturating_mul(5)).clamp(lim, 500)
     } else {
-        let fetch_lim = (lim.saturating_mul(5)).clamp(lim, 500);
-        let mut stmt = conn
-            .prepare(
-                "SELECT id, group_id, COALESCE(user_id,''), COALESCE(sender_name,''),
-                        COALESCE(content,''), event_time, COALESCE(created_at,'')
-                 FROM messages ORDER BY id DESC LIMIT ?",
-            )
-            .map_err(|e| e.to_string())?;
-        let rows = stmt
-            .query_map(rusqlite::params![fetch_lim], |r| {
-                Ok((
-                    r.get::<_, i64>(0)?,
-                    r.get::<_, String>(1)?,
-                    r.get::<_, String>(2)?,
-                    r.get::<_, String>(3)?,
-                    r.get::<_, String>(4)?,
-                    r.get::<_, Option<i64>>(5)?,
-                    r.get::<_, String>(6)?,
-                ))
-            })
-            .map_err(|e| e.to_string())?;
-        for row in rows {
-            let (id, group_id, user_id, sender_name, content, event_time, created_at) =
-                row.map_err(|e| e.to_string())?;
-            if blocked.contains(&group_id) {
-                continue;
-            }
-            push_row(
-                id,
-                group_id,
-                user_id,
-                sender_name,
-                content,
-                event_time,
-                created_at,
-            );
-        }
-        if rows_out.len() as i64 > lim {
-            rows_out.truncate(lim as usize);
+        lim
+    };
+
+    let mut rows = if live {
+        // 实时面板：合并滚动表 + 持久化消息，避免历史/补拉只落 messages 时右侧空白
+        let mut merged = query_message_table(
+            &conn,
+            "live_messages",
+            gid.as_deref(),
+            fetch_lim,
+            true,
+        )?;
+        merged.extend(query_message_table(
+            &conn,
+            "messages",
+            gid.as_deref(),
+            fetch_lim,
+            false,
+        )?);
+        merge_message_rows(merged, lim)
+    } else {
+        query_message_table(&conn, "messages", gid.as_deref(), fetch_lim, false)?
+    };
+
+    if gid.is_none() {
+        rows.retain(|r| !blocked.contains(&r.group_id));
+        if rows.len() as i64 > lim {
+            rows.truncate(lim as usize);
         }
     }
+
+    let rows_out: Vec<Value> = rows
+        .into_iter()
+        .map(|r| {
+            // live 表与 messages 表 id 可能冲突；给 live 行加偏移，保证前端指纹稳定
+            let live_cursor = if r.from_live {
+                Value::from(r.id)
+            } else {
+                Value::Null
+            };
+            let id = if r.from_live {
+                -(r.id.abs())
+            } else {
+                r.id
+            };
+            serde_json::json!({
+                "id": id,
+                "groupId": r.group_id,
+                "groupName": "",
+                "userId": r.user_id,
+                "senderName": r.sender_name,
+                "content": r.content,
+                "eventTime": r.event_time,
+                "createdAt": r.created_at,
+                "liveCursor": live_cursor,
+            })
+        })
+        .collect();
     Ok(Value::Array(rows_out))
 }
 
@@ -798,6 +1168,88 @@ fn api_report_favorite_messages(report_id: i64) -> Result<Value, String> {
 }
 
 #[tauri::command]
+fn api_github_issue_preview(report_id: i64) -> Result<Value, String> {
+    let rid = report_id.to_string();
+    let mut preview = py_api_json(&["github-issue-preview", "--report-id", &rid])?;
+    let repo = current_github_repo()?;
+    if let Some(obj) = preview.as_object_mut() {
+        obj.insert("repo".into(), Value::String(repo));
+    }
+    Ok(preview)
+}
+
+#[tauri::command]
+fn api_report_github_issue(report_id: i64) -> Result<Value, String> {
+    let rid = report_id.to_string();
+    let preview = py_api_json(&["github-issue-preview", "--report-id", &rid])?;
+    if let Some(url) = preview
+        .get("issueUrl")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+    {
+        return Ok(serde_json::json!({"ok": true, "issueUrl": url, "existing": true}));
+    }
+    let repo = current_github_repo()?;
+    let title = preview
+        .get("title")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "Issue 标题缺失".to_string())?;
+    let body = preview
+        .get("body")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "Issue 正文缺失".to_string())?;
+
+    let mut child = Command::new("gh")
+        .args([
+            "issue",
+            "create",
+            "--repo",
+            &repo,
+            "--title",
+            title,
+            "--body-file",
+            "-",
+        ])
+        .current_dir(project_root())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("无法启动 gh，请确认 GitHub CLI 已安装: {e}"))?;
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin
+            .write_all(body.as_bytes())
+            .map_err(|e| format!("写入 Issue 正文失败: {e}"))?;
+    }
+    let output = child
+        .wait_with_output()
+        .map_err(|e| format!("等待 gh 失败: {e}"))?;
+    if !output.status.success() {
+        let err = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("创建 GitHub Issue 失败: {}", err.trim()));
+    }
+    let issue_url = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .find(|line| line.trim().starts_with("https://github.com/"))
+        .map(str::trim)
+        .ok_or_else(|| "gh 未返回 Issue URL".to_string())?
+        .to_string();
+    py_api_json(&[
+        "set-report-issue",
+        "--report-id",
+        &rid,
+        "--issue-url",
+        &issue_url,
+    ])?;
+    Ok(serde_json::json!({
+        "ok": true,
+        "repo": repo,
+        "issueUrl": issue_url,
+        "existing": false
+    }))
+}
+
+#[tauri::command]
 fn api_token_stats(group_id: Option<String>) -> Result<Value, String> {
     let v = if let Some(gid) = group_id.filter(|s| !s.is_empty()) {
         py_api_json(&["token-stats", "--group-id", &gid])?
@@ -840,6 +1292,15 @@ fn settings_to_camel(v: Value) -> Value {
                 "bound": qq_o.remove("bound").unwrap_or(Value::Bool(false)),
                 "label": qq_o.remove("label").unwrap_or(Value::String(String::new())),
                 "lastError": qq_o.remove("last_error").unwrap_or(Value::String(String::new())),
+                "mode": qq_o.remove("mode").unwrap_or(Value::String("onebot".into())),
+                "notificationAccess": qq_o
+                    .remove("notification_access")
+                    .unwrap_or(Value::String(String::new())),
+                "uiaReady": qq_o.remove("uia_ready").unwrap_or(Value::Bool(false)),
+                "pollSeconds": qq_o.remove("poll_seconds").unwrap_or(Value::from(1.5)),
+                "groupNameMap": qq_o
+                    .remove("group_name_map")
+                    .unwrap_or(Value::Object(Default::default())),
             },
             "wechat": {
                 "bound": wx_o.remove("bound").unwrap_or(Value::Bool(false)),
@@ -884,6 +1345,11 @@ fn settings_to_camel(v: Value) -> Value {
         "llm".into(),
         serde_json::json!({
             "activeProviderId": llm_obj.remove("active_provider_id").unwrap_or(Value::String(String::new())),
+            "defaultImageModel": llm_obj.remove("default_image_model").unwrap_or(Value::String(String::new())),
+            "defaultPrompt": llm_obj.remove("default_prompt").unwrap_or(Value::String(String::new())),
+            "defaultEveryMinutes": llm_obj.remove("default_every_minutes").unwrap_or(Value::Number(60.into())),
+            "defaultWindowMinutes": llm_obj.remove("default_window_minutes").unwrap_or(Value::Number(60.into())),
+            "defaultMinMessages": llm_obj.remove("default_min_messages").unwrap_or(Value::Number(8.into())),
             "reportKeepLimit": llm_obj.remove("report_keep_limit").unwrap_or(Value::Number(100.into())),
             "providers": providers,
         }),
@@ -893,9 +1359,6 @@ fn settings_to_camel(v: Value) -> Value {
     out.insert(
         "ui".into(),
         serde_json::json!({
-            "compactModeEnabled": ui_obj
-                .remove("compact_mode_enabled")
-                .unwrap_or(Value::Bool(false)),
             "theme": ui_obj
                 .remove("theme")
                 .unwrap_or(Value::String("midnight".into())),
@@ -934,6 +1397,10 @@ fn group_to_camel(v: Value) -> Value {
         },
         "llmMonitor": {
             "enabled": lo.get("enabled").cloned().unwrap_or(Value::Bool(false)),
+            "useGlobalDefaults": lo
+                .get("use_global_defaults")
+                .cloned()
+                .unwrap_or(Value::Bool(true)),
             "textEnabled": lo.get("text_enabled").cloned().unwrap_or(Value::Bool(true)),
             "providerId": lo.get("provider_id").cloned().unwrap_or(Value::String(String::new())),
             "model": lo.get("model").cloned().unwrap_or(Value::String(String::new())),
@@ -1006,6 +1473,19 @@ fn api_test_onebot() -> Result<Value, String> {
 fn api_bind_qq(payload: Value) -> Result<Value, String> {
     let raw = payload.to_string();
     let v = py_api_json(&["bind-qq", "--json", &raw])?;
+    Ok(channels_result_to_camel(v))
+}
+
+#[tauri::command]
+fn api_detect_qq_passive() -> Result<Value, String> {
+    let v = py_api_json(&["detect-qq-passive"])?;
+    Ok(channels_result_to_camel(v))
+}
+
+#[tauri::command]
+fn api_set_qq_group_map(payload: Value) -> Result<Value, String> {
+    let raw = payload.to_string();
+    let v = py_api_json(&["set-qq-group-map", "--json", &raw])?;
     Ok(channels_result_to_camel(v))
 }
 
@@ -1115,10 +1595,6 @@ fn pull_onebot_groups() -> Result<String, String> {
         .get("onebot_access_token")
         .and_then(|x| x.as_str())
         .unwrap_or("");
-    if !port_open("127.0.0.1", 3001) {
-        return Err("OneBot WS 未启动".into());
-    }
-
     // Prefer Python pull via list_groups.py --json then cache
     let output = Command::new(python_exe())
         .arg(project_root().join("scripts").join("list_groups.py"))
@@ -1144,8 +1620,19 @@ fn pull_onebot_groups() -> Result<String, String> {
         .ok_or_else(|| "未返回群列表 JSON".to_string())?;
     // list_groups --json returns login+groups; wrap for cache
     let parsed: Value = serde_json::from_str(line).map_err(|e| e.to_string())?;
+    let status = parsed.get("status").and_then(Value::as_str).unwrap_or("");
+    let retcode = parsed.get("retcode").and_then(Value::as_i64).unwrap_or(-1);
+    if status != "ok" || retcode != 0 {
+        return Err(format!(
+            "OneBot get_group_list 失败: status={status}, retcode={retcode}"
+        ));
+    }
+    let groups = parsed
+        .get("groups")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "OneBot 群列表格式错误".to_string())?;
     let cache = serde_json::json!({
-        "groups": parsed.get("groups").cloned().unwrap_or(Value::Array(vec![])),
+        "groups": groups,
         "login": parsed.get("login").cloned().unwrap_or(Value::Null),
     });
     let raw = cache.to_string();
@@ -1155,8 +1642,40 @@ fn pull_onebot_groups() -> Result<String, String> {
         .and_then(|x| x.as_array())
         .map(|a| a.len())
         .unwrap_or(0);
+    let group_ids = groups
+        .iter()
+        .filter_map(|g| {
+            g.get("group_id").and_then(|v| {
+                v.as_str()
+                    .map(ToString::to_string)
+                    .or_else(|| v.as_i64().map(|n| n.to_string()))
+                    .or_else(|| v.as_u64().map(|n| n.to_string()))
+            })
+        })
+        .collect::<Vec<_>>();
+    let recent_raw = serde_json::json!({"groupIds": group_ids}).to_string();
+    let count = "10".to_string();
+    let recent = py_api_json(&[
+        "sync-group-recents",
+        "--json",
+        &recent_raw,
+        "--count",
+        &count,
+    ]);
     let _ = build_onebot_ws_url(ws, token);
-    Ok(format!("已从 OneBot 拉取 {n} 个群"))
+    match recent {
+        Ok(stats) => {
+            let succeeded = stats.get("succeeded").and_then(Value::as_u64).unwrap_or(0);
+            let failed = stats.get("failed").and_then(Value::as_u64).unwrap_or(0);
+            let fetched = stats.get("fetched").and_then(Value::as_u64).unwrap_or(0);
+            Ok(format!(
+                "已从 OneBot 拉取 {n} 个群；近期消息同步成功 {succeeded} 群、失败 {failed} 群，共 {fetched} 条"
+            ))
+        }
+        Err(err) => Ok(format!(
+            "已从 OneBot 拉取 {n} 个群；近期消息时间同步失败：{err}"
+        )),
+    }
 }
 
 #[derive(Serialize)]
@@ -1291,12 +1810,15 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             get_status,
             start_napcat,
+            show_qq_window,
             get_napcat_login_status,
             refresh_napcat_login_qr,
             start_monitor,
             stop_monitor,
             api_list_groups,
             api_recent_messages,
+            api_recent_live_messages,
+            api_live_messages_since,
             api_messages_in_window,
             api_get_settings,
             api_save_settings,
@@ -1307,11 +1829,15 @@ pub fn run() {
             api_list_reports,
             api_set_report_favorite,
             api_report_favorite_messages,
+            api_github_issue_preview,
+            api_report_github_issue,
             api_token_stats,
             api_fetch_models,
             api_test_provider,
             api_test_onebot,
             api_bind_qq,
+            api_detect_qq_passive,
+            api_set_qq_group_map,
             api_bind_telegram,
             api_bind_wechat,
             api_unbind_channel,
