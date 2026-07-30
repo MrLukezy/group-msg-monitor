@@ -5,13 +5,15 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import sqlite3
+from contextlib import closing
 from typing import Any
 
 import websockets
 
 from app.handlers.store_handler import StoreHandler
 from app.llm.service import sqlite_path
-from app.models import try_parse_group_message
+from app.models import GroupMessageEvent, try_parse_group_message
 from app.onebot_client import build_ws_url
 from app.settings_store import load_app_settings
 
@@ -74,9 +76,12 @@ async def _store_messages(
     store: StoreHandler,
     group_id: str,
     messages: list[dict[str, Any]],
+    *,
+    materialize_images: bool = True,
 ) -> tuple[int, int]:
     inserted = 0
     skipped = 0
+    parsed: list[GroupMessageEvent] = []
     for raw in messages:
         event_raw = dict(raw)
         event_raw.setdefault("post_type", "message")
@@ -86,11 +91,19 @@ async def _store_messages(
         if event is None:
             skipped += 1
             continue
-        changed = await store.handle_upsert(event)
+        if not materialize_images:
+            parsed.append(event)
+            continue
+        changed = await store.handle_upsert(
+            event, materialize_images=materialize_images
+        )
         if changed:
             inserted += 1
         else:
             skipped += 1
+    if parsed:
+        inserted = await store.handle_many_upsert_raw(parsed)
+        skipped += len(parsed) - inserted
     return inserted, skipped
 
 
@@ -201,7 +214,7 @@ async def pull_enabled_groups_history(count: int = 200) -> dict[str, Any]:
 
     results = []
     for cfg in list_group_configs():
-        if cfg.blocked or not cfg.enabled:
+        if not cfg.enabled:
             continue
         if (cfg.channel or channel_of_group_id(cfg.group_id)) != "qq":
             continue
@@ -211,3 +224,106 @@ async def pull_enabled_groups_history(count: int = 200) -> dict[str, Any]:
             logger.exception("启动补拉历史失败 group=%s", cfg.group_id)
             results.append({"ok": False, "groupId": cfg.group_id, "error": str(e)})
     return {"ok": True, "results": results}
+
+
+async def pull_groups_recent_history(
+    group_ids: list[str], count: int = 10
+) -> dict[str, Any]:
+    """为群列表同步短期消息；未启用群只记录最近消息时间。"""
+    from app.settings_store import list_group_configs
+
+    ids = list(dict.fromkeys(str(x).strip() for x in group_ids if str(x).strip()))
+    if not ids:
+        return {"ok": True, "groups": 0, "succeeded": 0, "failed": 0, "fetched": 0}
+    settings = load_app_settings()
+    if not settings.channels.qq.bound:
+        raise RuntimeError("QQ 通道未绑定")
+    enabled = {
+        c.group_id
+        for c in list_group_configs()
+        if c.enabled and c.basic.storage_enabled
+    }
+    ws_url = build_ws_url(settings.onebot_ws_url, settings.onebot_access_token)
+    per_group = max(1, min(int(count or 10), 20))
+    store = StoreHandler(sqlite_path())
+    activity_updates: list[tuple[str, int]] = []
+    results: list[dict[str, Any]] = []
+    fetched_total = 0
+
+    async with websockets.connect(
+        ws_url,
+        open_timeout=8,
+        max_size=50 * 1024 * 1024,
+    ) as ws:
+        for index, group_id in enumerate(ids, 1):
+            gid_param: Any = int(group_id) if group_id.isdigit() else group_id
+            try:
+                resp = await _call(
+                    ws,
+                    "get_group_msg_history",
+                    {"group_id": gid_param, "count": per_group},
+                    f"recent-{index}-{group_id}",
+                    timeout=15,
+                )
+                if resp.get("status") != "ok" and resp.get("retcode") not in (0, None):
+                    raise RuntimeError(
+                        f"status={resp.get('status')} retcode={resp.get('retcode')}"
+                    )
+                messages = _extract_messages(resp)
+                fetched_total += len(messages)
+                latest_ts = 0
+                for raw in messages:
+                    try:
+                        latest_ts = max(latest_ts, int(raw.get("time") or 0))
+                    except Exception:
+                        pass
+                if latest_ts:
+                    activity_updates.append((group_id, latest_ts))
+                inserted = 0
+                if group_id in enabled and messages:
+                    inserted, _ = await _store_messages(
+                        store,
+                        group_id,
+                        messages,
+                        materialize_images=False,
+                    )
+                results.append(
+                    {
+                        "groupId": group_id,
+                        "ok": True,
+                        "fetched": len(messages),
+                        "inserted": inserted,
+                        "lastTime": latest_ts,
+                    }
+                )
+            except Exception as exc:
+                logger.warning("同步群近期消息失败 group=%s error=%s", group_id, exc)
+                results.append({"groupId": group_id, "ok": False, "error": str(exc)})
+            await asyncio.sleep(0.02)
+
+    if activity_updates:
+        with closing(sqlite3.connect(sqlite_path(), timeout=5)) as conn, conn:
+            conn.execute("PRAGMA busy_timeout=5000")
+            conn.executemany(
+                """
+                INSERT INTO group_activity
+                    (group_id, last_event_time, last_received_at, received_count)
+                VALUES (?, ?, ?, 0)
+                ON CONFLICT(group_id) DO UPDATE SET
+                    last_event_time=MAX(
+                        COALESCE(group_activity.last_event_time, 0),
+                        COALESCE(excluded.last_event_time, 0)
+                    )
+                """,
+                [(gid, ts, ts) for gid, ts in activity_updates],
+            )
+
+    succeeded = sum(1 for r in results if r.get("ok"))
+    return {
+        "ok": succeeded == len(results),
+        "groups": len(ids),
+        "succeeded": succeeded,
+        "failed": len(results) - succeeded,
+        "fetched": fetched_total,
+        "results": results,
+    }

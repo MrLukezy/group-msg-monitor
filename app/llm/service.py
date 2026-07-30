@@ -7,6 +7,7 @@ import logging
 import re
 import sqlite3
 import time
+import traceback
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -19,12 +20,14 @@ from app.media_store import (
     read_local_image_b64,
 )
 from app.settings_store import (
+    DEFAULT_LLM_MONITOR_PROMPT,
     ROOT_DIR,
     GroupConfig,
     clamp_report_keep_limit,
     load_app_settings,
     load_group_config,
     provider_by_id,
+    resolve_llm_timing,
 )
 
 logger = logging.getLogger(__name__)
@@ -175,6 +178,7 @@ def ensure_llm_tables(db: Path) -> None:
             ON llm_reports(group_id, window_start DESC);
             """
         )
+        _ensure_job_error_columns(conn)
         _ensure_report_token_columns(conn)
         _ensure_report_favorite_columns(conn)
 
@@ -233,6 +237,202 @@ def _ensure_report_favorite_columns(conn: sqlite3.Connection) -> None:
         conn.execute(
             "ALTER TABLE llm_reports ADD COLUMN favorite_messages_json TEXT"
         )
+    if "github_issue_url" not in cols:
+        conn.execute("ALTER TABLE llm_reports ADD COLUMN github_issue_url TEXT")
+
+
+def _ensure_job_error_columns(conn: sqlite3.Connection) -> None:
+    cols = {str(r[1]) for r in conn.execute("PRAGMA table_info(llm_jobs)").fetchall()}
+    definitions = {
+        "error_stage": "TEXT",
+        "error_type": "TEXT",
+        "error_summary": "TEXT",
+        "error_detail": "TEXT",
+        "log_excerpt": "TEXT",
+    }
+    for name, sql_type in definitions.items():
+        if name not in cols:
+            conn.execute(f"ALTER TABLE llm_jobs ADD COLUMN {name} {sql_type}")
+
+
+def redact_sensitive_text(value: Any, max_chars: int = 8192) -> str:
+    """清理可上屏/上报的错误文本，禁止带出凭据、签名 URL 和聊天原文。"""
+    text = str(value or "")
+    text = re.sub(
+        r"(?i)\b(authorization|api[_-]?key|access[_-]?token|token|cookie|secret)"
+        r"\s*[:=]\s*([^\s,;]+)",
+        r"\1=[已脱敏]",
+        text,
+    )
+    text = re.sub(r"(?i)\bBearer\s+[A-Za-z0-9._~+/=-]+", "Bearer [已脱敏]", text)
+
+    def _strip_query(match: re.Match[str]) -> str:
+        url = match.group(0)
+        base = url.split("?", 1)[0]
+        return f"{base}?[查询参数已脱敏]" if "?" in url else base
+
+    text = re.sub(r"https?://[^\s<>'\"\]]+", _strip_query, text)
+    text = re.sub(r"(?is)\[CQ:image,[^\]]+\]", "[CQ:image,已脱敏]", text)
+    text = text.replace("\x00", "")
+    return text[: max(0, int(max_chars))]
+
+
+def _failure_summary(exc: BaseException) -> str:
+    raw = str(exc).strip()
+    if not raw:
+        raw = exc.__class__.__name__
+    return redact_sensitive_text(raw, 512)
+
+
+def record_llm_failure(
+    group_id: str,
+    *,
+    job_type: str,
+    exc: BaseException,
+    stage: str,
+    model: str = "",
+    window_start: int = 0,
+    window_end: int = 0,
+    job_id: int | None = None,
+    log_excerpt: str = "",
+) -> dict[str, Any]:
+    """把任意阶段异常持久化为失败 job + 可展示的失败主题。"""
+    db = sqlite_path()
+    ensure_llm_tables(db)
+    now = int(time.time())
+    end = int(window_end or now)
+    start = int(window_start or end)
+    error_type = exc.__class__.__name__
+    summary = _failure_summary(exc)
+    detail_raw = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+    detail = redact_sensitive_text(detail_raw or summary, 4096)
+    logs = redact_sensitive_text(log_excerpt or detail_raw or summary, 8192)
+    log_lines = logs.splitlines()[-50:]
+    logs = "\n".join(log_lines)
+    headline = f"[分析失败] {summary[:96]}"
+    payload = {
+        "failed": True,
+        "headline": headline,
+        "topics": ["LLM 分析错误"],
+        "key_points": [f"失败阶段：{stage}", f"错误类型：{error_type}"],
+        "risks": [],
+        "action_items": ["检查错误详情与诊断日志后重试；必要时上报 GitHub Issue。"],
+        "sentiment": "error",
+        "error": {
+            "stage": stage,
+            "type": error_type,
+            "summary": summary,
+            "detail": detail,
+            "log_excerpt": logs,
+        },
+        "period": {
+            "start": start,
+            "end": end,
+            "msg_count": 0,
+            "source": "LLM 错误记录",
+        },
+    }
+    md = (
+        f"# {headline}\n\n"
+        f"- 失败阶段：{stage}\n"
+        f"- 错误类型：{error_type}\n"
+        f"- 模型：{redact_sensitive_text(model, 200) or '记录不足'}\n"
+        f"- 错误摘要：{summary}\n\n"
+        "## 错误详情\n"
+        f"```text\n{detail}\n```\n\n"
+        "## 诊断日志（已脱敏）\n"
+        f"```text\n{logs}\n```\n\n"
+        "## 建议操作\n"
+        "- 检查 Provider、模型、网络和上下文长度后重试。\n"
+        "- 若问题持续，可使用右上角“上报 Issue”。\n"
+    )
+
+    with sqlite3.connect(db) as conn:
+        if job_id is None:
+            recent = conn.execute(
+                """
+                SELECT id FROM llm_jobs
+                WHERE group_id=? AND status='failed'
+                  AND COALESCE(error_summary, error, '')=?
+                  AND created_at >= datetime('now','-30 seconds')
+                ORDER BY id DESC LIMIT 1
+                """,
+                (str(group_id), summary),
+            ).fetchone()
+            if recent:
+                job_id = int(recent[0])
+            else:
+                cur = conn.execute(
+                    """
+                    INSERT INTO llm_jobs(
+                      job_type, group_id, window_start, window_end, status, error, model,
+                      error_stage, error_type, error_summary, error_detail, log_excerpt,
+                      finished_at
+                    ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,datetime('now','localtime'))
+                    """,
+                    (
+                        job_type,
+                        str(group_id),
+                        start,
+                        end,
+                        "failed",
+                        summary,
+                        model,
+                        stage,
+                        error_type,
+                        summary,
+                        detail,
+                        logs,
+                    ),
+                )
+                job_id = int(cur.lastrowid)
+        else:
+            conn.execute(
+                """
+                UPDATE llm_jobs
+                SET status='failed', error=?, error_stage=?, error_type=?,
+                    error_summary=?, error_detail=?, log_excerpt=?,
+                    finished_at=datetime('now','localtime')
+                WHERE id=?
+                """,
+                (summary, stage, error_type, summary, detail, logs, int(job_id)),
+            )
+
+        existing = conn.execute(
+            "SELECT id FROM llm_reports WHERE job_id=? ORDER BY id DESC LIMIT 1",
+            (int(job_id),),
+        ).fetchone()
+        if existing:
+            report_id = int(existing[0])
+        else:
+            cur = conn.execute(
+                """
+                INSERT INTO llm_reports(
+                  job_id, group_id, window_start, window_end, headline, sentiment,
+                  report_json, report_md, risk_max, msg_count
+                ) VALUES(?,?,?,?,?,?,?,?,?,?)
+                """,
+                (
+                    int(job_id),
+                    str(group_id),
+                    start,
+                    end,
+                    headline,
+                    "error",
+                    json.dumps(payload, ensure_ascii=False),
+                    md,
+                    "high",
+                    0,
+                ),
+            )
+            report_id = int(cur.lastrowid)
+    prune_old_llm_reports()
+    return {
+        "job_id": int(job_id),
+        "report_id": report_id,
+        "headline": headline,
+        "error_summary": summary,
+    }
 
 
 def fetch_messages_in_window(
@@ -387,6 +587,154 @@ def get_report_favorite_messages(report_id: int) -> list[dict[str, Any]]:
             limit=800,
         )
     ]
+
+
+def build_github_issue_preview(report_id: int) -> dict[str, Any]:
+    """从失败报告生成安全 Issue；绝不包含聊天原文。"""
+    db = sqlite_path()
+    ensure_llm_tables(db)
+    with sqlite3.connect(db) as conn:
+        conn.row_factory = sqlite3.Row
+        row = conn.execute(
+            """
+            SELECT r.id, r.job_id, r.headline, r.created_at, r.report_json,
+                   r.github_issue_url, j.group_id, j.job_type, j.model,
+                   j.error_stage, j.error_type, j.error_summary,
+                   j.error_detail, j.log_excerpt
+            FROM llm_reports r
+            LEFT JOIN llm_jobs j ON j.id=r.job_id
+            WHERE r.id=?
+            """,
+            (int(report_id),),
+        ).fetchone()
+    if not row:
+        raise ValueError(f"报告不存在: {report_id}")
+    try:
+        payload = json.loads(row["report_json"] or "{}")
+    except Exception:
+        payload = {}
+    if not payload.get("failed"):
+        raise ValueError("仅失败主题可以上报 Issue")
+
+    summary = redact_sensitive_text(
+        row["error_summary"] or (payload.get("error") or {}).get("summary") or row["headline"],
+        512,
+    )
+    detail = redact_sensitive_text(
+        row["error_detail"] or (payload.get("error") or {}).get("detail") or summary,
+        4096,
+    )
+    logs = redact_sensitive_text(
+        row["log_excerpt"] or (payload.get("error") or {}).get("log_excerpt") or "",
+        8192,
+    )
+    stage = redact_sensitive_text(row["error_stage"] or "unknown", 100)
+    error_type = redact_sensitive_text(row["error_type"] or "Error", 100)
+    model = redact_sensitive_text(row["model"] or "记录不足", 200)
+    title = f"[LLM 分析失败] {summary[:90]}"
+    body = (
+        "## 问题摘要\n"
+        f"{summary}\n\n"
+        "## 运行信息\n"
+        f"- Report ID: {int(row['id'])}\n"
+        f"- Job ID: {int(row['job_id'] or 0)}\n"
+        f"- Job 类型: {redact_sensitive_text(row['job_type'] or 'unknown', 50)}\n"
+        f"- 失败阶段: {stage}\n"
+        f"- 错误类型: {error_type}\n"
+        f"- 模型: {model}\n"
+        f"- 时间: {redact_sensitive_text(row['created_at'] or '', 100)}\n\n"
+        "## 错误详情（已脱敏）\n"
+        f"```text\n{detail}\n```\n\n"
+        "## 诊断日志（已脱敏）\n"
+        f"```text\n{logs or '记录不足'}\n```\n\n"
+        "## 隐私说明\n"
+        "本 Issue 由桌面端自动生成，不包含群聊原文、用户消息或访问凭据。\n"
+    )
+    return {
+        "reportId": int(row["id"]),
+        "title": title,
+        "body": body,
+        "issueUrl": row["github_issue_url"] or "",
+    }
+
+
+def set_report_github_issue_url(report_id: int, issue_url: str) -> dict[str, Any]:
+    url = str(issue_url or "").strip()
+    if not re.fullmatch(r"https://github\.com/[^/\s]+/[^/\s]+/issues/\d+", url):
+        raise ValueError("GitHub Issue URL 格式无效")
+    db = sqlite_path()
+    ensure_llm_tables(db)
+    with sqlite3.connect(db) as conn:
+        cur = conn.execute(
+            "UPDATE llm_reports SET github_issue_url=? WHERE id=?",
+            (url, int(report_id)),
+        )
+        if cur.rowcount <= 0:
+            raise ValueError(f"报告不存在: {report_id}")
+    return {"ok": True, "reportId": int(report_id), "issueUrl": url}
+
+
+def recover_stale_llm_jobs(max_age_minutes: int = 30) -> int:
+    """把异常退出后遗留的 running 任务转换为可见失败主题。"""
+    db = sqlite_path()
+    ensure_llm_tables(db)
+    with sqlite3.connect(db) as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            """
+            SELECT id, group_id, job_type, model, window_start, window_end
+            FROM llm_jobs
+            WHERE status='running'
+              AND created_at < datetime('now', ?)
+            ORDER BY id
+            """,
+            (f"-{max(1, int(max_age_minutes))} minutes",),
+        ).fetchall()
+    for row in rows:
+        record_llm_failure(
+            str(row["group_id"]),
+            job_type=str(row["job_type"] or "unknown"),
+            exc=RuntimeError("LLM worker 异常退出或执行超时"),
+            stage="interrupted",
+            model=str(row["model"] or ""),
+            window_start=int(row["window_start"] or 0),
+            window_end=int(row["window_end"] or 0),
+            job_id=int(row["id"]),
+            log_excerpt="任务长时间停留在 running，未检测到正常完成记录。",
+        )
+    return len(rows)
+
+
+def backfill_failed_llm_job_reports() -> int:
+    """将旧版本只写入 llm_jobs 的失败记录补成可见主题。"""
+    db = sqlite_path()
+    ensure_llm_tables(db)
+    with sqlite3.connect(db) as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            """
+            SELECT j.id, j.group_id, j.job_type, j.model, j.window_start,
+                   j.window_end, j.error, j.error_stage
+            FROM llm_jobs j
+            LEFT JOIN llm_reports r ON r.job_id=j.id
+            WHERE j.status='failed' AND r.id IS NULL
+            ORDER BY j.id
+            """
+        ).fetchall()
+    for row in rows:
+        message = str(row["error"] or "").strip() or "历史 LLM 任务失败（原始错误记录不足）"
+        record_llm_failure(
+            str(row["group_id"]),
+            job_type=str(row["job_type"] or "unknown"),
+            exc=RuntimeError(message),
+            stage=str(row["error_stage"] or "legacy"),
+            model=str(row["model"] or ""),
+            window_start=int(row["window_start"] or 0),
+            window_end=int(row["window_end"] or 0),
+            job_id=int(row["id"]),
+            log_excerpt=message,
+        )
+    return len(rows)
 
 
 def token_usage_from_payload(payload: dict[str, Any] | None) -> dict[str, int]:
@@ -1046,7 +1394,7 @@ async def ensure_rows_images_local(rows: list[dict[str, Any]], group_id: str) ->
     changed = 0
     for r in rows:
         content = (r.get("content") or "").strip()
-        if not content or "[CQ:image" not in content.lower():
+        if not content or "[cq:image" not in content.lower():
             continue
         try:
             new_content = await materialize_content_images(content, group_id=group_id)
@@ -1085,7 +1433,7 @@ async def enrich_rows_with_image_captions(
 
     for r in rows:
         content = (r.get("content") or "").strip()
-        if not content or "[CQ:image" not in content.lower():
+        if not content or "[cq:image" not in content.lower():
             continue
         refs = extract_image_refs(content)
         if not refs:
@@ -1323,13 +1671,30 @@ async def run_group_summary(
     cfg = load_group_config(group_id)
     settings = load_app_settings()
     llm_cfg = cfg.llm_monitor
-    text_enabled = bool(getattr(llm_cfg, "text_enabled", True))
-    image_enabled = bool(getattr(llm_cfg, "image_enabled", True))
-    image_same = bool(getattr(llm_cfg, "image_same_as_text", True))
-
-    provider = provider_by_id(settings, llm_cfg.provider_id or settings.llm.active_provider_id)
+    use_global_defaults = bool(getattr(llm_cfg, "use_global_defaults", True))
+    text_enabled = True if use_global_defaults else bool(getattr(llm_cfg, "text_enabled", True))
+    image_enabled = True if use_global_defaults else bool(getattr(llm_cfg, "image_enabled", True))
+    image_same = False if use_global_defaults else bool(
+        getattr(llm_cfg, "image_same_as_text", True)
+    )
+    provider_id = (
+        settings.llm.active_provider_id
+        if use_global_defaults
+        else llm_cfg.provider_id or settings.llm.active_provider_id
+    )
+    provider = provider_by_id(settings, provider_id)
     if provider is None:
         raise RuntimeError("未配置 LLM Provider，请先在总配置中填写")
+    model_name = (
+        provider.default_model
+        if use_global_defaults
+        else llm_cfg.model or provider.default_model
+    )
+    analysis_prompt = (
+        settings.llm.default_prompt
+        if use_global_defaults
+        else llm_cfg.prompt
+    ) or DEFAULT_LLM_MONITOR_PROMPT
     if not text_enabled and not image_enabled:
         return {
             "status": "skipped",
@@ -1346,9 +1711,12 @@ async def run_group_summary(
         }
 
     # 图片分析 Provider / 模型（可与文本一致，也可独立）
-    if image_same:
+    if use_global_defaults:
         image_provider = provider
-        image_model_name = llm_cfg.model or provider.default_model
+        image_model_name = settings.llm.default_image_model or model_name
+    elif image_same:
+        image_provider = provider
+        image_model_name = model_name
     else:
         image_provider = provider_by_id(
             settings,
@@ -1364,7 +1732,10 @@ async def run_group_summary(
         )
 
     end = end_ts or int(time.time())
-    minutes = window_minutes if window_minutes is not None else (llm_cfg.window_minutes or 60)
+    _, configured_window, configured_min_messages = resolve_llm_timing(
+        settings.llm, llm_cfg
+    )
+    minutes = window_minutes if window_minutes is not None else configured_window
     minutes = max(1, int(minutes))
     start = end - minutes * 60
 
@@ -1439,7 +1810,7 @@ async def run_group_summary(
             n = int(look_meta.get("lookback_messages") or 0)
             source = f"{source}；启发式向前补了 {n} 条（{reasons}）"
 
-    min_need = max(1, int(llm_cfg.min_messages or 1))
+    min_need = max(1, int(configured_min_messages))
     # 短窗口 + 过高门槛会导致定时永远跳过；按窗口做温和上限
     if job_type == "schedule" and minutes <= 5:
         min_need = min(min_need, max(1, minutes * 2))
@@ -1452,7 +1823,7 @@ async def run_group_summary(
                 INSERT INTO llm_jobs(job_type, group_id, window_start, window_end, status, error, model)
                 VALUES(?,?,?,?,?,?,?)
                 """,
-                (job_type, group_id, start, end, "skipped", reason, llm_cfg.model),
+                (job_type, group_id, start, end, "skipped", reason, model_name),
             )
             job_id = int(cur.lastrowid)
         _insert_skip_report(
@@ -1474,7 +1845,7 @@ async def run_group_summary(
                 INSERT INTO llm_jobs(job_type, group_id, window_start, window_end, status, error, model)
                 VALUES(?,?,?,?,?,?,?)
                 """,
-                (job_type, group_id, start, end, "skipped", reason, llm_cfg.model),
+                (job_type, group_id, start, end, "skipped", reason, model_name),
             )
             job_id = int(cur.lastrowid)
         if job_type == "schedule":
@@ -1494,7 +1865,7 @@ async def run_group_summary(
             "source": source,
         }
 
-    analysis_instructions = build_analysis_instructions(llm_cfg.prompt)
+    analysis_instructions = build_analysis_instructions(analysis_prompt)
     configured_end = int(context_meta.get("configured_end") or end)
     # 总时间跨度上限 = 配置窗口 × 5
     min_allowed_ts = max(0, configured_end - minutes * 60 * MAX_WINDOW_MULTIPLIER)
@@ -1502,7 +1873,6 @@ async def run_group_summary(
     llm_context_rounds = 0
     earlier_added_total = 0
     earlier_reasons: list[str] = []
-    model_name = llm_cfg.model or provider.default_model
     focus_forced_rounds = 0  # 检测到 GitHub/AI 时至少再向前补几轮
 
     def _build_meta_block() -> str:
@@ -1697,7 +2067,7 @@ async def run_group_summary(
         # 未启用图片分析：把 CQ 图片改成占位，避免把超长 url 塞进文本模型
         for r in rows:
             content = (r.get("content") or "")
-            if "[CQ:image" in content.lower():
+            if "[cq:image" in content.lower():
                 refs = extract_image_refs(content)
                 new_c = content
                 for ref in refs:
@@ -1730,7 +2100,7 @@ async def run_group_summary(
     )
 
     final_focus = detect_focus_topics(transcript)
-    final_max_tokens = 8192 if final_focus["hit"] or (llm_cfg.prompt or "").strip() else 4096
+    final_max_tokens = 8192 if final_focus["hit"] or analysis_prompt.strip() else 4096
     analysis_system = (
         DEFAULT_SYSTEM
         + "\n以下为本群分析要求，正式输出时必须落实：\n"
@@ -1804,7 +2174,8 @@ async def run_group_summary(
             "images_captioned": int(image_meta.get("captioned") or 0),
             "images_skipped": int(image_meta.get("skipped") or 0),
             "focus_topics": final_focus.get("labels") or [],
-            "custom_prompt_applied": bool((llm_cfg.prompt or "").strip()),
+            "custom_prompt_applied": bool(analysis_prompt.strip()),
+            "used_global_defaults": use_global_defaults,
             "source": source,
         }
         report["period"] = period
@@ -1895,14 +2266,16 @@ async def run_group_summary(
         }
     except Exception as e:
         logger.exception("LLM 总结失败 group=%s", group_id)
-        with sqlite3.connect(db) as conn:
-            conn.execute(
-                """
-                UPDATE llm_jobs SET status=?, error=?, finished_at=datetime('now','localtime')
-                WHERE id=?
-                """,
-                ("failed", str(e)[:500], job_id),
-            )
+        record_llm_failure(
+            group_id,
+            job_type=job_type,
+            exc=e,
+            stage="final_analysis",
+            model=model_name,
+            window_start=start,
+            window_end=end,
+            job_id=job_id,
+        )
         raise
 
 
@@ -1915,14 +2288,17 @@ def list_reports(
 ) -> list[dict[str, Any]]:
     db = sqlite_path()
     ensure_llm_tables(db)
+    recover_stale_llm_jobs()
+    backfill_failed_llm_job_reports()
     lim = max(1, min(1000, int(limit)))
     with sqlite3.connect(db) as conn:
         conn.row_factory = sqlite3.Row
         if favorites_only:
             rows = conn.execute(
                 """
-                SELECT id, group_id, window_start, window_end, headline, sentiment,
+                SELECT id, job_id, group_id, window_start, window_end, headline, sentiment,
                        risk_max, msg_count, created_at, report_md, report_json,
+                       COALESCE(github_issue_url, '') AS github_issue_url,
                        COALESCE(prompt_tokens, 0) AS prompt_tokens,
                        COALESCE(completion_tokens, 0) AS completion_tokens,
                        COALESCE(total_tokens, 0) AS total_tokens,
@@ -1943,8 +2319,9 @@ def list_reports(
         elif group_id:
             rows = conn.execute(
                 """
-                SELECT id, group_id, window_start, window_end, headline, sentiment,
+                SELECT id, job_id, group_id, window_start, window_end, headline, sentiment,
                        risk_max, msg_count, created_at, report_md, report_json,
+                       COALESCE(github_issue_url, '') AS github_issue_url,
                        COALESCE(prompt_tokens, 0) AS prompt_tokens,
                        COALESCE(completion_tokens, 0) AS completion_tokens,
                        COALESCE(total_tokens, 0) AS total_tokens,
@@ -1963,8 +2340,9 @@ def list_reports(
         else:
             rows = conn.execute(
                 """
-                SELECT id, group_id, window_start, window_end, headline, sentiment,
+                SELECT id, job_id, group_id, window_start, window_end, headline, sentiment,
                        risk_max, msg_count, created_at, report_md, report_json,
+                       COALESCE(github_issue_url, '') AS github_issue_url,
                        COALESCE(prompt_tokens, 0) AS prompt_tokens,
                        COALESCE(completion_tokens, 0) AS completion_tokens,
                        COALESCE(total_tokens, 0) AS total_tokens,

@@ -45,9 +45,15 @@ class OneBotClient:
         self.reconnect_min_delay = reconnect_min_delay
         self.reconnect_max_delay = reconnect_max_delay
         self._stop = asyncio.Event()
+        self._ws: Any | None = None
 
     def stop(self) -> None:
         self._stop.set()
+        if self._ws is not None:
+            try:
+                asyncio.get_running_loop().create_task(self._ws.close())
+            except RuntimeError:
+                pass
 
     async def run_forever(self) -> None:
         delay = self.reconnect_min_delay
@@ -95,11 +101,15 @@ class OneBotClient:
             ping_timeout=20,
             max_size=50 * 1024 * 1024,
         ) as ws:
-            logger.info("OneBot WebSocket 已连接")
-            async for raw in ws:
-                if self._stop.is_set():
-                    break
-                await self._handle_raw(raw)
+            self._ws = ws
+            try:
+                logger.info("OneBot WebSocket 已连接")
+                async for raw in ws:
+                    if self._stop.is_set():
+                        break
+                    await self._handle_raw(raw)
+            finally:
+                self._ws = None
 
     def _safe_url_for_log(self) -> str:
         parsed = urlparse(self.ws_url)

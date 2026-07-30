@@ -15,9 +15,12 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 from app.llm.service import (  # noqa: E402
+    build_github_issue_preview,
     get_report_favorite_messages,
     list_reports,
+    record_llm_failure,
     run_group_summary,
+    set_report_github_issue_url,
     set_report_favorited,
     sqlite_path,
     sum_report_tokens,
@@ -85,9 +88,10 @@ def db_connect():
 
 
 def cmd_list_groups(sort: str, q: str) -> None:
-    # 合并：已保存配置 + 消息库出现过的群 + OneBot 列表（可选，这里用库+配置）
+    # 合并：已保存配置 + 消息库出现过的群 + 各通道群列表缓存
     configs = {c.group_id: c for c in list_group_configs()}
     last_map: dict[str, dict] = {}
+    activity_map: dict[str, dict] = {}
     path = sqlite_path()
     if path.exists():
         with db_connect() as conn:
@@ -105,6 +109,25 @@ def cmd_list_groups(sort: str, q: str) -> None:
                     "last_time": r["last_time"],
                     "msg_count": r["msg_count"],
                 }
+            activity_table = conn.execute(
+                """
+                SELECT 1 FROM sqlite_master
+                WHERE type='table' AND name='group_activity'
+                """
+            ).fetchone()
+            if activity_table:
+                rows = conn.execute(
+                    """
+                    SELECT group_id, last_event_time, last_received_at, received_count
+                    FROM group_activity
+                    """
+                ).fetchall()
+                for r in rows:
+                    activity_map[str(r["group_id"])] = {
+                        "last_event_time": r["last_event_time"],
+                        "last_received_at": r["last_received_at"],
+                        "received_count": r["received_count"],
+                    }
 
     # 也读 onebot cache file if present from previous pull
     cache = ROOT / "data" / "groups_cache.json"
@@ -123,11 +146,12 @@ def cmd_list_groups(sort: str, q: str) -> None:
         except Exception:
             pass
 
-    ids = set(configs) | set(last_map) | set(names)
+    ids = set(configs) | set(last_map) | set(activity_map) | set(names)
     items = []
     for gid in ids:
         cfg = configs.get(gid) or GroupConfig(group_id=gid, group_name=names.get(gid, ""))
         meta = last_map.get(gid) or {}
+        activity = activity_map.get(gid) or {}
         mem = members.get(gid) or {}
         items.append(
             {
@@ -135,9 +159,13 @@ def cmd_list_groups(sort: str, q: str) -> None:
                 "groupName": cfg.group_name or names.get(gid) or "",
                 "channel": cfg.channel or channel_of_group_id(gid),
                 "enabled": cfg.enabled,
-                "blocked": cfg.blocked,
-                "lastTime": meta.get("last_time"),
+                "lastTime": (
+                    activity.get("last_event_time")
+                    or activity.get("last_received_at")
+                    or meta.get("last_time")
+                ),
                 "msgCount": meta.get("msg_count") or 0,
+                "activityCount": activity.get("received_count") or 0,
                 "memberCount": mem.get("member_count"),
                 "maxMemberCount": mem.get("max_member_count"),
                 "keywordEnabled": cfg.keyword_monitor.enabled,
@@ -157,8 +185,7 @@ def cmd_list_groups(sort: str, q: str) -> None:
         items.sort(key=lambda x: ((x["groupName"] or "").lower(), x["groupId"]))
     else:  # recent
         items.sort(
-            key=lambda x: (x["lastTime"] is not None, x["lastTime"] or 0, x["msgCount"]),
-            reverse=True,
+            key=lambda x: (-(x["lastTime"] or 0), -x["activityCount"], x["groupId"]),
         )
     out({"groups": items})
 
@@ -253,6 +280,18 @@ def cmd_save_settings(raw: str) -> None:
     elif "report_keep_limit" not in llm:
         llm["report_keep_limit"] = 100
     llm["report_keep_limit"] = int(llm.get("report_keep_limit") or 100)
+    if "defaultImageModel" in llm:
+        llm["default_image_model"] = llm.pop("defaultImageModel")
+    if "defaultPrompt" in llm:
+        llm["default_prompt"] = llm.pop("defaultPrompt")
+    for camel, snake, fallback in (
+        ("defaultEveryMinutes", "default_every_minutes", 60),
+        ("defaultWindowMinutes", "default_window_minutes", 60),
+        ("defaultMinMessages", "default_min_messages", 8),
+    ):
+        if camel in llm:
+            llm[snake] = llm.pop(camel)
+        llm[snake] = max(1, int(llm.get(snake) or fallback))
     providers = []
     for p in llm.get("providers") or []:
         providers.append(
@@ -271,11 +310,6 @@ def cmd_save_settings(raw: str) -> None:
     ui = mapped.get("ui") or {}
     if isinstance(ui, dict):
         mapped["ui"] = {
-            "compact_mode_enabled": bool(
-                ui.get("compactModeEnabled")
-                if "compactModeEnabled" in ui
-                else ui.get("compact_mode_enabled", False)
-            ),
             "theme": (ui.get("theme") or "midnight").strip() or "midnight",
         }
 
@@ -294,8 +328,36 @@ def cmd_save_settings(raw: str) -> None:
         qq = channels.get("qq") or {}
         wx = channels.get("wechat") or {}
         tg = channels.get("telegram") or {}
+        qq_src = qq if isinstance(qq, dict) else {}
+        mode = (qq_src.get("mode") or "onebot").strip().lower()
+        if mode not in ("onebot", "passive"):
+            mode = "onebot"
+        group_name_map = qq_src.get("groupNameMap") or qq_src.get("group_name_map") or {}
+        if not isinstance(group_name_map, dict):
+            group_name_map = {}
         mapped["channels"] = {
-            "qq": _ch(qq if isinstance(qq, dict) else {}),
+            "qq": _ch(
+                qq_src,
+                {
+                    "mode": mode,
+                    "notification_access": (
+                        qq_src.get("notificationAccess")
+                        or qq_src.get("notification_access")
+                        or ""
+                    ).strip(),
+                    "uia_ready": bool(
+                        qq_src.get("uiaReady")
+                        if "uiaReady" in qq_src
+                        else qq_src.get("uia_ready", False)
+                    ),
+                    "poll_seconds": float(
+                        qq_src.get("pollSeconds") or qq_src.get("poll_seconds") or 1.5
+                    ),
+                    "group_name_map": {
+                        str(k): str(v) for k, v in group_name_map.items() if str(k).strip()
+                    },
+                },
+            ),
             "wechat": _ch(
                 wx if isinstance(wx, dict) else {},
                 {
@@ -361,6 +423,49 @@ def _cache_channel_groups(groups: list[dict], channel: str) -> int:
 def cmd_bind_qq(raw: str) -> None:
     data = json.loads(raw or "{}")
     settings = load_app_settings()
+    mode = (data.get("mode") or settings.channels.qq.mode or "onebot").strip().lower()
+    if mode not in ("onebot", "passive"):
+        mode = "onebot"
+    settings.channels.qq.mode = mode
+
+    if mode == "passive":
+        from app.channels.qq_passive import detect_official_qq
+        from app.channels.qq_passive_parse import stable_group_id
+
+        detect = detect_official_qq()
+        settings.channels.qq.bound = True
+        settings.channels.qq.label = (data.get("label") or "官方 QQ 被动监听").strip()
+        settings.channels.qq.notification_access = str(detect.get("notificationAccess") or "")
+        settings.channels.qq.uia_ready = bool(detect.get("uiaOk"))
+        settings.channels.qq.poll_seconds = float(
+            data.get("pollSeconds") or data.get("poll_seconds") or settings.channels.qq.poll_seconds or 1.5
+        )
+        # 合并探测到的群名
+        uia_name = str(detect.get("uiaGroupName") or "").strip()
+        if uia_name and uia_name not in settings.channels.qq.group_name_map:
+            settings.channels.qq.group_name_map[uia_name] = stable_group_id(uia_name)
+        if detect.get("napcatRunning"):
+            settings.channels.qq.last_error = "检测到 NapCat 仍在运行，请先关闭后再用被动模式"
+        else:
+            settings.channels.qq.last_error = ""
+        save_app_settings(settings)
+        # 把已知群名缓存进群列表
+        groups = [
+            {"group_id": gid, "group_name": name, "channel": "qq"}
+            for name, gid in settings.channels.qq.group_name_map.items()
+        ]
+        if groups:
+            _cache_channel_groups(groups, "qq")
+        out(
+            {
+                "ok": True,
+                "message": "QQ 被动模式已绑定（低风险，可能漏消息）",
+                "channels": dump_public(settings.channels),
+                "detect": detect,
+            }
+        )
+        return
+
     ws = (data.get("onebotWsUrl") or data.get("ws") or settings.onebot_ws_url or "").strip()
     token = (data.get("onebotAccessToken") or data.get("token") or settings.onebot_access_token or "").strip()
     if ws:
@@ -371,6 +476,51 @@ def cmd_bind_qq(raw: str) -> None:
     settings.channels.qq.last_error = ""
     save_app_settings(settings)
     out({"ok": True, "message": "QQ / OneBot 已绑定", "channels": dump_public(settings.channels)})
+
+
+def cmd_detect_qq_passive() -> None:
+    from app.channels.qq_passive import detect_official_qq
+    from app.channels.qq_passive_parse import stable_group_id
+
+    detect = detect_official_qq()
+    settings = load_app_settings()
+    settings.channels.qq.notification_access = str(detect.get("notificationAccess") or "")
+    settings.channels.qq.uia_ready = bool(detect.get("uiaOk"))
+    uia_name = str(detect.get("uiaGroupName") or "").strip()
+    if uia_name and uia_name not in settings.channels.qq.group_name_map:
+        settings.channels.qq.group_name_map[uia_name] = stable_group_id(uia_name)
+    save_app_settings(settings)
+    out(
+        {
+            "ok": True,
+            "detect": detect,
+            "channels": dump_public(settings.channels),
+            "groupNameMap": settings.channels.qq.group_name_map,
+            "message": "已完成官方 QQ 被动采集探测",
+        }
+    )
+
+
+def cmd_set_qq_group_map(raw: str) -> None:
+    data = json.loads(raw or "{}")
+    settings = load_app_settings()
+    mapping = data.get("groupNameMap") or data.get("group_name_map") or {}
+    if not isinstance(mapping, dict):
+        out({"ok": False, "message": "groupNameMap 必须是对象"})
+        return
+    cleaned = {str(k).strip(): str(v).strip() for k, v in mapping.items() if str(k).strip()}
+    settings.channels.qq.group_name_map = cleaned
+    save_app_settings(settings)
+    groups = [{"group_id": gid, "group_name": name, "channel": "qq"} for name, gid in cleaned.items()]
+    if groups:
+        _cache_channel_groups(groups, "qq")
+    out(
+        {
+            "ok": True,
+            "message": f"已更新 {len(cleaned)} 条群名映射",
+            "channels": dump_public(settings.channels),
+        }
+    )
 
 
 def cmd_bind_telegram(raw: str) -> None:
@@ -654,6 +804,7 @@ def cmd_unbind_channel(channel: str) -> None:
         settings.channels.qq.bound = False
         settings.channels.qq.label = ""
         settings.channels.qq.last_error = ""
+        # 保留 mode / group_name_map，方便再次绑定
     elif ch in ("wechat", "wx"):
         settings.channels.wechat.bound = False
         settings.channels.wechat.label = ""
@@ -830,7 +981,6 @@ def cmd_save_group(raw: str) -> None:
             "group_name": pick(data, "groupName", "group_name", default="") or "",
             "channel": channel,
             "enabled": pick(data, "enabled", default=False),
-            "blocked": pick(data, "blocked", default=False),
             "basic": {
                 "log_all": pick(basic, "logAll", "log_all", default=True),
                 "storage_enabled": pick(basic, "storageEnabled", "storage_enabled", default=True),
@@ -843,6 +993,9 @@ def cmd_save_group(raw: str) -> None:
             },
             "llm_monitor": {
                 "enabled": pick(llm, "enabled", default=False),
+                "use_global_defaults": pick(
+                    llm, "useGlobalDefaults", "use_global_defaults", default=True
+                ),
                 "text_enabled": pick(llm, "textEnabled", "text_enabled", default=True),
                 "provider_id": pick(llm, "providerId", "provider_id", default="") or "",
                 "model": pick(llm, "model", default="") or "",
@@ -862,18 +1015,13 @@ def cmd_save_group(raw: str) -> None:
             },
         }
     )
-    # 屏蔽与启用互斥
-    if cfg.blocked:
-        cfg.enabled = False
-    elif cfg.enabled:
-        cfg.blocked = False
     if isinstance(cfg.keyword_monitor.keywords, str):
         cfg.keyword_monitor.keywords = [
             x.strip() for x in cfg.keyword_monitor.keywords.split(",") if x.strip()
         ]
 
     prev = load_group_config(str(group_id))
-    newly_enabled = bool(cfg.enabled and not prev.enabled and not cfg.blocked)
+    newly_enabled = bool(cfg.enabled and not prev.enabled)
     save_group_config(cfg)
 
     history: dict | None = None
@@ -895,20 +1043,53 @@ def cmd_save_group(raw: str) -> None:
 
 def cmd_run_llm(group_id: str) -> None:
     cfg = load_group_config(group_id)
-    if cfg.blocked:
-        raise SystemExit("该群已屏蔽，无法执行 LLM 分析")
-    result = asyncio.run(run_group_summary(group_id, job_type="manual"))
-    out(result)
+    if not cfg.enabled:
+        raise SystemExit("该群未启用监听，无法执行 LLM 分析")
+    try:
+        result = asyncio.run(run_group_summary(group_id, job_type="manual"))
+        out(result)
+    except Exception as e:
+        failure = record_llm_failure(
+            group_id,
+            job_type="manual",
+            exc=e,
+            stage="prepare_or_execute",
+            model=cfg.llm_monitor.model,
+        )
+        out(
+            {
+                "ok": False,
+                "status": "failed",
+                "error": failure.get("error_summary") or "LLM 分析失败",
+                **failure,
+            }
+        )
+
+
+def cmd_github_issue_preview(report_id: int) -> None:
+    out(build_github_issue_preview(int(report_id)))
+
+
+def cmd_set_report_issue(report_id: int, issue_url: str) -> None:
+    out(set_report_github_issue_url(int(report_id), issue_url))
 
 
 def cmd_pull_history(group_id: str, count: int) -> None:
     from app.history_sync import pull_group_history
 
     cfg = load_group_config(group_id)
-    if cfg.blocked:
-        raise SystemExit("该群已屏蔽，无法拉取历史")
+    if not cfg.enabled:
+        raise SystemExit("该群未启用监听，无法拉取历史")
     result = asyncio.run(pull_group_history(group_id, count=count))
     out(result)
+
+
+def cmd_sync_group_recents(raw: str, count: int) -> None:
+    from app.history_sync import pull_groups_recent_history
+
+    data = json.loads(raw)
+    group_ids = data.get("groupIds") or data.get("group_ids") or []
+    out(asyncio.run(pull_groups_recent_history(group_ids, count=count)))
 
 
 def cmd_list_reports(group_id: str | None, limit: int, favorites_only: bool = False) -> None:
@@ -918,6 +1099,7 @@ def cmd_list_reports(group_id: str | None, limit: int, favorites_only: bool = Fa
         period: dict = {}
         payload: dict = {}
         skipped = False
+        failed = False
         raw_json = r.get("report_json") or ""
         if raw_json:
             try:
@@ -925,6 +1107,7 @@ def cmd_list_reports(group_id: str | None, limit: int, favorites_only: bool = Fa
                 if isinstance(parsed, dict):
                     payload = parsed
                     skipped = bool(payload.get("skipped"))
+                    failed = bool(payload.get("failed"))
                     if isinstance(payload.get("period"), dict):
                         period = payload["period"]
             except Exception:
@@ -936,6 +1119,7 @@ def cmd_list_reports(group_id: str | None, limit: int, favorites_only: bool = Fa
         items.append(
             {
                 "id": r["id"],
+                "jobId": r.get("job_id"),
                 "groupId": r["group_id"],
                 "windowStart": r["window_start"],
                 "windowEnd": r["window_end"],
@@ -946,6 +1130,9 @@ def cmd_list_reports(group_id: str | None, limit: int, favorites_only: bool = Fa
                 "createdAt": r["created_at"],
                 "reportMd": r["report_md"],
                 "skipped": skipped,
+                "failed": failed,
+                "error": payload.get("error") if isinstance(payload.get("error"), dict) else {},
+                "githubIssueUrl": r.get("github_issue_url") or "",
                 "windowExtended": bool(period.get("window_extended")),
                 "lookbackMessages": int(period.get("lookback_messages") or 0),
                 "lookbackReasons": period.get("lookback_reasons") or [],
@@ -1016,19 +1203,20 @@ def cmd_token_stats(group_id: str | None) -> None:
 
 
 def cmd_cache_groups(raw: str) -> None:
-    path = ROOT / "data" / "groups_cache.json"
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(raw, encoding="utf-8")
-    # 同步群名到已有配置
     data = json.loads(raw)
-    for g in data.get("groups") or []:
-        gid = str(g.get("group_id"))
-        name = g.get("group_name") or ""
-        cfg = load_group_config(gid)
-        if name and cfg.group_name != name:
-            cfg.group_name = name
-            save_group_config(cfg)
-    out({"ok": True, "count": len(data.get("groups") or [])})
+    groups = data.get("groups") or []
+    if not isinstance(groups, list):
+        raise ValueError("OneBot 群列表格式错误")
+
+    count = _cache_channel_groups(groups, "qq")
+    path = ROOT / "data" / "groups_cache.json"
+    cached = json.loads(path.read_text(encoding="utf-8"))
+    cached["login"] = data.get("login")
+    cached["qq_fetched_at"] = int(time.time())
+    tmp = path.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(cached, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp.replace(path)
+    out({"ok": True, "count": count})
 
 
 def cmd_fetch_models(provider_id: str) -> None:
@@ -1256,6 +1444,9 @@ def main() -> None:
     p_hist = sub.add_parser("pull-history")
     p_hist.add_argument("--group-id", required=True)
     p_hist.add_argument("--count", type=int, default=100)
+    p_recent_groups = sub.add_parser("sync-group-recents")
+    p_recent_groups.add_argument("--json", required=True)
+    p_recent_groups.add_argument("--count", type=int, default=10)
 
     p7 = sub.add_parser("list-reports")
     p7.add_argument("--group-id", default="")
@@ -1268,6 +1459,13 @@ def main() -> None:
 
     p_fav_msgs = sub.add_parser("report-favorite-messages")
     p_fav_msgs.add_argument("--report-id", type=int, required=True)
+
+    p_issue_preview = sub.add_parser("github-issue-preview")
+    p_issue_preview.add_argument("--report-id", type=int, required=True)
+
+    p_set_issue = sub.add_parser("set-report-issue")
+    p_set_issue.add_argument("--report-id", type=int, required=True)
+    p_set_issue.add_argument("--issue-url", required=True)
 
     p_tok = sub.add_parser("token-stats")
     p_tok.add_argument("--group-id", default="")
@@ -1286,6 +1484,9 @@ def main() -> None:
 
     p_bind_qq = sub.add_parser("bind-qq")
     p_bind_qq.add_argument("--json", default="{}")
+    sub.add_parser("detect-qq-passive")
+    p_qq_map = sub.add_parser("set-qq-group-map")
+    p_qq_map.add_argument("--json", default="{}")
     p_bind_tg = sub.add_parser("bind-telegram")
     p_bind_tg.add_argument("--json", default="{}")
     p_bind_wx = sub.add_parser("bind-wechat")
@@ -1324,6 +1525,8 @@ def main() -> None:
         cmd_run_llm(args.group_id)
     elif args.cmd == "pull-history":
         cmd_pull_history(args.group_id, args.count)
+    elif args.cmd == "sync-group-recents":
+        cmd_sync_group_recents(args.json, args.count)
     elif args.cmd == "list-reports":
         cmd_list_reports(
             args.group_id or None,
@@ -1334,6 +1537,10 @@ def main() -> None:
         cmd_set_report_favorite(args.report_id, bool(args.favorited))
     elif args.cmd == "report-favorite-messages":
         cmd_report_favorite_messages(args.report_id)
+    elif args.cmd == "github-issue-preview":
+        cmd_github_issue_preview(args.report_id)
+    elif args.cmd == "set-report-issue":
+        cmd_set_report_issue(args.report_id, args.issue_url)
     elif args.cmd == "token-stats":
         cmd_token_stats(args.group_id or None)
     elif args.cmd == "cache-groups":
@@ -1346,6 +1553,10 @@ def main() -> None:
         cmd_test_onebot()
     elif args.cmd == "bind-qq":
         cmd_bind_qq(args.json)
+    elif args.cmd == "detect-qq-passive":
+        cmd_detect_qq_passive()
+    elif args.cmd == "set-qq-group-map":
+        cmd_set_qq_group_map(args.json)
     elif args.cmd == "bind-telegram":
         cmd_bind_telegram(args.json)
     elif args.cmd == "bind-wechat":

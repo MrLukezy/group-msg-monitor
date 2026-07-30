@@ -6,7 +6,7 @@ import json
 from pathlib import Path
 from typing import Any
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 ROOT_DIR = Path(__file__).resolve().parent.parent
 DATA_DIR = ROOT_DIR / "data"
@@ -26,6 +26,11 @@ class LlmProvider(BaseModel):
 class LlmGlobalSettings(BaseModel):
     providers: list[LlmProvider] = Field(default_factory=list)
     active_provider_id: str = ""
+    default_image_model: str = ""
+    default_prompt: str = ""
+    default_every_minutes: int = 60
+    default_window_minutes: int = 60
+    default_min_messages: int = 8
     # 全局只保留最近 N 条 LLM 分析报告（20~500）
     report_keep_limit: int = 100
 
@@ -33,6 +38,24 @@ class LlmGlobalSettings(BaseModel):
 LLM_REPORT_KEEP_MIN = 20
 LLM_REPORT_KEEP_MAX = 500
 LLM_REPORT_KEEP_DEFAULT = 100
+
+LEGACY_LLM_MONITOR_PROMPT = (
+    "请基于群聊做中文分析。若出现 GitHub 仓库或 AI/大模型相关名词，"
+    "必须多轮补齐相关上下文，并在 deep_dives 中深入展开、扩充回答；"
+    "仓库写入 appendix.links，名词写入 appendix.nouns。"
+    "同时关注主题、风险、待办；禁止编造，不确定写「记录不足」。"
+)
+
+DEFAULT_LLM_MONITOR_PROMPT = (
+    "你是群聊监控分析助手。请基于给定聊天记录输出中文 JSON："
+    "headline, topics, key_points, risks, action_items, sentiment。"
+    "禁止编造；不确定请写「记录不足」。risks 需带原文 evidence。"
+    "帮我去分析当前这分钟重点说了什么内容。"
+    "如果内容中有 GitHub 仓库、网站链接等内容，则需要在回复内容后面，"
+    "单独着重分析这个仓库的内容、方案，以及网站的内容和方案。"
+    "如果遇到大模型相关、AI 相关的内容，也着重分析；"
+    "尤其是遇到特有名词或者单词简称，也帮我查询并解释是什么。"
+)
 
 
 def clamp_report_keep_limit(value: Any) -> int:
@@ -46,7 +69,6 @@ def clamp_report_keep_limit(value: Any) -> int:
 class UiSettings(BaseModel):
     """桌面端外观与交互偏好。"""
 
-    compact_mode_enabled: bool = False  # 开启后点缩小进入缩略窗
     theme: str = "midnight"  # midnight | daylight | ocean | forest | rose | graphite
 
 
@@ -54,6 +76,19 @@ class QqChannelSettings(BaseModel):
     bound: bool = False
     label: str = ""
     last_error: str = ""
+    # 当前仅支持 NapCat / OneBot 完整监听。
+    mode: str = "onebot"
+    notification_access: str = ""  # allowed | denied | unsupported | unknown
+    uia_ready: bool = False
+    poll_seconds: float = 1.5
+    # 群名 -> 群 ID（可填真实 QQ 群号，或保留 qqp:hash）
+    group_name_map: dict[str, str] = Field(default_factory=dict)
+
+    @field_validator("mode", mode="before")
+    @classmethod
+    def normalize_mode(cls, value: Any) -> str:
+        _ = value
+        return "onebot"
 
 
 class WechatChannelSettings(BaseModel):
@@ -105,16 +140,12 @@ class KeywordMonitorConfig(BaseModel):
 
 class LlmMonitorConfig(BaseModel):
     enabled: bool = False
+    use_global_defaults: bool = True
     # 文本分析
     text_enabled: bool = True
     provider_id: str = ""
     model: str = ""
-    prompt: str = (
-        "请基于群聊做中文分析。若出现 GitHub 仓库或 AI/大模型相关名词，"
-        "必须多轮补齐相关上下文，并在 deep_dives 中深入展开、扩充回答；"
-        "仓库写入 appendix.links，名词写入 appendix.nouns。"
-        "同时关注主题、风险、待办；禁止编造，不确定写「记录不足」。"
-    )
+    prompt: str = DEFAULT_LLM_MONITOR_PROMPT
     # 图片分析（视觉描述）
     image_enabled: bool = True
     image_same_as_text: bool = True  # True 时复用文本的 provider/model
@@ -124,13 +155,43 @@ class LlmMonitorConfig(BaseModel):
     window_minutes: int = 60
     min_messages: int = 8
 
+    @field_validator("prompt", mode="before")
+    @classmethod
+    def migrate_default_prompt(cls, value: Any) -> Any:
+        if value == LEGACY_LLM_MONITOR_PROMPT:
+            return DEFAULT_LLM_MONITOR_PROMPT
+        return value
+
+
+def resolve_llm_timing(
+    global_settings: LlmGlobalSettings,
+    group_settings: LlmMonitorConfig,
+) -> tuple[int, int, int]:
+    """返回 (执行间隔, 分析窗口, 最少消息数)，统一处理全局继承。"""
+    if group_settings.use_global_defaults:
+        values = (
+            global_settings.default_every_minutes,
+            global_settings.default_window_minutes,
+            global_settings.default_min_messages,
+        )
+    else:
+        values = (
+            group_settings.every_minutes,
+            group_settings.window_minutes,
+            group_settings.min_messages,
+        )
+    return (
+        max(1, int(values[0] or 1)),
+        max(1, int(values[1] or 1)),
+        max(1, int(values[2] or 1)),
+    )
+
 
 class GroupConfig(BaseModel):
     group_id: str
     group_name: str = ""
     channel: str = "qq"  # qq | wechat | telegram
     enabled: bool = False
-    blocked: bool = False  # 屏蔽：不落库、不处理
     basic: GroupBasicConfig = Field(default_factory=GroupBasicConfig)
     keyword_monitor: KeywordMonitorConfig = Field(default_factory=KeywordMonitorConfig)
     llm_monitor: LlmMonitorConfig = Field(default_factory=LlmMonitorConfig)
@@ -173,14 +234,26 @@ def default_app_settings() -> AppSettings:
 
 
 def _migrate_channel_defaults(settings: AppSettings) -> AppSettings:
-    """兼容旧配置：已有 OneBot 地址则默认视为 QQ 已绑定；屏蔽微信通道时强制解绑。"""
-    from app.channels.feature_flags import WECHAT_CHANNEL_ENABLED, WECHAT_DISABLED_MESSAGE
+    """兼容旧配置，并强制关闭当前未支持的通道。"""
+    from app.channels.feature_flags import (
+        TELEGRAM_CHANNEL_ENABLED,
+        TELEGRAM_DISABLED_MESSAGE,
+        WECHAT_CHANNEL_ENABLED,
+        WECHAT_DISABLED_MESSAGE,
+    )
 
     changed = False
-    if not settings.channels.qq.bound and (settings.onebot_ws_url or settings.onebot_access_token):
-        settings.channels.qq.bound = True
-        if not settings.channels.qq.label:
-            settings.channels.qq.label = "OneBot / NapCat"
+    if not settings.llm.default_prompt:
+        settings.llm.default_prompt = DEFAULT_LLM_MONITOR_PROMPT
+        changed = True
+    qq = settings.channels.qq
+    if qq.mode != "onebot":
+        qq.mode = "onebot"
+        changed = True
+    if not qq.bound and (settings.onebot_ws_url or settings.onebot_access_token):
+        qq.bound = True
+        if not qq.label:
+            qq.label = "OneBot / NapCat"
         changed = True
     if not WECHAT_CHANNEL_ENABLED:
         wx = settings.channels.wechat
@@ -188,6 +261,13 @@ def _migrate_channel_defaults(settings: AppSettings) -> AppSettings:
             wx.bound = False
             wx.label = ""
             wx.last_error = WECHAT_DISABLED_MESSAGE
+            changed = True
+    if not TELEGRAM_CHANNEL_ENABLED:
+        tg = settings.channels.telegram
+        if tg.bound or tg.label or tg.last_error != TELEGRAM_DISABLED_MESSAGE:
+            tg.bound = False
+            tg.label = ""
+            tg.last_error = TELEGRAM_DISABLED_MESSAGE
             changed = True
     if changed:
         save_app_settings(settings)
@@ -220,12 +300,22 @@ def load_app_settings() -> AppSettings:
 
 
 def save_app_settings(settings: AppSettings) -> None:
-    from app.channels.feature_flags import WECHAT_CHANNEL_ENABLED, WECHAT_DISABLED_MESSAGE
+    from app.channels.feature_flags import (
+        TELEGRAM_CHANNEL_ENABLED,
+        TELEGRAM_DISABLED_MESSAGE,
+        WECHAT_CHANNEL_ENABLED,
+        WECHAT_DISABLED_MESSAGE,
+    )
 
+    settings.channels.qq.mode = "onebot"
     if not WECHAT_CHANNEL_ENABLED:
         settings.channels.wechat.bound = False
         settings.channels.wechat.label = ""
         settings.channels.wechat.last_error = WECHAT_DISABLED_MESSAGE
+    if not TELEGRAM_CHANNEL_ENABLED:
+        settings.channels.telegram.bound = False
+        settings.channels.telegram.label = ""
+        settings.channels.telegram.last_error = TELEGRAM_DISABLED_MESSAGE
     settings.llm.report_keep_limit = clamp_report_keep_limit(settings.llm.report_keep_limit)
     _ensure_dirs()
     SETTINGS_PATH.write_text(
@@ -277,7 +367,7 @@ def list_group_configs() -> list[GroupConfig]:
 
 
 def enabled_group_ids() -> set[str]:
-    ids = {c.group_id for c in list_group_configs() if c.enabled and not c.blocked}
+    ids = {c.group_id for c in list_group_configs() if c.enabled}
     if ids:
         return ids
     # 兼容旧 .env MONITOR_GROUP_IDS
@@ -288,12 +378,6 @@ def enabled_group_ids() -> set[str]:
                 raw = line.split("=", 1)[1].strip().strip('"')
                 return {x.strip() for x in raw.split(",") if x.strip()}
     return set()
-
-
-def blocked_group_ids() -> set[str]:
-    return {c.group_id for c in list_group_configs() if c.blocked}
-
-
 def provider_by_id(settings: AppSettings, provider_id: str) -> LlmProvider | None:
     for p in settings.llm.providers:
         if p.id == provider_id:

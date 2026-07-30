@@ -1,4 +1,4 @@
-"""群消息实时监控服务入口（QQ / 微信 / Telegram）。"""
+"""群消息实时监控服务入口。"""
 
 from __future__ import annotations
 
@@ -11,15 +11,13 @@ import time
 from logging.handlers import RotatingFileHandler
 from typing import Any
 
-from app.channels.telegram import TelegramUserAdapter
-from app.channels.feature_flags import WECHAT_CHANNEL_ENABLED
+from app.channels.feature_flags import TELEGRAM_CHANNEL_ENABLED, WECHAT_CHANNEL_ENABLED
 from app.config import Settings, load_settings
 from app.filters import matched_keywords
 from app.handlers.alert_handler import AlertHandler
 from app.handlers.log_handler import LogHandler
 from app.handlers.store_handler import StoreHandler
-from app.history_sync import pull_enabled_groups_history
-from app.llm.service import run_group_summary
+from app.llm.service import record_llm_failure, run_group_summary
 from app.models import GroupMessageEvent, try_parse_group_message
 from app.onebot_client import OneBotClient, build_ws_url
 from app.settings_store import (
@@ -28,6 +26,7 @@ from app.settings_store import (
     list_group_configs,
     load_app_settings,
     load_group_config,
+    resolve_llm_timing,
 )
 
 
@@ -127,8 +126,16 @@ class MonitorApp:
         )
         self._alert_cache: dict[str, AlertHandler] = {}
         self._llm_last_run: dict[str, float] = {}
+        self._llm_queue: asyncio.Queue[str] = asyncio.Queue()
+        self._llm_pending: set[str] = set()
+        self._stop_event = asyncio.Event()
+        self._stop_file = ROOT_DIR / "data" / "monitor.stop"
+        self._store_stop_task: asyncio.Task[None] | None = None
+        self._received_count = 0
+        self._background_tasks: set[asyncio.Task[Any]] = set()
         self.qq_client: OneBotClient | None = None
-        self.tg_adapter: TelegramUserAdapter | None = None
+        self.qq_passive = None
+        self.tg_adapter: Any | None = None
         self.wx_adapter: WechatLocalAdapter | None = None
 
     def _allowed(self) -> set[str]:
@@ -137,15 +144,34 @@ class MonitorApp:
             return ids
         return self.settings.allowed_groups
 
+    def _spawn_background(self, coro: Any, *, label: str) -> None:
+        task = asyncio.create_task(coro, name=label)
+        self._background_tasks.add(task)
+
+        def _done(done: asyncio.Task[Any]) -> None:
+            self._background_tasks.discard(done)
+            if not done.cancelled() and done.exception() is not None:
+                logging.getLogger(__name__).error(
+                    "后台任务失败 task=%s error=%s",
+                    label,
+                    done.exception(),
+                )
+
+        task.add_done_callback(_done)
+
     async def handle_group_event(self, event: GroupMessageEvent) -> None:
         gcfg = load_group_config(event.group_id_str)
-        if gcfg.blocked or not gcfg.enabled:
+        if self.store_handler is not None:
+            await self.store_handler.enqueue(
+                event,
+                live=gcfg.enabled,
+                persist=gcfg.enabled and gcfg.basic.storage_enabled,
+            )
+        if not gcfg.enabled:
             return
 
         if gcfg.basic.log_all:
             await self.log_handler.handle(event)
-        if gcfg.basic.storage_enabled and self.store_handler is not None:
-            await self.store_handler.handle(event)
 
         km = gcfg.keyword_monitor
         if km.enabled and km.keywords:
@@ -158,49 +184,116 @@ class MonitorApp:
                     if alert is None:
                         alert = AlertHandler(km.webhook_url)
                         self._alert_cache[km.webhook_url] = alert
-                    await alert.handle(event, hits)
+                    self._spawn_background(
+                        alert.handle(event, hits),
+                        label=f"keyword-alert-{event.group_id_str}",
+                    )
 
     async def on_onebot_event(self, raw: dict[str, Any]) -> None:
+        started = time.perf_counter()
         event = try_parse_group_message(raw)
         if event is None:
             return
         await self.handle_group_event(event)
+        self._received_count += 1
+        elapsed_ms = (time.perf_counter() - started) * 1000
+        if elapsed_ms >= 50 or self._received_count % 500 == 0:
+            logging.getLogger(__name__).info(
+                "OneBot 消息接收处理 group=%s elapsed_ms=%.1f total=%s",
+                event.group_id_str,
+                elapsed_ms,
+                self._received_count,
+            )
 
     async def llm_scheduler_loop(self) -> None:
         logger = logging.getLogger(__name__)
-        while True:
+        while not self._stop_event.is_set():
             try:
+                global_llm = load_app_settings().llm
                 for cfg in list_group_configs():
-                    if cfg.blocked or not cfg.enabled or not cfg.llm_monitor.enabled:
+                    if not cfg.enabled or not cfg.llm_monitor.enabled:
                         continue
-                    every = int(cfg.llm_monitor.every_minutes or 60)
-                    every = max(1, every)
+                    every, _, _ = resolve_llm_timing(global_llm, cfg.llm_monitor)
                     last = self._llm_last_run.get(cfg.group_id, 0)
                     if time.time() - last < every * 60:
                         continue
                     self._llm_last_run[cfg.group_id] = time.time()
-                    try:
-                        result = await run_group_summary(cfg.group_id, job_type="schedule")
-                        logger.info(
-                            "LLM 定时总结 group=%s status=%s msg=%s reason=%s",
-                            cfg.group_id,
-                            result.get("status"),
-                            result.get("msg_count"),
-                            result.get("reason") or "",
-                        )
-                    except Exception:
-                        logger.exception("LLM 定时总结失败 group=%s", cfg.group_id)
+                    if cfg.group_id not in self._llm_pending:
+                        self._llm_pending.add(cfg.group_id)
+                        await self._llm_queue.put(cfg.group_id)
+                        logger.info("LLM 定时任务已入后台队列 group=%s", cfg.group_id)
             except Exception:
                 logger.exception("LLM scheduler 异常")
-            await asyncio.sleep(15)
+            try:
+                await asyncio.wait_for(self._stop_event.wait(), timeout=15)
+            except asyncio.TimeoutError:
+                pass
+
+    @staticmethod
+    def _run_llm_job(group_id: str) -> dict[str, Any]:
+        return asyncio.run(run_group_summary(group_id, job_type="schedule"))
+
+    async def llm_worker_loop(self) -> None:
+        logger = logging.getLogger(__name__)
+        while not self._stop_event.is_set() or not self._llm_queue.empty():
+            try:
+                group_id = await asyncio.wait_for(self._llm_queue.get(), timeout=1)
+            except asyncio.TimeoutError:
+                continue
+            started = time.perf_counter()
+            try:
+                result = await asyncio.to_thread(self._run_llm_job, group_id)
+                logger.info(
+                    "LLM 后台任务完成 group=%s status=%s msg=%s elapsed=%.1fs",
+                    group_id,
+                    result.get("status"),
+                    result.get("msg_count"),
+                    time.perf_counter() - started,
+                )
+            except Exception as e:
+                logger.exception("LLM 后台任务失败 group=%s", group_id)
+                record_llm_failure(
+                    group_id,
+                    job_type="schedule",
+                    exc=e,
+                    stage="scheduler_worker",
+                )
+            finally:
+                self._llm_pending.discard(group_id)
+                self._llm_queue.task_done()
+
+    async def stop_file_watcher(self) -> None:
+        while not self._stop_event.is_set():
+            if self._stop_file.exists():
+                try:
+                    self._stop_file.unlink()
+                except OSError:
+                    pass
+                logging.getLogger(__name__).info("收到桌面端优雅停止请求")
+                self.stop()
+                return
+            try:
+                await asyncio.wait_for(self._stop_event.wait(), timeout=0.2)
+            except asyncio.TimeoutError:
+                pass
 
     def stop(self) -> None:
+        self._stop_event.set()
         if self.qq_client is not None:
             self.qq_client.stop()
+        if self.qq_passive is not None:
+            self.qq_passive.stop()
         if self.tg_adapter is not None:
             self.tg_adapter.stop()
         if self.wx_adapter is not None:
             self.wx_adapter.stop()
+        if self.store_handler is not None and self._store_stop_task is None:
+            try:
+                self._store_stop_task = asyncio.get_running_loop().create_task(
+                    self.store_handler.stop(), name="message-store-drain"
+                )
+            except RuntimeError:
+                pass
 
     async def run(self) -> None:
         logger = logging.getLogger(__name__)
@@ -210,9 +303,19 @@ class MonitorApp:
 
         app_settings = load_app_settings()
         ch = app_settings.channels
-        tasks: list[Any] = [self.llm_scheduler_loop()]
+        try:
+            self._stop_file.unlink(missing_ok=True)
+        except OSError:
+            pass
+        if self.store_handler is not None:
+            await self.store_handler.start()
+        tasks: list[Any] = [
+            self.llm_scheduler_loop(),
+            self.llm_worker_loop(),
+            self.stop_file_watcher(),
+        ]
 
-        # QQ / OneBot
+        # QQ：当前仅支持 OneBot 完整监听。
         if ch.qq.bound:
             ws = app_settings.onebot_ws_url or self.settings.onebot_ws_url
             token = app_settings.onebot_access_token or self.settings.onebot_access_token
@@ -226,21 +329,15 @@ class MonitorApp:
             self.qq_client.ws_url = build_ws_url(ws, token)
             self.qq_client.access_token = token
             tasks.append(self.qq_client.run_forever())
-            logger.info("通道 QQ 已启用 | ws=%s", ws)
+            logger.info("通道 QQ 已启用 | mode=onebot ws=%s", ws)
 
-            async def _bootstrap_history() -> None:
-                try:
-                    result = await pull_enabled_groups_history(count=200)
-                    logger.info("启动补拉历史完成: %s", result)
-                except Exception:
-                    logger.exception("启动补拉历史失败")
-
-            tasks.append(_bootstrap_history())
         else:
-            logger.info("通道 QQ 未绑定，跳过 OneBot")
+            logger.info("通道 QQ 未绑定，跳过 QQ 采集")
 
-        # Telegram 用户 session
-        if ch.telegram.bound:
+        # Telegram 暂未支持；功能开关恢复后才加载适配器。
+        if TELEGRAM_CHANNEL_ENABLED and ch.telegram.bound:
+            from app.channels.telegram import TelegramUserAdapter
+
             if ch.telegram.api_id and ch.telegram.api_hash:
                 try:
                     self.tg_adapter = TelegramUserAdapter(
@@ -280,14 +377,21 @@ class MonitorApp:
         elif ch.wechat.bound and not WECHAT_CHANNEL_ENABLED:
             logger.info("微信通道已屏蔽，忽略绑定配置")
 
-        if len(tasks) == 1:
-            logger.warning("未绑定任何消息通道；请在总配置中绑定 QQ / Telegram")
+        if len(tasks) == 3:
+            logger.warning("未绑定任何消息通道；请在总配置中绑定 QQ")
 
         logger.info(
             "监听启动 | 启用监听群=%s",
             sorted(allowed) if allowed else ["(未启用任何群)"],
         )
-        await asyncio.gather(*tasks)
+        try:
+            await asyncio.gather(*tasks)
+        finally:
+            self._stop_event.set()
+            if self._store_stop_task is not None:
+                await self._store_stop_task
+            elif self.store_handler is not None:
+                await self.store_handler.stop()
 
 
 async def _amain() -> None:

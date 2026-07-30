@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import html
 import logging
 import mimetypes
 import re
@@ -122,7 +123,9 @@ def _parse_cq_params(param_str: str) -> dict[str, str]:
         if "=" not in part:
             continue
         k, v = part.split("=", 1)
-        params[k.strip()] = v.strip()
+        # CQ 参数会把 URL 中的 &、逗号等转义为 HTML 实体；应在分段后还原，
+        # 否则腾讯图片 URL 会携带字面量 “&amp;” 而下载失败。
+        params[k.strip()] = html.unescape(v.strip())
     return params
 
 
@@ -250,7 +253,7 @@ def build_local_image_cq(*, local_rel: str, url: str = "") -> str:
 
 async def materialize_content_images(content: str, *, group_id: str) -> str:
     """把 content 里远程图片下载到本地，并改写 CQ。"""
-    if not content or "[CQ:image" not in content.lower():
+    if not content or "[cq:image" not in content.lower():
         return content
 
     refs = extract_image_refs(content)
