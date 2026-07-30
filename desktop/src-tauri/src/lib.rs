@@ -8,9 +8,14 @@ use std::time::Duration;
 use base64::Engine;
 use serde::Serialize;
 use serde_json::Value;
+use sha2::{Digest, Sha256};
+
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
 
 struct AppState {
     monitor_child: Mutex<Option<Child>>,
+    napcat_webui_credential: Mutex<Option<String>>,
 }
 
 fn project_root() -> PathBuf {
@@ -48,6 +53,113 @@ fn read_webui_port() -> u16 {
         .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
         .and_then(|v| v.get("port").and_then(|p| p.as_u64()))
         .unwrap_or(6099) as u16
+}
+
+fn read_webui_config() -> Result<(u16, String), String> {
+    let path = napcat_dir().join("config").join("webui.json");
+    let raw = fs::read_to_string(&path)
+        .map_err(|e| format!("读取 NapCat WebUI 配置失败（{}）: {e}", path.display()))?;
+    let config: Value =
+        serde_json::from_str(&raw).map_err(|e| format!("解析 NapCat WebUI 配置失败: {e}"))?;
+    let port = config.get("port").and_then(Value::as_u64).unwrap_or(6099) as u16;
+    let token = config
+        .get("token")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    if token.is_empty() {
+        return Err("NapCat WebUI token 为空".into());
+    }
+    Ok((port, token))
+}
+
+fn napcat_webui_client() -> Result<reqwest::blocking::Client, String> {
+    reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(4))
+        .build()
+        .map_err(|e| format!("创建 NapCat WebUI 客户端失败: {e}"))
+}
+
+fn napcat_webui_credential(
+    state: &tauri::State<'_, AppState>,
+    client: &reqwest::blocking::Client,
+    port: u16,
+    token: &str,
+) -> Result<String, String> {
+    if let Some(credential) = state
+        .napcat_webui_credential
+        .lock()
+        .map_err(|e| e.to_string())?
+        .clone()
+    {
+        return Ok(credential);
+    }
+
+    let digest = Sha256::digest(format!("{token}.napcat").as_bytes());
+    let hash = digest
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    let response = client
+        .post(format!("http://127.0.0.1:{port}/api/auth/login"))
+        .json(&serde_json::json!({ "hash": hash }))
+        .send()
+        .map_err(|e| format!("连接 NapCat WebUI 登录接口失败: {e}"))?;
+    let payload: Value = response
+        .json()
+        .map_err(|e| format!("解析 NapCat WebUI 登录响应失败: {e}"))?;
+    let credential = payload
+        .pointer("/data/Credential")
+        .or_else(|| payload.pointer("/data/credential"))
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            payload
+                .get("message")
+                .and_then(Value::as_str)
+                .unwrap_or("NapCat WebUI 授权失败")
+                .to_string()
+        })?
+        .to_string();
+    *state
+        .napcat_webui_credential
+        .lock()
+        .map_err(|e| e.to_string())? = Some(credential.clone());
+    Ok(credential)
+}
+
+fn napcat_webui_post(
+    state: &tauri::State<'_, AppState>,
+    path: &str,
+) -> Result<Value, String> {
+    let (port, token) = read_webui_config()?;
+    if !port_open("127.0.0.1", port) {
+        return Err("NapCat WebUI 正在启动".into());
+    }
+    let client = napcat_webui_client()?;
+    let credential = napcat_webui_credential(state, &client, port, &token)?;
+    let response = client
+        .post(format!("http://127.0.0.1:{port}/api{path}"))
+        .bearer_auth(&credential)
+        .json(&serde_json::json!({}))
+        .send()
+        .map_err(|e| format!("请求 NapCat WebUI 失败: {e}"))?;
+    let payload: Value = response
+        .json()
+        .map_err(|e| format!("解析 NapCat WebUI 响应失败: {e}"))?;
+    let message = payload
+        .get("message")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    if message.eq_ignore_ascii_case("Unauthorized") {
+        *state
+            .napcat_webui_credential
+            .lock()
+            .map_err(|e| e.to_string())? = None;
+        return Err("NapCat WebUI 凭据已过期，正在重新授权".into());
+    }
+    Ok(payload)
 }
 
 fn py_api(args: &[&str]) -> Result<String, String> {
@@ -195,11 +307,85 @@ fn start_napcat() -> Result<String, String> {
     if !path.exists() {
         return Err("未找到 start-napcat.bat / restart-napcat.bat".into());
     }
-    Command::new("cmd")
-        .args(["/C", "start", "", &path.display().to_string()])
+    let mut command = Command::new("cmd");
+    command
+        .args(["/C", &path.display().to_string()])
+        .current_dir(project_root())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    #[cfg(windows)]
+    command.creation_flags(0x08000000);
+    command
         .spawn()
         .map_err(|e| e.to_string())?;
     Ok("已请求启动 NapCat".into())
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct NapcatLoginStatus {
+    status: String,
+    message: String,
+    qr_code_url: String,
+}
+
+#[tauri::command]
+fn get_napcat_login_status(state: tauri::State<'_, AppState>) -> NapcatLoginStatus {
+    let payload = match napcat_webui_post(&state, "/QQLogin/CheckLoginStatus") {
+        Ok(payload) => payload,
+        Err(message) => {
+            return NapcatLoginStatus {
+                status: "starting".into(),
+                message,
+                qr_code_url: String::new(),
+            };
+        }
+    };
+    let data = payload.get("data").unwrap_or(&Value::Null);
+    if data
+        .get("isLogin")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        return NapcatLoginStatus {
+            status: "authorized".into(),
+            message: "QQ 登录授权成功".into(),
+            qr_code_url: String::new(),
+        };
+    }
+    let qr_code_url = data
+        .get("qrcodeurl")
+        .or_else(|| data.get("qrcodeUrl"))
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let login_error = data
+        .get("loginError")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    NapcatLoginStatus {
+        status: if login_error.is_empty() {
+            "waiting_scan".into()
+        } else {
+            "error".into()
+        },
+        message: if login_error.is_empty() {
+            if qr_code_url.is_empty() {
+                "正在等待 NapCat 生成登录二维码…".into()
+            } else {
+                "请使用手机 QQ 扫描二维码授权登录".into()
+            }
+        } else {
+            login_error.to_string()
+        },
+        qr_code_url,
+    }
+}
+
+#[tauri::command]
+fn refresh_napcat_login_qr(state: tauri::State<'_, AppState>) -> Result<String, String> {
+    napcat_webui_post(&state, "/QQLogin/RefreshQRcode")?;
+    Ok("已刷新 QQ 登录二维码".into())
 }
 
 #[tauri::command]
@@ -1100,10 +1286,13 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .manage(AppState {
             monitor_child: Mutex::new(None),
+            napcat_webui_credential: Mutex::new(None),
         })
         .invoke_handler(tauri::generate_handler![
             get_status,
             start_napcat,
+            get_napcat_login_status,
+            refresh_napcat_login_qr,
             start_monitor,
             stop_monitor,
             api_list_groups,

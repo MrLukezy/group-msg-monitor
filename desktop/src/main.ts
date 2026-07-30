@@ -2,6 +2,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWindow, LogicalSize } from "@tauri-apps/api/window";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import gsap from "gsap";
+import QRCode from "qrcode";
 import { formatTime, renderMsgHtml } from "./cq";
 
 type StatusInfo = {
@@ -586,14 +587,141 @@ async function pollLlmTipsAndUnread() {
 }
 
 function setPill(key: string, on: boolean, label: string) {
-  const el = document.querySelector(`.pill[data-key="${key}"]`) as HTMLElement;
+  const el = document.querySelector(`.pill[data-key="${key}"]`) as HTMLButtonElement;
   if (!el) return;
-  const next = `${label}${on ? " · 在线" : " · 离线"}`;
+  if (on) el.dataset.repairing = "false";
+  const repairing = el.dataset.repairing === "true";
+  const next = `${label}${on ? " · 在线" : repairing ? " · 重连中…" : " · 离线 · 点击重连"}`;
   const wasOn = el.classList.contains("on");
+  el.dataset.online = String(on);
+  el.disabled = repairing && !on;
+  el.title = on
+    ? `${label} 当前在线`
+    : repairing
+      ? `正在修复并重连 ${label}`
+      : `${label} 当前离线，点击尝试修复并重连`;
+  el.setAttribute("aria-label", el.title);
   if (el.textContent === next && wasOn === on) return;
   el.classList.toggle("on", on);
   el.classList.toggle("off", !on);
   el.textContent = next;
+}
+
+type NapcatLoginStatus = {
+  status: "starting" | "waiting_scan" | "authorized" | "error";
+  message: string;
+  qrCodeUrl: string;
+};
+
+let napcatQrTimer = 0;
+let napcatQrPolling = false;
+let lastNapcatQrUrl = "";
+
+function stopNapcatQrPoll() {
+  if (napcatQrTimer) {
+    window.clearInterval(napcatQrTimer);
+    napcatQrTimer = 0;
+  }
+}
+
+function closeNapcatLogin() {
+  stopNapcatQrPoll();
+  $("napcat-login-modal").classList.add("hidden");
+}
+
+async function pollNapcatLoginStatus() {
+  if (napcatQrPolling) return;
+  napcatQrPolling = true;
+  try {
+    const status = await invoke<NapcatLoginStatus>("get_napcat_login_status");
+    const hint = $("napcat-qr-hint");
+    const image = $<HTMLImageElement>("napcat-qr-img");
+    const placeholder = $("napcat-qr-placeholder");
+    hint.textContent = status.message;
+    hint.classList.toggle("success", status.status === "authorized");
+    hint.classList.toggle("error", status.status === "error");
+
+    if (status.qrCodeUrl && status.qrCodeUrl !== lastNapcatQrUrl) {
+      image.src = await QRCode.toDataURL(status.qrCodeUrl, {
+        width: 220,
+        margin: 1,
+        errorCorrectionLevel: "M",
+      });
+      image.hidden = false;
+      placeholder.classList.add("hidden");
+      lastNapcatQrUrl = status.qrCodeUrl;
+    } else if (!status.qrCodeUrl && status.status !== "authorized") {
+      placeholder.textContent = status.message;
+      placeholder.classList.remove("hidden");
+      image.hidden = true;
+    }
+
+    if (status.status === "authorized") {
+      stopNapcatQrPoll();
+      placeholder.textContent = "✓ QQ 登录授权成功";
+      placeholder.classList.remove("hidden");
+      image.hidden = true;
+      await refreshStatus();
+      window.setTimeout(closeNapcatLogin, 1400);
+    }
+  } catch (e) {
+    $("napcat-qr-hint").textContent = String(e);
+    $("napcat-qr-hint").classList.add("error");
+  } finally {
+    napcatQrPolling = false;
+  }
+}
+
+function openNapcatLogin() {
+  stopNapcatQrPoll();
+  lastNapcatQrUrl = "";
+  const modal = $("napcat-login-modal");
+  const image = $<HTMLImageElement>("napcat-qr-img");
+  const placeholder = $("napcat-qr-placeholder");
+  modal.classList.remove("hidden");
+  image.hidden = true;
+  placeholder.textContent = "正在启动 NapCat…";
+  placeholder.classList.remove("hidden");
+  $("napcat-qr-hint").textContent = "请稍候，正在获取二维码…";
+  $("napcat-qr-hint").classList.remove("success", "error");
+  pollNapcatLoginStatus().catch((e) => console.error(e));
+  napcatQrTimer = window.setInterval(() => {
+    pollNapcatLoginStatus().catch((e) => console.error(e));
+  }, 1200);
+}
+
+async function repairStatus(key: string) {
+  const el = document.querySelector(`.pill[data-key="${key}"]`) as HTMLButtonElement | null;
+  if (!el) return;
+  const label = key === "monitor" ? "监听服务" : key === "onebot" ? "OneBot" : "NapCat";
+  if (el.dataset.online === "true") {
+    toast(`${label} 当前在线，无需重连`);
+    return;
+  }
+  if (el.dataset.repairing === "true") return;
+
+  el.dataset.repairing = "true";
+  setPill(key, false, label);
+  try {
+    const command = key === "monitor" ? "start_monitor" : "start_napcat";
+    const message = await invoke<string>(command);
+    toast(`${message}，正在等待 ${label} 恢复连接…`);
+    if (key !== "monitor") openNapcatLogin();
+  } catch (e) {
+    el.dataset.repairing = "false";
+    setPill(key, false, label);
+    toast(String(e), true);
+    return;
+  }
+
+  window.setTimeout(async () => {
+    el.dataset.repairing = "false";
+    try {
+      await refreshStatus();
+    } catch (e) {
+      console.error(e);
+    }
+  }, key === "monitor" ? 1800 : 5000);
 }
 
 function animateViewEnter(view: HTMLElement) {
@@ -1518,26 +1646,36 @@ function renderProviderList() {
 
   box.querySelectorAll<HTMLElement>(".provider-item").forEach((item) => {
     const id = item.dataset.id || "";
-    item.addEventListener("click", () => switchActiveProvider(id));
+    item.addEventListener("click", () => {
+      void switchActiveProvider(id);
+    });
     item.querySelectorAll<HTMLElement>("[data-act]").forEach((el) => {
       el.addEventListener("click", (ev) => {
-        ev.stopPropagation();
         const act = el.dataset.act;
+        // 主区域 data-act=select：不拦截，交给条目 click 切换活跃代理
+        if (act === "select") return;
+        ev.stopPropagation();
         if (act === "edit") openEditProvider(id);
-        if (act === "del") deleteProvider(id);
+        if (act === "del") void deleteProvider(id);
       });
     });
   });
 }
 
-function switchActiveProvider(id: string) {
+async function switchActiveProvider(id: string) {
   if (!settingsCache) return;
   const p = settingsCache.llm.providers.find((x) => x.id === id);
   if (!p) return;
+  if (settingsCache.llm.activeProviderId === id) return;
   settingsCache.llm.activeProviderId = id;
   settingsModelOptions = p.defaultModel ? [{ id: p.defaultModel }] : [];
   fillModelSelect("s-default-model", settingsModelOptions, p.defaultModel || "");
   renderProviderList();
+  try {
+    await persistSettingsFromForm();
+  } catch (e) {
+    toast(String(e), true);
+  }
 }
 
 function openAddProviderForm() {
@@ -1581,7 +1719,7 @@ function closeProviderForm() {
   $("provider-form").classList.add("hidden");
 }
 
-function saveProviderForm() {
+async function saveProviderForm() {
   if (!settingsCache) return;
   const name = $<HTMLInputElement>("pf-name").value.trim();
   const baseUrl = $<HTMLInputElement>("pf-url").value.trim();
@@ -1613,9 +1751,8 @@ function saveProviderForm() {
       apiKey,
       defaultModel,
     });
-    if (!settingsCache.llm.activeProviderId) {
-      settingsCache.llm.activeProviderId = id;
-    }
+    // 新建后立即设为活跃，便于直接测通/拉模型
+    settingsCache.llm.activeProviderId = id;
   }
   const active = activeProvider();
   if (active) {
@@ -1624,10 +1761,15 @@ function saveProviderForm() {
   }
   renderProviderList();
   closeProviderForm();
-  toast("代理已更新（记得点右上角保存总配置）");
+  try {
+    await persistSettingsFromForm();
+    toast("代理已保存");
+  } catch (e) {
+    toast(String(e), true);
+  }
 }
 
-function deleteProvider(id: string) {
+async function deleteProvider(id: string) {
   if (!settingsCache) return;
   settingsCache.llm.providers = settingsCache.llm.providers.filter((p) => p.id !== id);
   if (settingsCache.llm.activeProviderId === id) {
@@ -1637,6 +1779,12 @@ function deleteProvider(id: string) {
   const active = activeProvider();
   settingsModelOptions = active?.defaultModel ? [{ id: active.defaultModel }] : [];
   fillModelSelect("s-default-model", settingsModelOptions, active?.defaultModel || "");
+  try {
+    await persistSettingsFromForm();
+    toast("代理已删除");
+  } catch (e) {
+    toast(String(e), true);
+  }
 }
 
 function fillModelSelect(
@@ -2309,6 +2457,24 @@ window.addEventListener("DOMContentLoaded", async () => {
     };
   });
 
+  document.querySelectorAll<HTMLButtonElement>(".pill[data-key]").forEach((pill) => {
+    pill.onclick = () => repairStatus(pill.dataset.key || "").catch((e) => toast(String(e), true));
+  });
+  $("btn-close-napcat-login").onclick = closeNapcatLogin;
+  $("btn-done-napcat-login").onclick = closeNapcatLogin;
+  document.querySelectorAll("[data-napcat-login-close]").forEach((el) => {
+    (el as HTMLElement).onclick = closeNapcatLogin;
+  });
+  $("btn-refresh-napcat-qr").onclick = async () => {
+    try {
+      toast(await invoke<string>("refresh_napcat_login_qr"));
+      lastNapcatQrUrl = "";
+      await pollNapcatLoginStatus();
+    } catch (e) {
+      toast(String(e), true);
+    }
+  };
+
   $("btn-start-monitor").onclick = async () => {
     try {
       toast(await invoke<string>("start_monitor"));
@@ -2328,6 +2494,7 @@ window.addEventListener("DOMContentLoaded", async () => {
   $("btn-start-napcat").onclick = async () => {
     try {
       toast(await invoke<string>("start_napcat"));
+      openNapcatLogin();
     } catch (e) {
       toast(String(e), true);
     }
@@ -2918,7 +3085,9 @@ window.addEventListener("DOMContentLoaded", async () => {
   $("btn-add-provider").onclick = () => openAddProviderForm();
   $("btn-close-provider-form").onclick = () => closeProviderForm();
   $("btn-cancel-provider").onclick = () => closeProviderForm();
-  $("btn-save-provider").onclick = () => saveProviderForm();
+  $("btn-save-provider").onclick = () => {
+    void saveProviderForm();
+  };
   $("pf-preset").onchange = () => applyPreset($<HTMLSelectElement>("pf-preset").value);
   $("btn-refresh-models").onclick = () => refreshSettingsModels();
   $("btn-refresh-group-models").onclick = () => refreshGroupModels();
