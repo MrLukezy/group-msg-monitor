@@ -1724,6 +1724,10 @@ function renderMonitoredReportList(reports: ReportRow[]) {
 
 async function selectMonitoredGroup(groupId: string) {
   monitoredSelectedGroupId = groupId;
+  const configBtn = document.getElementById(
+    "btn-configure-monitored-group",
+  ) as HTMLButtonElement | null;
+  if (configBtn) configBtn.hidden = !groupId || groupId === FAVORITES_GROUP_ID;
   document.querySelectorAll<HTMLButtonElement>("#monitored-group-list .monitored-group-item").forEach((btn) => {
     btn.classList.toggle("active", btn.dataset.id === groupId);
   });
@@ -2074,23 +2078,18 @@ async function refreshMonitored() {
         const active = g.groupId === monitoredSelectedGroupId ? "active" : "";
         const unread = groupUnreadCount(g.groupId);
         const unreadCls = unread > 0 ? "has-unread" : "";
-        return `<div class="monitored-group-row">
-          <button class="monitored-group-item ${active} ${unreadCls}" type="button" data-id="${escapeHtml(
-            g.groupId,
-          )}">
-            ${unreadBadgeHtml(unread)}
-            <div class="name">${escapeHtml(name)}</div>
-            <div class="meta">群号 ${escapeHtml(g.groupId)}</div>
-            <div class="meta">${escapeHtml(last)} · ${g.msgCount} 条</div>
-            <div class="badges">
-              <span class="badge ${g.llmEnabled ? "on" : ""}">LLM</span>
-              <span class="badge ${g.keywordEnabled ? "on" : ""}">关键词</span>
-            </div>
-          </button>
-          <button class="monitored-group-config-btn" type="button" data-config-id="${escapeHtml(
-            g.groupId,
-          )}" title="打开本群配置">配置</button>
-        </div>`;
+        return `<button class="monitored-group-item ${active} ${unreadCls}" type="button" data-id="${escapeHtml(
+          g.groupId,
+        )}">
+          ${unreadBadgeHtml(unread)}
+          <div class="name">${escapeHtml(name)}</div>
+          <div class="meta">群号 ${escapeHtml(g.groupId)}</div>
+          <div class="meta">${escapeHtml(last)} · ${g.msgCount} 条</div>
+          <div class="badges">
+            <span class="badge ${g.llmEnabled ? "on" : ""}">LLM</span>
+            <span class="badge ${g.keywordEnabled ? "on" : ""}">关键词</span>
+          </div>
+        </button>`;
       })
       .join("");
 
@@ -2099,14 +2098,6 @@ async function refreshMonitored() {
       selectMonitoredGroup(btn.dataset.id || "").catch((e) => toast(String(e), true));
     };
   });
-  box.querySelectorAll<HTMLButtonElement>(".monitored-group-config-btn").forEach((btn) => {
-    btn.onclick = () => {
-      openMonitoredGroupConfig(btn.dataset.configId || "").catch((e) =>
-        toast(`打开群配置失败：${e}`, true),
-      );
-    };
-  });
-
   await refreshUnreadBadge().catch(() => undefined);
 
   if (monitoredSelectedGroupId) {
@@ -3043,6 +3034,11 @@ window.addEventListener("DOMContentLoaded", async () => {
       renderMonitoredReportList(monitoredReportsCache);
     };
   }
+  $("btn-configure-monitored-group").onclick = () => {
+    openMonitoredGroupConfig(monitoredSelectedGroupId || "").catch((e) =>
+      toast(`打开群配置失败：${e}`, true),
+    );
+  };
   $("monitored-tab-success").onclick = () => {
     monitoredReportTab = "success";
     renderMonitoredReportList(monitoredReportsCache);

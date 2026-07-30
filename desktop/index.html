@@ -157,10 +157,15 @@
                     <h3 class="pane-title" id="monitored-reports-title">LLM 分析主题</h3>
                     <p class="field-hint" id="monitored-reports-hint">请选择左侧群</p>
                   </div>
-                  <label class="check toolbar-check" title="隐藏因消息太少而定时跳过的条目">
-                    <input id="monitored-hide-skipped" type="checkbox" checked />
-                    忽略定时跳过
-                  </label>
+                  <div class="row monitored-reports-actions">
+                    <button id="btn-configure-monitored-group" class="btn" type="button" hidden>
+                      配置此群
+                    </button>
+                    <label class="check toolbar-check" title="隐藏因消息太少而定时跳过的条目">
+                      <input id="monitored-hide-skipped" type="checkbox" checked />
+                      忽略定时跳过
+                    </label>
+                  </div>
                 </div>
                 <div class="report-kind-tabs" role="tablist" aria-label="LLM 记录分类">
                   <button

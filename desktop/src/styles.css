@@ -1459,31 +1459,6 @@ input::placeholder, textarea::placeholder {
   flex: 1;
 }
 
-.monitored-group-row {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) auto;
-  gap: 6px;
-  align-items: stretch;
-}
-
-.monitored-group-config-btn {
-  width: 46px;
-  border: 1px solid var(--border);
-  border-radius: 11px;
-  background: color-mix(in srgb, var(--accent-2) 8%, var(--bg-2));
-  color: var(--text-dim);
-  font: inherit;
-  font-size: 12px;
-  cursor: pointer;
-  transition: border-color 0.15s ease, background 0.15s ease, color 0.15s ease;
-}
-
-.monitored-group-config-btn:hover {
-  border-color: color-mix(in srgb, var(--accent) 55%, transparent);
-  background: color-mix(in srgb, var(--accent) 16%, var(--bg-3));
-  color: var(--text);
-}
-
 .monitored-group-item {
   position: relative;
   display: flex;
@@ -1583,6 +1558,11 @@ input::placeholder, textarea::placeholder {
 .monitored-reports-head-main { min-width: 0; flex: 1; }
 .monitored-reports-head .pane-title { margin-bottom: 4px; }
 .monitored-reports-head .field-hint { margin: 0; }
+.monitored-reports-actions {
+  flex-shrink: 0;
+  flex-wrap: nowrap;
+  align-items: center;
+}
 .monitored-reports-head .toolbar-check {
   flex-shrink: 0;
   white-space: nowrap;
