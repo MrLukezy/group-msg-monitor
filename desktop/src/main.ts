@@ -3,7 +3,13 @@ import { getCurrentWindow, LogicalSize } from "@tauri-apps/api/window";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import gsap from "gsap";
 import QRCode from "qrcode";
-import { formatTime, renderMsgHtml } from "./cq";
+import {
+  formatTime,
+  highlightUserNames,
+  normalizeKnownUserNames,
+  renderMsgHtml,
+  userNameHtml,
+} from "./cq";
 import { setupUiSounds } from "./ui-sounds";
 import {
   CUSTOM_QUICK_COLORS,
@@ -275,6 +281,8 @@ let reportSubviewPointIndex: number | null = null;
 /** 从要点详情返回总览时，滚动回到该要点卡片 */
 let reportOverviewFocusPointIndex: number | null = null;
 let reportDetailMessagesCache: MessageRow[] = [];
+/** 当前报告详情中已知用户名（发言者 + 活跃成员），用于正文高亮 */
+let reportKnownUserNames: string[] = [];
 let reportAskContext: { selection?: string; pointIndex?: number | null } = {};
 /** 追问请求世代号：关闭弹窗或新发送时递增，丢弃过期结果 */
 let reportAskSeq = 0;
@@ -1558,27 +1566,29 @@ async function refreshStatus(): Promise<StatusInfo> {
 
 function messageArticleHtml(
   m: MessageRow,
-  opts?: { hideGroup?: boolean },
+  opts?: { hideGroup?: boolean; knownNames?: string[] },
 ): string {
   const when = formatTime(m.createdAt, m.eventTime);
   const gName = groupDisplayName(m.groupId, m.groupName);
   const hideGroup = !!opts?.hideGroup;
+  const known = opts?.knownNames || [];
   const groupBlock = hideGroup
     ? ""
     : `<div class="msg-group">
         <span class="msg-group-name">${escapeHtml(gName)}</span>
         <span class="msg-group-id">${escapeHtml(m.groupId)}</span>
       </div>`;
+  const senderLabel = m.senderName || m.userId || "未知";
   return `<article class="msg" data-id="${m.id}">
     <div class="msg-head">
       ${groupBlock}
       <div class="msg-meta">
-        <span class="msg-sender">${escapeHtml(m.senderName || m.userId || "未知")}</span>
+        <span class="msg-sender">${userNameHtml(senderLabel)}</span>
         <span class="msg-time">${escapeHtml(when)}</span>
         <span class="msg-id">#${m.id}</span>
       </div>
     </div>
-    <div class="body">${renderMsgHtml(m.content || "")}</div>
+    <div class="body">${renderMsgHtml(m.content || "", known)}</div>
   </article>`;
 }
 
@@ -1598,6 +1608,9 @@ function renderMessages(
     box.innerHTML = `<div class="empty">暂无消息</div>`;
     return;
   }
+
+  const knownNames = normalizeKnownUserNames(rows.map((m) => m.senderName || ""));
+  const msgOpts = { ...opts, knownNames };
 
   const fp = idsFingerprint(rows);
   const prevFp = box.dataset.fp || "";
@@ -1619,7 +1632,7 @@ function renderMessages(
       const prevHeight = box.scrollHeight;
       const html = rows
         .slice(0, cut)
-        .map((m) => messageArticleHtml(m, opts))
+        .map((m) => messageArticleHtml(m, msgOpts))
         .join("");
       box.insertAdjacentHTML("afterbegin", html);
       // 裁掉尾部多余节点，保持与数据条数一致
@@ -1635,7 +1648,7 @@ function renderMessages(
   }
 
   const scrollTop = box.scrollTop;
-  box.innerHTML = rows.map((m) => messageArticleHtml(m, opts)).join("");
+  box.innerHTML = rows.map((m) => messageArticleHtml(m, msgOpts)).join("");
   box.dataset.fp = fp;
   box.scrollTop = scrollTop;
 }
@@ -2167,7 +2180,7 @@ function reportTokenMeta(r: ReportRow): string {
   return ` · Token ${formatTokenCount(total)}`;
 }
 
-/** 渲染分析结果：`**用户名**`（非「标题：」形式）与已知发言者显示为黄色。 */
+/** 渲染分析结果：`**用户名**`（非「标题：」形式）与已知发言者显示为高亮色。 */
 function renderReportMdHtml(md: string, extraUserNames: string[] = []): string {
   const raw = (md || "").trim() || "（无详细内容）";
   type Tok = { kind: "user" | "bold" | "text"; text: string };
@@ -2187,29 +2200,7 @@ function renderReportMdHtml(md: string, extraUserNames: string[] = []): string {
   }
   if (last < raw.length) toks.push({ kind: "text", text: raw.slice(last) });
 
-  const known = [
-    ...new Set(
-      extraUserNames
-        .map((n) => (n || "").trim())
-        .filter((n) => n.length >= 2 && n.length <= 32),
-    ),
-  ].sort((a, b) => b.length - a.length);
-
-  const paintPlainText = (text: string): string => {
-    if (!known.length || !text) return escapeHtml(text);
-    const hits: string[] = [];
-    let out = text;
-    for (const name of known) {
-      if (!out.includes(name)) continue;
-      const parts = out.split(name);
-      out = parts.join(`\u0000N${hits.length}\u0000`);
-      hits.push(name);
-    }
-    return escapeHtml(out).replace(/\u0000N(\d+)\u0000/g, (_, i) => {
-      const name = hits[Number(i)] || "";
-      return `<span class="report-user-name">${escapeHtml(name)}</span>`;
-    });
-  };
+  const known = normalizeKnownUserNames(extraUserNames);
 
   const paintText = (text: string): string => {
     if (!text) return "";
@@ -2219,21 +2210,21 @@ function renderReportMdHtml(md: string, extraUserNames: string[] = []): string {
     let lastIndex = 0;
     let link: RegExpExecArray | null;
     while ((link = linkRe.exec(text))) {
-      out += paintPlainText(text.slice(lastIndex, link.index));
+      out += highlightUserNames(text.slice(lastIndex, link.index), known);
       const url = link[2] || link[3] || "";
       const label = link[1] || url;
       const safeUrl = escapeHtml(url);
-      out += `<a class="report-link" href="${safeUrl}" data-ext-url="${safeUrl}" title="${safeUrl}">${paintPlainText(label)}</a>`;
+      out += `<a class="report-link" href="${safeUrl}" data-ext-url="${safeUrl}" title="${safeUrl}">${highlightUserNames(label, known)}</a>`;
       lastIndex = link.index + link[0].length;
     }
-    out += paintPlainText(text.slice(lastIndex));
+    out += highlightUserNames(text.slice(lastIndex), known);
     return out;
   };
 
   return toks
     .map((t) => {
       if (t.kind === "user") {
-        return `<span class="report-user-name">${escapeHtml(t.text)}</span>`;
+        return userNameHtml(t.text);
       }
       if (t.kind === "bold") {
         return `<strong class="report-md-strong">${escapeHtml(t.text)}</strong>`;
@@ -2243,6 +2234,25 @@ function renderReportMdHtml(md: string, extraUserNames: string[] = []): string {
         .replace(/^### (.+)$/gm, `<span class="report-md-h3">$1</span>`);
     })
     .join("");
+}
+
+function collectReportKnownUserNames(
+  report: ReportRow,
+  senderNames: string[] = [],
+): string[] {
+  const names = [...senderNames];
+  for (const u of report.reportJson?.notableUsers || []) {
+    if (typeof u === "string") names.push(u);
+    else if (u?.name) names.push(u.name);
+  }
+  for (const a of report.reportJson?.actionItems || []) {
+    if (typeof a !== "string" && a?.owner_hint) names.push(a.owner_hint);
+  }
+  return normalizeKnownUserNames(names);
+}
+
+function reportProseHtml(text: string): string {
+  return highlightUserNames(text, reportKnownUserNames).replace(/\n/g, "<br>");
 }
 
 function loadAnalysisFavorites(): AnalysisFavorite[] {
@@ -2431,9 +2441,9 @@ function renderNounList(
   }
   const items = nouns
     .map((n) => {
-      if (typeof n === "string") return `<li>${escapeHtml(n)}</li>`;
+      if (typeof n === "string") return `<li>${reportProseHtml(n)}</li>`;
       const term = escapeHtml(n.term || "");
-      const meaning = escapeHtml(n.meaning || "");
+      const meaning = reportProseHtml(n.meaning || "");
       return `<li><strong>${term}</strong>：${meaning}</li>`;
     })
     .join("");
@@ -2450,9 +2460,9 @@ function renderKnowledgeList(
   }
   const items = knowledge
     .map((k) => {
-      if (typeof k === "string") return `<li>${escapeHtml(k)}</li>`;
+      if (typeof k === "string") return `<li>${reportProseHtml(k)}</li>`;
       const topic = escapeHtml(k.topic || "");
-      const content = escapeHtml(k.content || "").replace(/\n/g, "<br>");
+      const content = reportProseHtml(k.content || "");
       const source = escapeHtml(k.source || "");
       const head = topic ? `<strong>${topic}</strong>：` : "";
       const src = source ? `<span class="report-knowledge-source">${source}</span>` : "";
@@ -2475,12 +2485,12 @@ function renderDeepDiveBlock(dive: {
         <h5 class="report-block-subtitle">群内观点</h5>
         <div class="report-prose">${
           detail
-            ? escapeHtml(detail).replace(/\n/g, "<br>")
+            ? reportProseHtml(detail)
             : `<span class="report-empty-hint">（暂无群内观点分析）</span>`
         }</div>
         ${
           evidence
-            ? `<blockquote class="report-evidence">依据：${escapeHtml(evidence)}</blockquote>`
+            ? `<blockquote class="report-evidence">依据：${reportProseHtml(evidence)}</blockquote>`
             : ""
         }
       </div>
@@ -2503,7 +2513,7 @@ function renderLinkList(
         return `<li><a class="report-link" href="${safe}" data-ext-url="${safe}">${safe}</a></li>`;
       }
       const url = escapeHtml(lk.url || "");
-      const summary = escapeHtml(lk.summary || "");
+      const summary = reportProseHtml(lk.summary || "");
       return `<li><a class="report-link" href="${url}" data-ext-url="${url}">${url || summary}</a>${
         summary ? ` — ${summary}` : ""
       }</li>`;
@@ -2514,7 +2524,7 @@ function renderLinkList(
 
 function renderNotesList(notes: string[] | undefined): string {
   if (!notes?.length) return "";
-  const items = notes.map((n) => `<li>${escapeHtml(n)}</li>`).join("");
+  const items = notes.map((n) => `<li>${reportProseHtml(n)}</li>`).join("");
   return `<div class="report-block"><h4 class="report-block-title">补充说明</h4><ul class="report-block-list">${items}</ul></div>`;
 }
 
@@ -2534,35 +2544,35 @@ function renderStructuredOverview(report: ReportRow): string {
   const sentiment = data.sentiment || report.sentiment || "";
   const topics = (data.topics || [])
     .map((t) => {
-      if (typeof t === "string") return `<li>${escapeHtml(t)}</li>`;
+      if (typeof t === "string") return `<li>${reportProseHtml(t)}</li>`;
       return `<li><strong>${escapeHtml(t.title || "")}</strong>${
-        t.summary ? ` — ${escapeHtml(t.summary)}` : ""
+        t.summary ? ` — ${reportProseHtml(t.summary)}` : ""
       }</li>`;
     })
     .join("");
   const risks = (data.risks || [])
     .map((r) => {
-      if (typeof r === "string") return `<li>${escapeHtml(r)}</li>`;
+      if (typeof r === "string") return `<li>${reportProseHtml(r)}</li>`;
       return `<li><span class="risk-tag risk-${escapeHtml(r.level || "mid")}">${escapeHtml(
         r.level || "-",
-      )}</span> ${escapeHtml(r.detail || "")}</li>`;
+      )}</span> ${reportProseHtml(r.detail || "")}</li>`;
     })
     .join("");
   const actions = (data.actionItems || [])
     .map((a) => {
-      if (typeof a === "string") return `<li>${escapeHtml(a)}</li>`;
-      return `<li>${escapeHtml(a.task || "")}${
-        a.owner_hint ? `（${escapeHtml(a.owner_hint)}）` : ""
+      if (typeof a === "string") return `<li>${reportProseHtml(a)}</li>`;
+      return `<li>${reportProseHtml(a.task || "")}${
+        a.owner_hint ? `（${userNameHtml(a.owner_hint)}）` : ""
       }</li>`;
     })
     .join("");
   const notables = (data.notableUsers || [])
     .map((u) => {
-      if (typeof u === "string") return `<li>${escapeHtml(u)}</li>`;
-      const name = escapeHtml(u.name || u.user_id || "");
+      if (typeof u === "string") return `<li>${userNameHtml(u)}</li>`;
+      const name = userNameHtml(u.name || u.user_id || "");
       const role = u.role ? `（${escapeHtml(u.role)}）` : "";
-      const summary = u.summary ? ` — ${escapeHtml(u.summary)}` : "";
-      return `<li><strong>${name}</strong>${role}${summary}</li>`;
+      const summary = u.summary ? ` — ${reportProseHtml(u.summary)}` : "";
+      return `<li>${name}${role}${summary}</li>`;
     })
     .join("");
 
@@ -2577,7 +2587,7 @@ function renderStructuredOverview(report: ReportRow): string {
             fav ? "取消收藏要点" : "收藏此要点"
           }">${fav ? "★" : "☆"}</button>
         </div>
-        ${p.summary ? `<p class="key-point-summary">${escapeHtml(p.summary)}</p>` : ""}
+        ${p.summary ? `<p class="key-point-summary">${reportProseHtml(p.summary)}</p>` : ""}
         <div class="key-point-card-foot">
           <button type="button" class="key-point-link" data-open-point="${i}">查看详情 →</button>
         </div>
@@ -2631,7 +2641,7 @@ function renderPointDetail(report: ReportRow, index: number): string {
         fav ? "取消收藏要点" : "收藏此要点"
       }">${fav ? "★" : "☆"}</button>
     </div>
-    ${p.summary ? `<p class="key-point-summary large">${escapeHtml(p.summary)}</p>` : ""}
+    ${p.summary ? `<p class="key-point-summary large">${reportProseHtml(p.summary)}</p>` : ""}
     ${renderDeepDiveBlock(dive)}
     ${renderNounList(p.nouns, { title: "名词剖析", always: true })}
     ${renderLinkList(p.links)}
@@ -2649,9 +2659,9 @@ function renderPointsSummary(report: ReportRow): string {
         ? dive.knowledge
             .slice(0, 2)
             .map((k) => {
-              if (typeof k === "string") return escapeHtml(k);
+              if (typeof k === "string") return reportProseHtml(k);
               const topic = k.topic ? `<strong>${escapeHtml(k.topic)}</strong>：` : "";
-              return `${topic}${escapeHtml(k.content || "")}`;
+              return `${topic}${reportProseHtml(k.content || "")}`;
             })
             .filter(Boolean)
             .join("<br>")
@@ -2660,12 +2670,12 @@ function renderPointsSummary(report: ReportRow): string {
         <h4 class="key-point-title"><span class="key-point-index">${i + 1}</span> ${escapeHtml(
           p.title || `要点 ${i + 1}`,
         )}</h4>
-        ${p.summary ? `<p class="key-point-summary">${escapeHtml(p.summary)}</p>` : ""}
+        ${p.summary ? `<p class="key-point-summary">${reportProseHtml(p.summary)}</p>` : ""}
         ${
           dive.detail
-            ? `<div class="report-prose muted"><span class="report-mini-label">群内观点</span>${escapeHtml(
+            ? `<div class="report-prose muted"><span class="report-mini-label">群内观点</span>${reportProseHtml(
                 dive.detail,
-              ).replace(/\n/g, "<br>")}</div>`
+              )}</div>`
             : ""
         }
         ${
@@ -2673,7 +2683,7 @@ function renderPointsSummary(report: ReportRow): string {
             ? `<div class="report-prose muted"><span class="report-mini-label">背景知识</span>${knowledgePreview}</div>`
             : ""
         }
-        ${dive.evidence ? `<blockquote class="report-evidence">${escapeHtml(dive.evidence)}</blockquote>` : ""}
+        ${dive.evidence ? `<blockquote class="report-evidence">${reportProseHtml(dive.evidence)}</blockquote>` : ""}
         ${renderNounList(p.nouns, { title: "名词剖析" })}
         <button type="button" class="key-point-link" data-open-point="${i}">查看该要点详情 →</button>
       </article>`;
@@ -2719,7 +2729,8 @@ function paintReportMessages(filterTokens: string[] | null) {
   const hint = $("monitored-report-msgs-hint");
   const report =
     monitoredDetailReportId != null
-      ? monitoredReportsCache.find((r) => r.id === monitoredDetailReportId)
+      ? monitoredReportsCache.find((r) => r.id === monitoredDetailReportId) ||
+        favoritesReportsCache.find((r) => r.id === monitoredDetailReportId)
       : undefined;
   if (filterTokens && filterTokens.length) {
     hint.textContent =
@@ -2737,7 +2748,10 @@ function paintReportMessages(filterTokens: string[] | null) {
         filterTokens && filterTokens.length
           ? messageMatchesEvidence(m.content || "", filterTokens)
           : false;
-      const html = messageArticleHtml(m, { hideGroup: true });
+      const html = messageArticleHtml(m, {
+        hideGroup: true,
+        knownNames: reportKnownUserNames,
+      });
       return hit ? html.replace('class="msg"', 'class="msg is-evidence-hit"') : html;
     })
     .join("");
@@ -2747,12 +2761,13 @@ function paintReportMessages(filterTokens: string[] | null) {
 function renderReportAnalysisView(report: ReportRow, senderNames: string[] = []) {
   const body = $("monitored-report-detail-body");
   const titleEl = $("monitored-report-analysis-title");
+  reportKnownUserNames = collectReportKnownUserNames(report, senderNames);
   updateReportBackButton();
   syncReportClipsButton();
 
   if (!useStructuredReport(report)) {
     titleEl.textContent = "分析结果";
-    setReportDetailBody((report.reportMd || "").trim() || "（无详细内容）", senderNames);
+    setReportDetailBody((report.reportMd || "").trim() || "（无详细内容）", reportKnownUserNames);
     paintReportMessages(null);
     return;
   }
@@ -2780,7 +2795,9 @@ function navigateReportSubview(view: ReportSubview, pointIndex: number | null = 
   reportSubview = view;
   reportSubviewPointIndex = pointIndex;
   if (monitoredDetailReportId == null) return;
-  const report = monitoredReportsCache.find((r) => r.id === monitoredDetailReportId);
+  const report =
+    monitoredReportsCache.find((r) => r.id === monitoredDetailReportId) ||
+    favoritesReportsCache.find((r) => r.id === monitoredDetailReportId);
   if (!report) return;
   const senderNames = [
     ...new Set(
@@ -2831,7 +2848,9 @@ function bindReportAnalysisActions(root: HTMLElement) {
     const favBtn = t.closest("[data-fav-point]") as HTMLElement | null;
     if (favBtn && monitoredDetailReportId != null) {
       const idx = Number(favBtn.getAttribute("data-fav-point"));
-      const report = monitoredReportsCache.find((r) => r.id === monitoredDetailReportId);
+      const report =
+        monitoredReportsCache.find((r) => r.id === monitoredDetailReportId) ||
+        favoritesReportsCache.find((r) => r.id === monitoredDetailReportId);
       const point = report ? reportKeyPoints(report)[idx] : null;
       if (!point || !Number.isFinite(idx)) return;
       if (isPointFavorited(monitoredDetailReportId, idx)) {
@@ -2981,6 +3000,21 @@ function setupReportContextMenu() {
   });
 }
 
+function paintAskAnswer(el: HTMLElement, text: string, opts?: { error?: boolean; empty?: boolean }) {
+  if (opts?.error) {
+    el.className = "report-ask-answer error";
+    el.textContent = text;
+    return;
+  }
+  if (opts?.empty) {
+    el.className = "report-ask-answer empty-hint";
+    el.textContent = text;
+    return;
+  }
+  el.className = "report-ask-answer";
+  el.innerHTML = highlightUserNames(text, reportKnownUserNames).replace(/\n/g, "<br>");
+}
+
 function closeReportAskPopup() {
   // 作废进行中的追问结果，避免关闭后仍写回 UI
   reportAskSeq += 1;
@@ -3047,15 +3081,13 @@ function openReportAskPopup(ctx: {
   if (presetQ && presetA) {
     lastAskResult = { question: presetQ, answer: presetA };
     if (input) input.value = presetQ;
-    if (answer) {
-      answer.className = "report-ask-answer";
-      answer.textContent = presetA;
-    }
+    if (answer) paintAskAnswer(answer, presetA);
   } else {
     lastAskResult = null;
     if (answer) {
-      answer.className = "report-ask-answer empty-hint";
-      answer.textContent = "回答将分段标注【来自群聊/报告】与【来自模型知识】";
+      paintAskAnswer(answer, "回答将分段标注【来自群聊/报告】与【来自模型知识】", {
+        empty: true,
+      });
     }
     if (input && !presetQ) input.value = "";
     else if (input && presetQ) input.value = presetQ;
@@ -3110,11 +3142,9 @@ async function sendReportAsk() {
     const errText = (res.error || "").trim();
     if (answerEl) {
       if (answerText) {
-        answerEl.className = "report-ask-answer";
-        answerEl.textContent = answerText;
+        paintAskAnswer(answerEl, answerText);
       } else {
-        answerEl.className = "report-ask-answer error";
-        answerEl.textContent = errText || "（无回答）";
+        paintAskAnswer(answerEl, errText || "（无回答）", { error: true });
       }
     }
     if (answerText && res.ok !== false) {
@@ -3126,8 +3156,7 @@ async function sendReportAsk() {
   } catch (e) {
     if (seq !== reportAskSeq) return;
     if (answerEl) {
-      answerEl.className = "report-ask-answer error";
-      answerEl.textContent = String(e);
+      paintAskAnswer(answerEl, String(e), { error: true });
     }
     lastAskResult = null;
     syncAskFavoriteButton();
@@ -3209,7 +3238,7 @@ function openReportClipsOverlay() {
         }
         return `<button type="button" class="report-clip-item" data-clip-i="${i}">
           <strong>${label}</strong>
-          <span>${escapeHtml(it.text.slice(0, 160))}</span>
+          <span>${highlightUserNames(it.text.slice(0, 160), reportKnownUserNames)}</span>
         </button>`;
       })
       .join("");

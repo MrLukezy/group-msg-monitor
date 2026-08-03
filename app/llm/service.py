@@ -2285,9 +2285,10 @@ async def run_group_summary(
                 system=CONTEXT_CHECK_SYSTEM,
                 user=check_user,
                 temperature=0.1,
-                timeout_sec=60,
+                timeout_sec=90,
                 force_json=True,
                 history=history or None,
+                retries=1,
             )
             tokens.add(check_usage)
             check = extract_json_object(check_raw)
@@ -2488,8 +2489,9 @@ async def run_group_summary(
             system=analysis_system,
             user=user_prompt,
             history=history or None,
-            timeout_sec=180,
+            timeout_sec=300,
             max_tokens=final_max_tokens,
+            retries=2,
         )
         tokens.add(final_usage)
         report = extract_json_object(raw)

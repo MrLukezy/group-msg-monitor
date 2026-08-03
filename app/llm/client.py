@@ -227,6 +227,28 @@ def extract_json_object(text: str) -> dict[str, Any]:
     return data
 
 
+def _is_retryable_llm_error(exc: BaseException) -> bool:
+    """超时、网络抖动、限流与 5xx 可重试；4xx（除 408/429）不重试。"""
+    if isinstance(exc, (asyncio.TimeoutError, TimeoutError)):
+        return True
+    if isinstance(exc, aiohttp.ClientError):
+        return True
+    if isinstance(exc, RuntimeError):
+        msg = str(exc)
+        m = re.search(r"HTTP\s+(\d{3})", msg)
+        if m:
+            code = int(m.group(1))
+            return code in (408, 429, 500, 502, 503, 504)
+    return False
+
+
+def _client_timeout(timeout_sec: float) -> aiohttp.ClientTimeout:
+    """连接尽快失败，总耗时留给模型生成。"""
+    total = max(1.0, float(timeout_sec))
+    connect = min(30.0, total)
+    return aiohttp.ClientTimeout(total=total, connect=connect, sock_connect=connect)
+
+
 async def chat_complete(
     provider: LlmProvider,
     *,
@@ -238,53 +260,86 @@ async def chat_complete(
     force_json: bool = True,
     history: list[dict[str, str]] | None = None,
     max_tokens: int | None = None,
+    retries: int = 2,
 ) -> tuple[str, TokenUsage]:
     """单轮或多轮对话。history 为既有 user/assistant 消息（不含当前 system/user）。
 
     返回 (文本内容, token 用量)。部分 Provider 可能无法回报 usage，此时为 0。
+    retries：可重试错误的额外尝试次数（默认 2，合计最多 3 次）。
     """
     ptype = (provider.type or "openai_compatible").lower()
     use_model = model or provider.default_model
-    if ptype == "openai_compatible":
-        return await _openai_compatible(
-            provider,
-            model=use_model,
-            system=system,
-            user=user,
-            temperature=temperature,
-            timeout_sec=timeout_sec,
-            force_json=force_json,
-            history=history,
-            max_tokens=max_tokens,
-        )
-    if ptype == "opencode":
-        # OpenCode 路径暂拼成单轮文本
-        merged_user = user
-        if history:
-            chunks = []
-            for h in history:
-                role = h.get("role") or "user"
-                chunks.append(f"[{role}]\n{h.get('content') or ''}")
-            chunks.append(f"[user]\n{user}")
-            merged_user = "\n\n".join(chunks)
-        text = await _opencode(
-            provider, model=use_model, system=system, user=merged_user, timeout_sec=timeout_sec
-        )
-        return text, TokenUsage()
-    if ptype == "cursor":
-        merged_user = user
-        if history:
-            chunks = []
-            for h in history:
-                role = h.get("role") or "user"
-                chunks.append(f"[{role}]\n{h.get('content') or ''}")
-            chunks.append(f"[user]\n{user}")
-            merged_user = "\n\n".join(chunks)
-        text = await _cursor_sdk(
-            provider, model=use_model, system=system, user=merged_user, timeout_sec=timeout_sec
-        )
-        return text, TokenUsage()
-    raise ValueError(f"不支持的 LLM provider type: {provider.type}")
+    attempts = max(1, int(retries) + 1)
+    last_err: BaseException | None = None
+
+    for attempt in range(1, attempts + 1):
+        try:
+            if ptype == "openai_compatible":
+                return await _openai_compatible(
+                    provider,
+                    model=use_model,
+                    system=system,
+                    user=user,
+                    temperature=temperature,
+                    timeout_sec=timeout_sec,
+                    force_json=force_json,
+                    history=history,
+                    max_tokens=max_tokens,
+                )
+            if ptype == "opencode":
+                # OpenCode 路径暂拼成单轮文本
+                merged_user = user
+                if history:
+                    chunks = []
+                    for h in history:
+                        role = h.get("role") or "user"
+                        chunks.append(f"[{role}]\n{h.get('content') or ''}")
+                    chunks.append(f"[user]\n{user}")
+                    merged_user = "\n\n".join(chunks)
+                text = await _opencode(
+                    provider,
+                    model=use_model,
+                    system=system,
+                    user=merged_user,
+                    timeout_sec=timeout_sec,
+                )
+                return text, TokenUsage()
+            if ptype == "cursor":
+                merged_user = user
+                if history:
+                    chunks = []
+                    for h in history:
+                        role = h.get("role") or "user"
+                        chunks.append(f"[{role}]\n{h.get('content') or ''}")
+                    chunks.append(f"[user]\n{user}")
+                    merged_user = "\n\n".join(chunks)
+                text = await _cursor_sdk(
+                    provider,
+                    model=use_model,
+                    system=system,
+                    user=merged_user,
+                    timeout_sec=timeout_sec,
+                )
+                return text, TokenUsage()
+            raise ValueError(f"不支持的 LLM provider type: {provider.type}")
+        except Exception as e:
+            last_err = e
+            if attempt >= attempts or not _is_retryable_llm_error(e):
+                raise
+            delay = min(8.0, 1.0 * (2 ** (attempt - 1)))
+            logger.warning(
+                "LLM 调用失败将重试 attempt=%s/%s delay=%.1fs provider=%s model=%s err=%s",
+                attempt,
+                attempts,
+                delay,
+                provider.name,
+                use_model,
+                e,
+            )
+            await asyncio.sleep(delay)
+
+    assert last_err is not None
+    raise last_err
 
 
 async def test_provider_connection(
@@ -318,7 +373,7 @@ async def test_provider_connection(
 
     if ptype == "opencode":
         base = (provider.base_url or "http://127.0.0.1:4096").rstrip("/")
-        timeout = aiohttp.ClientTimeout(total=timeout_sec)
+        timeout = _client_timeout(timeout_sec)
         async with aiohttp.ClientSession(timeout=timeout) as session:
             last_err = ""
             for path in ("/global/health", "/health", "/session", "/"):
@@ -350,7 +405,7 @@ async def test_provider_connection(
     models_endpoint = ""
     models_count = 0
     last_err = ""
-    timeout = aiohttp.ClientTimeout(total=timeout_sec)
+    timeout = _client_timeout(timeout_sec)
     headers = {}
     if provider.api_key:
         headers["Authorization"] = f"Bearer {provider.api_key}"
@@ -468,7 +523,7 @@ async def _openai_compatible(
     }
     if force_json:
         payload["response_format"] = {"type": "json_object"}
-    timeout = aiohttp.ClientTimeout(total=timeout_sec)
+    timeout = _client_timeout(timeout_sec)
     async with aiohttp.ClientSession(timeout=timeout) as session:
         async with session.post(url, headers=headers, json=payload) as resp:
             body = await resp.text()
@@ -513,7 +568,7 @@ async def _opencode(
 ) -> str:
     """优先 REST；若安装了 opencode-ai 包也可后续扩展。"""
     base = (provider.base_url or "http://127.0.0.1:4096").rstrip("/")
-    timeout = aiohttp.ClientTimeout(total=timeout_sec)
+    timeout = _client_timeout(timeout_sec)
     prompt = f"{system}\n\n---\n\n{user}"
     headers = {"Content-Type": "application/json"}
     if provider.api_key:
@@ -683,7 +738,7 @@ async def describe_image(
             }
         ],
     }
-    timeout = aiohttp.ClientTimeout(total=timeout_sec)
+    timeout = _client_timeout(timeout_sec)
     try:
         async with aiohttp.ClientSession(timeout=timeout) as session:
             async with session.post(url, headers=headers, json=payload) as resp:

@@ -1007,8 +1007,15 @@ input::placeholder, textarea::placeholder {
 }
 
 .msg-sender {
-  color: var(--accent);
   font-weight: 600;
+}
+
+.user-name,
+.msg-sender .user-name,
+.msg-at,
+.report-user-name {
+  color: #f5c542;
+  font-weight: 650;
 }
 
 .msg-time {
@@ -1110,8 +1117,9 @@ input::placeholder, textarea::placeholder {
 }
 
 .msg-at {
-  color: var(--blue);
-  font-weight: 600;
+  /* 兼容旧 class；新渲染统一用 .user-name */
+  color: #f5c542;
+  font-weight: 650;
 }
 
 .msg-reply {
@@ -1656,7 +1664,10 @@ input::placeholder, textarea::placeholder {
   white-space: normal;
   color: var(--text);
 }
-.report-detail-body .report-user-name {
+.report-detail-body .user-name,
+.report-detail-body .report-user-name,
+.report-ask-answer .user-name,
+.report-clip-item .user-name {
   color: #f5c542;
   font-weight: 650;
 }

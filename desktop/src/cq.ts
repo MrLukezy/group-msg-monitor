@@ -21,6 +21,45 @@ function escapeHtml(s: string) {
     .replace(/"/g, "&quot;");
 }
 
+/** 去重、过滤过短/过长，长名优先匹配，避免短名误伤。 */
+export function normalizeKnownUserNames(names: Iterable<string>): string[] {
+  return [
+    ...new Set(
+      [...names]
+        .map((n) => (n || "").trim())
+        .filter((n) => n.length >= 2 && n.length <= 32),
+    ),
+  ].sort((a, b) => b.length - a.length);
+}
+
+/** 显式用户名（发送者、@、活跃成员等）高亮包装。 */
+export function userNameHtml(name: string, opts?: { at?: boolean }): string {
+  const n = (name || "").trim() || "未知";
+  const prefix = opts?.at ? "@" : "";
+  return `<span class="user-name">${prefix}${escapeHtml(n)}</span>`;
+}
+
+/**
+ * 在纯文本中把已知用户名替换为高亮 span（先占位再 escape，避免嵌套 HTML 注入）。
+ */
+export function highlightUserNames(text: string, knownNames: string[] = []): string {
+  if (!text) return "";
+  const known = normalizeKnownUserNames(knownNames);
+  if (!known.length) return escapeHtml(text);
+  const hits: string[] = [];
+  let out = text;
+  for (const name of known) {
+    if (!out.includes(name)) continue;
+    const parts = out.split(name);
+    out = parts.join(`\u0000N${hits.length}\u0000`);
+    hits.push(name);
+  }
+  return escapeHtml(out).replace(/\u0000N(\d+)\u0000/g, (_, i) => {
+    const name = hits[Number(i)] || "";
+    return `<span class="user-name">${escapeHtml(name)}</span>`;
+  });
+}
+
 function unescapeCq(value: string) {
   return value
     .replace(/&#91;/g, "[")
@@ -274,7 +313,7 @@ function resolveImageOpenUrl(seg: { url?: string; file?: string }): string {
   return "";
 }
 
-export function renderMsgHtml(raw: string): string {
+export function renderMsgHtml(raw: string, knownNames: string[] = []): string {
   const segs = parseCqContent(raw);
   if (!segs.length) {
     return `<span class="msg-empty">（空消息）</span>`;
@@ -284,7 +323,9 @@ export function renderMsgHtml(raw: string): string {
   for (const seg of segs) {
     switch (seg.kind) {
       case "text":
-        parts.push(`<span class="msg-text">${escapeHtml(seg.text)}</span>`);
+        parts.push(
+          `<span class="msg-text">${highlightUserNames(seg.text, knownNames)}</span>`,
+        );
         break;
       case "link":
         if (!seg.url) break;
@@ -317,7 +358,7 @@ export function renderMsgHtml(raw: string): string {
       case "reply": {
         const idPart = seg.id ? `#${escapeHtml(seg.id)}` : "";
         const textPart = seg.text
-          ? `<span class="msg-reply-text">${escapeHtml(seg.text)}</span>`
+          ? `<span class="msg-reply-text">${highlightUserNames(seg.text, knownNames)}</span>`
           : `<span class="msg-reply-text muted">原消息 ${idPart || ""}</span>`;
         parts.push(
           `<div class="msg-reply"><span class="msg-reply-label">回复</span>${textPart}</div>`,
@@ -326,7 +367,7 @@ export function renderMsgHtml(raw: string): string {
       }
       case "at": {
         const who = seg.name || seg.qq || "";
-        parts.push(`<span class="msg-at">@${escapeHtml(who)}</span>`);
+        parts.push(userNameHtml(who || "某人", { at: true }));
         break;
       }
       case "file":
