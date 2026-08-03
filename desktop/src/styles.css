@@ -2898,10 +2898,21 @@ input::placeholder, textarea::placeholder {
   justify-content: center;
   gap: 10px;
   padding: 16px;
-  overflow: auto;
+  overflow: hidden;
   background:
     radial-gradient(circle at 20% 10%, color-mix(in srgb, var(--accent-2) 10%, transparent), transparent 40%),
     var(--bg-0);
+  touch-action: none;
+  user-select: none;
+}
+.image-lightbox-stage {
+  flex: 1;
+  min-height: 0;
+  width: 100%;
+  display: grid;
+  place-items: center;
+  overflow: hidden;
+  cursor: zoom-in;
 }
 .image-lightbox-body img {
   display: block;
@@ -2911,6 +2922,11 @@ input::placeholder, textarea::placeholder {
   border-radius: 10px;
   background: #111;
   box-shadow: 0 8px 28px color-mix(in srgb, #000 35%, transparent);
+  transform-origin: center center;
+  transform: translate(0px, 0px) scale(1);
+  will-change: transform;
+  transition: transform 0.05s ease-out;
+  pointer-events: none;
 }
 .image-lightbox-body .field-hint {
   margin: 0;

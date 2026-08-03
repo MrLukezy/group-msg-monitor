@@ -80,6 +80,19 @@ CONTEXT_CHECK_SYSTEM = (
     "禁止编造 id 或臆测窗外具体内容。"
 )
 
+IMAGE_NEED_CHECK_SYSTEM = (
+    "你是群聊图片识别必要性审查助手。"
+    "记录中的图片已用「[图片]」占位，你只能根据文字判断是否需要视觉识别图片内容。"
+    "必须输出合法 JSON："
+    '{"need_images":bool,"reason":string,"image_message_ids":string[]}。'
+    "need_images=true 仅当文字表明分析依赖图片内容，例如："
+    "讨论/询问图中信息、引用截图/报错/配置/代码/单据、风险或关键证据可能在图中且文字不足以理解。"
+    "纯表情包、无讨论的刷图、文字已充分说明图意时 need_images=false。"
+    "image_message_ids 填写需要识别的消息 id（仅限记录中已出现的 id=…）；"
+    "need_images=true 但无法精确指出时，可返回空数组表示识别窗口内相关图片。"
+    "禁止编造 id；禁止臆测图中具体内容。"
+)
+
 # 内置：GitHub / AI 相关必须多轮深挖
 TOPIC_DEEP_DIVE_RULES = (
     "若历史记录中出现 GitHub 仓库（含 github.com、gist、owner/repo、clone/PR/issue 等），"
@@ -1484,15 +1497,57 @@ async def ensure_rows_images_local(rows: list[dict[str, Any]], group_id: str) ->
     return changed
 
 
+def rows_contain_cq_images(rows: list[dict[str, Any]]) -> bool:
+    return any("[cq:image" in (r.get("content") or "").lower() for r in rows)
+
+
+def replace_cq_images_with_placeholder(
+    content: str, placeholder: str = "[图片]"
+) -> str:
+    """把 CQ 图片标签替换为短占位，避免把超长 url 塞进文本模型。"""
+    text = content or ""
+    if "[cq:image" not in text.lower():
+        return text
+    refs = extract_image_refs(text)
+    if not refs:
+        return text
+    new_c = text
+    for ref in refs:
+        new_c = new_c.replace(ref["raw"], placeholder, 1)
+    return new_c
+
+
+def apply_image_placeholders(rows: list[dict[str, Any]], placeholder: str = "[图片]") -> int:
+    """就地把行内 CQ 图片改为占位符，返回改写条数。"""
+    changed = 0
+    for r in rows:
+        content = r.get("content") or ""
+        new_c = replace_cq_images_with_placeholder(content, placeholder)
+        if new_c != content:
+            r["content"] = new_c
+            changed += 1
+    return changed
+
+
+def format_transcript_with_image_placeholders(
+    rows: list[dict[str, Any]], max_chars: int = 24000
+) -> str:
+    """生成把图片换成 [图片] 的 transcript，不修改原 rows。"""
+    shadow = [{**r, "content": replace_cq_images_with_placeholder(r.get("content") or "")} for r in rows]
+    return format_transcript(shadow, max_chars=max_chars)
+
+
 async def enrich_rows_with_image_captions(
     rows: list[dict[str, Any]],
     *,
     provider: Any,
     model: str,
     max_images: int = 8,
+    message_ids: set[str] | None = None,
 ) -> dict[str, Any]:
     """
     对本地图片做视觉描述，把 CQ 替换为 [图片描述: …] 供文本模型分析。
+    message_ids 非空时只识别这些消息中的图片，其余 CQ 改为 [图片]。
     返回 meta：{captioned, skipped, captions:[{path, text}], token_usage}
     """
     meta: dict[str, Any] = {
@@ -1504,10 +1559,15 @@ async def enrich_rows_with_image_captions(
     tokens = TokenUsage()
     cache: dict[str, str] = {}
     budget = max(0, int(max_images))
+    allow_ids = {str(x).strip() for x in (message_ids or set()) if str(x).strip()} or None
 
     for r in rows:
         content = (r.get("content") or "").strip()
         if not content or "[cq:image" not in content.lower():
+            continue
+        mid = str(r.get("message_id") or "").strip()
+        if allow_ids is not None and mid not in allow_ids:
+            r["content"] = replace_cq_images_with_placeholder(content)
             continue
         refs = extract_image_refs(content)
         if not refs:
@@ -2389,43 +2449,113 @@ async def run_group_summary(
             # 只为补引用，本轮后结束
             break
 
-    # 正式分析前：补本地化（含多轮新增消息）+ 可选视觉描述
+    # 正式分析前：补本地化（含多轮新增消息）+ 按需视觉描述
     try:
         await ensure_rows_images_local(rows, group_id)
     except Exception:
         logger.exception("正式分析前图片本地化失败 group=%s", group_id)
-    image_meta: dict[str, Any] = {"captioned": 0, "skipped": 0, "captions": []}
+    image_meta: dict[str, Any] = {
+        "captioned": 0,
+        "skipped": 0,
+        "captions": [],
+        "need_images": None,
+        "gate_reason": "",
+    }
     if image_enabled:
-        try:
-            image_meta = await enrich_rows_with_image_captions(
+        if rows_contain_cq_images(rows):
+            gate_transcript = format_transcript_with_image_placeholders(
                 rows,
-                provider=image_provider,
-                model=image_model_name,
-                max_images=MANUAL_MAX_IMAGES if job_type == "manual" else 8,
+                max_chars=(
+                    MANUAL_TRANSCRIPT_MAX_CHARS if job_type == "manual" else 24000
+                ),
             )
-            img_tu = image_meta.get("token_usage")
-            if isinstance(img_tu, dict):
-                tokens.add(
-                    TokenUsage(
-                        prompt_tokens=int(img_tu.get("prompt_tokens") or 0),
-                        completion_tokens=int(img_tu.get("completion_tokens") or 0),
-                        total_tokens=int(img_tu.get("total_tokens") or 0),
-                    )
+            gate_user = (
+                "请根据下列群聊文字判断：是否需要视觉识别其中「[图片]」的内容，"
+                "才能完成主题/风险/要点分析。只输出审查 JSON。\n\n"
+                f"{analysis_instructions}\n\n"
+                f"{_build_meta_block()}\n聊天记录:\n{gate_transcript}"
+            )
+            need_images = False
+            gate_ids: list[str] = []
+            gate_reason = ""
+            try:
+                gate_raw, gate_usage = await chat_complete(
+                    provider,
+                    model=model_name,
+                    system=IMAGE_NEED_CHECK_SYSTEM,
+                    user=gate_user,
+                    temperature=0.1,
+                    timeout_sec=90,
+                    force_json=True,
+                    retries=1,
                 )
-            if image_meta.get("captioned"):
-                source = f"{source}；已视觉识别图片 {image_meta['captioned']} 张"
-        except Exception:
-            logger.exception("图片视觉描述失败 group=%s", group_id)
+                tokens.add(gate_usage)
+                gate = extract_json_object(gate_raw)
+                need_images = bool(gate.get("need_images"))
+                gate_reason = str(gate.get("reason") or "").strip()
+                if isinstance(gate.get("image_message_ids"), list):
+                    gate_ids = [
+                        str(x).strip()
+                        for x in gate["image_message_ids"]
+                        if str(x).strip()
+                    ]
+            except Exception:
+                # 门控失败时回退为识别（避免静默丢掉关键图证）
+                logger.exception(
+                    "图片必要性审查失败 group=%s，回退为识别窗口内图片", group_id
+                )
+                need_images = True
+                gate_reason = "图片必要性审查失败，回退识别"
+
+            image_meta["need_images"] = need_images
+            image_meta["gate_reason"] = gate_reason
+
+            if need_images:
+                try:
+                    id_filter = set(gate_ids) if gate_ids else None
+                    image_meta = await enrich_rows_with_image_captions(
+                        rows,
+                        provider=image_provider,
+                        model=image_model_name,
+                        max_images=MANUAL_MAX_IMAGES if job_type == "manual" else 8,
+                        message_ids=id_filter,
+                    )
+                    image_meta["need_images"] = True
+                    image_meta["gate_reason"] = gate_reason
+                    img_tu = image_meta.get("token_usage")
+                    if isinstance(img_tu, dict):
+                        tokens.add(
+                            TokenUsage(
+                                prompt_tokens=int(img_tu.get("prompt_tokens") or 0),
+                                completion_tokens=int(
+                                    img_tu.get("completion_tokens") or 0
+                                ),
+                                total_tokens=int(img_tu.get("total_tokens") or 0),
+                            )
+                        )
+                    if image_meta.get("captioned"):
+                        source = (
+                            f"{source}；LLM判定需识图，"
+                            f"已视觉识别 {image_meta['captioned']} 张"
+                        )
+                    else:
+                        source = f"{source}；LLM判定需识图，但未能成功识别图片"
+                    if gate_reason:
+                        source = f"{source}（{gate_reason}）"
+                except Exception:
+                    logger.exception("图片视觉描述失败 group=%s", group_id)
+                    apply_image_placeholders(rows)
+                    source = f"{source}；图片识别失败，已用占位替换"
+            else:
+                apply_image_placeholders(rows)
+                reason_s = f"（{gate_reason}）" if gate_reason else ""
+                source = f"{source}；LLM判定无需识图，已跳过视觉识别{reason_s}"
+        else:
+            image_meta["need_images"] = False
+            image_meta["gate_reason"] = "窗口内无图片"
     else:
         # 未启用图片分析：把 CQ 图片改成占位，避免把超长 url 塞进文本模型
-        for r in rows:
-            content = (r.get("content") or "")
-            if "[cq:image" in content.lower():
-                refs = extract_image_refs(content)
-                new_c = content
-                for ref in refs:
-                    new_c = new_c.replace(ref["raw"], "[图片]", 1)
-                r["content"] = new_c
+        apply_image_placeholders(rows)
         source = f"{source}；图片分析已关闭"
 
     transcript = format_transcript(
@@ -2447,6 +2577,13 @@ async def run_group_summary(
             f"跳过/失败 {image_meta.get('skipped') or 0} 张；"
             "请将「[图片描述: …]」纳入主题与风险分析。\n"
         )
+    elif image_meta.get("need_images") is False and image_meta.get("gate_reason"):
+        base_meta += (
+            f"图片识别: 已跳过（LLM 判定文字足以分析；"
+            f"{image_meta.get('gate_reason')}）。\n"
+        )
+    elif image_meta.get("need_images") is False:
+        base_meta += "图片识别: 已跳过（LLM 判定无需识别图片内容）。\n"
 
     user_prompt = (
         f"{analysis_instructions}\n\n"
@@ -2531,6 +2668,8 @@ async def run_group_summary(
             "earlier_messages": earlier_added_total,
             "images_captioned": int(image_meta.get("captioned") or 0),
             "images_skipped": int(image_meta.get("skipped") or 0),
+            "images_need_check": image_meta.get("need_images"),
+            "images_gate_reason": str(image_meta.get("gate_reason") or ""),
             "focus_topics": final_focus.get("labels") or [],
             "custom_prompt_applied": bool(analysis_prompt.strip()),
             "used_global_defaults": use_global_defaults,
