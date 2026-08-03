@@ -36,4 +36,8 @@ third_party/
 desktop/node_modules/
 desktop/dist/
 desktop/src-tauri/target/
+desktop/src-tauri/icons/android/
+desktop/src-tauri/icons/ios/
+desktop/src-tauri/icons/generated/
+desktop/public/theme-atmospheres/raw/
 desktop/.vscode/

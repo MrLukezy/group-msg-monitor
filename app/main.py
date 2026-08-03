@@ -315,21 +315,36 @@ class MonitorApp:
             self.stop_file_watcher(),
         ]
 
-        # QQ：当前仅支持 OneBot 完整监听。
+        # QQ：OneBot 完整监听，或官方 QQ 被动采集（通知 + UIA）。
         if ch.qq.bound:
-            ws = app_settings.onebot_ws_url or self.settings.onebot_ws_url
-            token = app_settings.onebot_access_token or self.settings.onebot_access_token
-            self.qq_client = OneBotClient(
-                ws_url=ws,
-                access_token=token,
-                on_event=self.on_onebot_event,
-                reconnect_min_delay=self.settings.reconnect_min_delay,
-                reconnect_max_delay=self.settings.reconnect_max_delay,
-            )
-            self.qq_client.ws_url = build_ws_url(ws, token)
-            self.qq_client.access_token = token
-            tasks.append(self.qq_client.run_forever())
-            logger.info("通道 QQ 已启用 | mode=onebot ws=%s", ws)
+            if ch.qq.mode == "passive":
+                from app.channels.qq_passive import QqPassiveAdapter
+
+                self.qq_passive = QqPassiveAdapter(
+                    on_message=self.handle_group_event,
+                    poll_seconds=ch.qq.poll_seconds,
+                    group_name_map=ch.qq.group_name_map,
+                )
+                tasks.append(self.qq_passive.run_forever())
+                logger.info(
+                    "通道 QQ 已启用 | mode=passive poll=%.1fs map=%s",
+                    ch.qq.poll_seconds,
+                    len(ch.qq.group_name_map),
+                )
+            else:
+                ws = app_settings.onebot_ws_url or self.settings.onebot_ws_url
+                token = app_settings.onebot_access_token or self.settings.onebot_access_token
+                self.qq_client = OneBotClient(
+                    ws_url=ws,
+                    access_token=token,
+                    on_event=self.on_onebot_event,
+                    reconnect_min_delay=self.settings.reconnect_min_delay,
+                    reconnect_max_delay=self.settings.reconnect_max_delay,
+                )
+                self.qq_client.ws_url = build_ws_url(ws, token)
+                self.qq_client.access_token = token
+                tasks.append(self.qq_client.run_forever())
+                logger.info("通道 QQ 已启用 | mode=onebot ws=%s", ws)
 
         else:
             logger.info("通道 QQ 未绑定，跳过 QQ 采集")

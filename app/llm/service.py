@@ -35,15 +35,20 @@ logger = logging.getLogger(__name__)
 DEFAULT_SYSTEM = (
     "你是群聊监控分析助手。只基于给定记录分析，禁止编造。"
     "必须输出合法 JSON 对象，字段含：headline, topics, key_points, risks, "
-    "action_items, sentiment, notable_users, deep_dives, appendix, context_usage。"
+    "action_items, sentiment, notable_users, appendix, context_usage。"
     "risks 项含 level/type/detail/evidence；evidence 必须是原文摘录。"
     "notable_users 项含 user_id/name/role/summary。"
-    "deep_dives 为深入分析数组，项含 topic/detail/evidence："
+    "key_points 必须是对象数组（禁止纯字符串），每项含："
+    "title（一句话要点）、summary（2～4 句简述）、"
+    "deep_dive（{detail, evidence}：detail 建议 120～400 字深入分析，evidence 为原文摘录）、"
+    "nouns（[{term, meaning}] 本要点相关名词/黑话）、"
+    "links（[{url, summary}] 本要点相关链接）、notes（[string] 本要点补充说明）。"
+    "每个要点都必须有独立的 deep_dive，深入分析绑定在对应要点内，不要把深入分析单独拆到别处。"
     "当出现 GitHub 仓库、AI/大模型相关名词，或用户自定义要求需深挖时，"
-    "必须在 deep_dives 中写长文展开（每条 detail 建议 120~400 字），不要只写一句话。"
-    "appendix 为附录对象，含：nouns（[{term, meaning}] 名词/黑话解析）、"
-    "links（[{url, summary}] 链接详解）、notes（[string] 补充说明）。"
-    "若某类附录无内容，用空数组；有 GitHub/AI 内容时 appendix 也应尽量充实。"
+    "必须在对应要点的 deep_dive.detail 中写长文展开，不要只写一句话。"
+    "appendix 为全局附录对象，含：nouns、links、notes（格式同上）；"
+    "要点相关内容优先写在该要点的 nouns/links/notes 中；appendix 仅放跨要点或无法归类的补充。"
+    "若某类数组无内容，用空数组；有 GitHub/AI 内容时要点内 appendix 字段也应尽量充实。"
     "context_usage 必填："
     "{used_earlier_context:bool, earlier_rounds:int, earlier_messages:int, summary:string}；"
     "若分析使用了配置时间窗之前补入的消息/引用原文，used_earlier_context 必须为 true，"
@@ -51,7 +56,7 @@ DEFAULT_SYSTEM = (
     "记录可能含「补前文/补后文/引用补全」标记，请把它们当作同一段多轮对话理解。"
     "消息中可能含「[图片描述: …]」，这是对聊天图片的视觉识别结果，必须纳入主题与风险分析。"
     "用户消息中的「本群自定义分析要求」与「主题深挖规则」优先级最高，必须遵守；"
-    "允许并鼓励在 deep_dives/appendix/key_points 中明显扩充篇幅，不要为了短而省略。"
+    "允许并鼓励在 key_points（含 deep_dive/nouns/notes）中明显扩充篇幅，不要为了短而省略。"
 )
 
 CONTEXT_CHECK_SYSTEM = (
@@ -74,9 +79,9 @@ TOPIC_DEEP_DIVE_RULES = (
     "或 AI 相关名词（大模型、LLM、GPT、Claude、Gemini、Cursor、Agent、Prompt、RAG、微调、"
     "OpenAI、Anthropic、通义、文心、DeepSeek 等），必须："
     "1) 通过多轮向前补文尽量凑齐相关讨论上下文；"
-    "2) 在 deep_dives 中对每个仓库/名词做深入分析并明显扩充篇幅；"
-    "3) 仓库链接写入 appendix.links（说明用途、讨论结论；不确定处标明「记录不足」）；"
-    "4) AI 名词写入 appendix.nouns（解释含义与群内用法）；"
+    "2) 为每个仓库/名词建立独立 key_point，并在该要点的 deep_dive 中深入分析、明显扩充篇幅；"
+    "3) 仓库链接写入对应要点的 links（或全局 appendix.links；说明用途、讨论结论；不确定处标明「记录不足」）；"
+    "4) AI 名词写入对应要点的 nouns（或全局 appendix.nouns；解释含义与群内用法）；"
     "5) 禁止只给一句带过。"
 )
 
@@ -1566,6 +1571,149 @@ def risk_max_from_report(report: dict[str, Any]) -> str:
     return label
 
 
+def _normalize_noun_items(raw: Any) -> list[dict[str, str]]:
+    out: list[dict[str, str]] = []
+    if not isinstance(raw, list):
+        return out
+    for item in raw:
+        if isinstance(item, dict):
+            term = str(item.get("term") or "").strip()
+            meaning = str(item.get("meaning") or "").strip()
+            if term or meaning:
+                out.append({"term": term, "meaning": meaning})
+        elif isinstance(item, str) and item.strip():
+            out.append({"term": item.strip(), "meaning": ""})
+    return out
+
+
+def _normalize_link_items(raw: Any) -> list[dict[str, str]]:
+    out: list[dict[str, str]] = []
+    if not isinstance(raw, list):
+        return out
+    for item in raw:
+        if isinstance(item, dict):
+            url = str(item.get("url") or "").strip()
+            summary = str(item.get("summary") or "").strip()
+            if url or summary:
+                out.append({"url": url, "summary": summary})
+        elif isinstance(item, str) and item.strip():
+            out.append({"url": item.strip(), "summary": ""})
+    return out
+
+
+def _normalize_note_items(raw: Any) -> list[str]:
+    if not isinstance(raw, list):
+        return []
+    return [str(x).strip() for x in raw if str(x).strip()]
+
+
+def _normalize_deep_dive(raw: Any, *, fallback_topic: str = "") -> dict[str, str]:
+    if isinstance(raw, dict):
+        detail = str(raw.get("detail") or "").strip()
+        evidence = str(raw.get("evidence") or "").strip()
+        if not detail and raw.get("topic"):
+            # 兼容旧 deep_dives 项被误塞进来
+            detail = str(raw.get("topic") or "").strip()
+        return {"detail": detail, "evidence": evidence}
+    if isinstance(raw, str) and raw.strip():
+        return {"detail": raw.strip(), "evidence": ""}
+    if fallback_topic:
+        return {"detail": "", "evidence": ""}
+    return {"detail": "", "evidence": ""}
+
+
+def normalize_key_point(item: Any, *, index: int = 0) -> dict[str, Any]:
+    """将要点规范为绑定 deep_dive 的对象结构。"""
+    if isinstance(item, str):
+        title = item.strip()
+        return {
+            "title": title or f"要点 {index + 1}",
+            "summary": "",
+            "deep_dive": {"detail": "", "evidence": ""},
+            "nouns": [],
+            "links": [],
+            "notes": [],
+        }
+    if not isinstance(item, dict):
+        return {
+            "title": f"要点 {index + 1}",
+            "summary": "",
+            "deep_dive": {"detail": "", "evidence": ""},
+            "nouns": [],
+            "links": [],
+            "notes": [],
+        }
+    title = str(item.get("title") or item.get("point") or "").strip()
+    summary = str(item.get("summary") or "").strip()
+    if not title and summary:
+        title = summary[:40] + ("…" if len(summary) > 40 else "")
+    if not title:
+        title = f"要点 {index + 1}"
+    dive_raw = item.get("deep_dive")
+    if dive_raw is None and (item.get("detail") or item.get("evidence")):
+        dive_raw = {"detail": item.get("detail"), "evidence": item.get("evidence")}
+    return {
+        "title": title,
+        "summary": summary,
+        "deep_dive": _normalize_deep_dive(dive_raw),
+        "nouns": _normalize_noun_items(item.get("nouns")),
+        "links": _normalize_link_items(item.get("links")),
+        "notes": _normalize_note_items(item.get("notes")),
+    }
+
+
+def normalize_report_key_points(report: dict[str, Any]) -> dict[str, Any]:
+    """规范化 key_points；若仅有顶层 deep_dives，尝试并入对应要点。"""
+    raw_points = report.get("key_points")
+    points: list[dict[str, Any]] = []
+    if isinstance(raw_points, list):
+        points = [normalize_key_point(raw_points[i], index=i) for i in range(len(raw_points))]
+
+    deep_dives = report.get("deep_dives")
+    if isinstance(deep_dives, list) and deep_dives:
+        # 若要点缺少 deep_dive.detail，按顺序把顶层 deep_dives 并入
+        for i, d in enumerate(deep_dives):
+            if not isinstance(d, dict):
+                continue
+            dive = _normalize_deep_dive(d)
+            topic = str(d.get("topic") or "").strip()
+            if i < len(points):
+                existing = points[i].get("deep_dive") or {}
+                if not str(existing.get("detail") or "").strip():
+                    points[i]["deep_dive"] = dive
+                if topic and points[i]["title"].startswith("要点 "):
+                    points[i]["title"] = topic
+            else:
+                points.append(
+                    {
+                        "title": topic or f"深入分析 {i + 1}",
+                        "summary": "",
+                        "deep_dive": dive,
+                        "nouns": [],
+                        "links": [],
+                        "notes": [],
+                    }
+                )
+
+    report["key_points"] = points
+    if not isinstance(report.get("deep_dives"), list):
+        report["deep_dives"] = []
+    return report
+
+
+def normalize_report_payload(report: dict[str, Any]) -> dict[str, Any]:
+    """落库前规范化 appendix / key_points 等结构字段。"""
+    if not isinstance(report.get("appendix"), dict):
+        report["appendix"] = {"nouns": [], "links": [], "notes": []}
+    else:
+        ap = report["appendix"]
+        ap["nouns"] = _normalize_noun_items(ap.get("nouns"))
+        ap["links"] = _normalize_link_items(ap.get("links"))
+        ap["notes"] = _normalize_note_items(ap.get("notes"))
+    normalize_report_key_points(report)
+    return report
+
+
 def report_to_md(report: dict[str, Any]) -> str:
     lines = [f"# {report.get('headline') or '群聊摘要'}", ""]
     if report.get("sentiment"):
@@ -1581,8 +1729,45 @@ def report_to_md(report: dict[str, Any]) -> str:
     points = report.get("key_points") or []
     if points:
         lines.append("\n## 要点")
-        for p in points:
-            lines.append(f"- {p}")
+        for i, p in enumerate(points, 1):
+            if isinstance(p, dict):
+                title = p.get("title") or f"要点 {i}"
+                summary = str(p.get("summary") or "").strip()
+                lines.append(f"\n### {i}. {title}")
+                if summary:
+                    lines.append(summary)
+                dive = p.get("deep_dive") if isinstance(p.get("deep_dive"), dict) else {}
+                detail = str((dive or {}).get("detail") or "").strip()
+                evidence = str((dive or {}).get("evidence") or "").strip()
+                if detail:
+                    lines.append(f"\n**深入分析**\n{detail}")
+                if evidence:
+                    lines.append(f"\n> 依据：{evidence}")
+                nouns = p.get("nouns") or []
+                if nouns:
+                    lines.append("\n**名词解析**")
+                    for n in nouns:
+                        if isinstance(n, dict):
+                            lines.append(f"- **{n.get('term', '')}**：{n.get('meaning', '')}")
+                        else:
+                            lines.append(f"- {n}")
+                links = p.get("links") or []
+                if links:
+                    lines.append("\n**相关链接**")
+                    for lk in links:
+                        if isinstance(lk, dict):
+                            url = lk.get("url") or ""
+                            summary_l = lk.get("summary") or ""
+                            lines.append(f"- {url} — {summary_l}".strip(" —"))
+                        else:
+                            lines.append(f"- {lk}")
+                notes = p.get("notes") or []
+                if notes:
+                    lines.append("\n**补充说明**")
+                    for note in notes:
+                        lines.append(f"- {note}")
+            else:
+                lines.append(f"- {p}")
     risks = report.get("risks") or []
     if risks:
         lines.append("\n## 风险")
@@ -1610,10 +1795,22 @@ def report_to_md(report: dict[str, Any]) -> str:
             else:
                 lines.append(f"- {u}")
 
+    # 兼容旧报告：顶层 deep_dives 仍渲染（新报告通常已并入要点）
     deep_dives = report.get("deep_dives") or []
-    if deep_dives:
+    orphan_dives = []
+    if isinstance(deep_dives, list):
+        # 仅当要点里没有对应深入分析内容时才单独展示，避免重复
+        has_bound = any(
+            isinstance(p, dict)
+            and isinstance(p.get("deep_dive"), dict)
+            and str((p.get("deep_dive") or {}).get("detail") or "").strip()
+            for p in points
+        )
+        if not has_bound:
+            orphan_dives = deep_dives
+    if orphan_dives:
         lines.append("\n## 深入分析")
-        for i, d in enumerate(deep_dives, 1):
+        for i, d in enumerate(orphan_dives, 1):
             if isinstance(d, dict):
                 topic = d.get("topic") or f"主题 {i}"
                 detail = d.get("detail") or ""
@@ -2187,9 +2384,11 @@ async def run_group_summary(
     user_prompt = (
         f"{analysis_instructions}\n\n"
         f"{base_meta}\n"
-        "请输出完整分析 JSON（必须含 deep_dives、appendix、context_usage）。\n"
-        "若检测到 GitHub/AI 主题或自定义要求深挖：deep_dives 至少 1～3 条长文，"
-        "appendix.links/nouns 写满相关条目，整体篇幅明显长于普通摘要。\n"
+        "请输出完整分析 JSON（必须含 key_points、appendix、context_usage）。\n"
+        "key_points 必须是对象数组：每项含 title/summary/deep_dive/nouns/links/notes，"
+        "深入分析写在对应要点的 deep_dive 内，不要单独拆开。\n"
+        "若检测到 GitHub/AI 主题或自定义要求深挖：至少产出 1～3 个带长文 deep_dive 的要点，"
+        "相关 links/nouns 写在对应要点内，整体篇幅明显长于普通摘要。\n"
         f"\n聊天记录:\n{transcript}"
     )
 
@@ -2227,15 +2426,7 @@ async def run_group_summary(
         )
         tokens.add(final_usage)
         report = extract_json_object(raw)
-        if not isinstance(report.get("appendix"), dict):
-            report["appendix"] = {"nouns": [], "links": [], "notes": []}
-        else:
-            ap = report["appendix"]
-            ap.setdefault("nouns", [])
-            ap.setdefault("links", [])
-            ap.setdefault("notes", [])
-        if not isinstance(report.get("deep_dives"), list):
-            report["deep_dives"] = []
+        normalize_report_payload(report)
 
         usage = report.get("context_usage")
         if not isinstance(usage, dict):
@@ -2457,3 +2648,174 @@ def list_reports(
                 (lim,),
             ).fetchall()
     return [dict(r) for r in rows]
+
+
+def structured_report_for_api(payload: dict[str, Any]) -> dict[str, Any]:
+    """前端展示用的精简结构化字段（已规范化 key_points）。"""
+    if not isinstance(payload, dict):
+        return {}
+    data = json.loads(json.dumps(payload, ensure_ascii=False))
+    if not isinstance(data, dict):
+        return {}
+    normalize_report_payload(data)
+    return {
+        "headline": data.get("headline") or "",
+        "sentiment": data.get("sentiment") or "",
+        "topics": data.get("topics") if isinstance(data.get("topics"), list) else [],
+        "keyPoints": data.get("key_points") if isinstance(data.get("key_points"), list) else [],
+        "risks": data.get("risks") if isinstance(data.get("risks"), list) else [],
+        "actionItems": data.get("action_items") if isinstance(data.get("action_items"), list) else [],
+        "notableUsers": data.get("notable_users") if isinstance(data.get("notable_users"), list) else [],
+        "appendix": data.get("appendix") if isinstance(data.get("appendix"), dict) else {},
+        "contextUsage": data.get("context_usage") if isinstance(data.get("context_usage"), dict) else {},
+        "failed": bool(data.get("failed")),
+        "skipped": bool(data.get("skipped")),
+    }
+
+
+def has_structured_key_points(payload: dict[str, Any]) -> bool:
+    """是否具备可卡片化展示的要点。
+
+    - 新报告：key_points 已是对象 → True
+    - 旧报告：纯字符串要点 → False（继续用 Markdown）
+    - 旧报告仅有顶层 deep_dives：规范化并入要点后若有深入内容 → True
+    """
+    if not isinstance(payload, dict):
+        return False
+    raw_points = payload.get("key_points")
+    raw_has_object = isinstance(raw_points, list) and any(
+        isinstance(p, dict) for p in raw_points
+    )
+    data = json.loads(json.dumps(payload, ensure_ascii=False))
+    if not isinstance(data, dict):
+        return False
+    normalize_report_payload(data)
+    points = data.get("key_points") or []
+    if not isinstance(points, list) or not points:
+        return False
+    if raw_has_object:
+        return True
+    return any(
+        isinstance(p, dict)
+        and (
+            str(p.get("summary") or "").strip()
+            or str(((p.get("deep_dive") or {}) if isinstance(p.get("deep_dive"), dict) else {}).get("detail") or "").strip()
+            or p.get("nouns")
+            or p.get("links")
+            or p.get("notes")
+        )
+        for p in points
+    )
+
+
+ASK_REPORT_SYSTEM = (
+    "你是群聊分析追问助手。仅基于用户提供的分析摘录作答，禁止编造聊天原文或未给出的事实。"
+    "若信息不足，明确说明「记录不足」。回答简洁、中文、直接给出结论；不要复述整份报告。"
+)
+
+
+async def ask_about_report(
+    report_id: int,
+    question: str,
+    *,
+    selection: str = "",
+    point_index: int | None = None,
+) -> dict[str, Any]:
+    """基于已有报告做单轮追问，返回纯文本答案。"""
+    q = (question or "").strip()
+    if not q:
+        raise ValueError("问题不能为空")
+    db = sqlite_path()
+    ensure_llm_tables(db)
+    with sqlite3.connect(db) as conn:
+        conn.row_factory = sqlite3.Row
+        row = conn.execute(
+            """
+            SELECT id, group_id, headline, report_json
+            FROM llm_reports WHERE id=?
+            """,
+            (int(report_id),),
+        ).fetchone()
+    if not row:
+        raise ValueError("报告不存在")
+
+    payload: dict[str, Any] = {}
+    raw_json = row["report_json"] or ""
+    if raw_json:
+        try:
+            parsed = json.loads(raw_json)
+            if isinstance(parsed, dict):
+                payload = parsed
+        except Exception:
+            payload = {}
+    normalize_report_payload(payload)
+
+    group_id = str(row["group_id"])
+    cfg = load_group_config(group_id)
+    settings = load_app_settings()
+    llm_cfg = cfg.llm_monitor
+    use_global_defaults = bool(getattr(llm_cfg, "use_global_defaults", True))
+    provider_id = (
+        settings.llm.active_provider_id
+        if use_global_defaults
+        else llm_cfg.provider_id or settings.llm.active_provider_id
+    )
+    provider = provider_by_id(settings, provider_id)
+    if provider is None:
+        raise RuntimeError("未配置 LLM Provider，请先在总配置中填写")
+    model_name = (
+        provider.default_model
+        if use_global_defaults
+        else llm_cfg.model or provider.default_model
+    )
+
+    context_parts: list[str] = [
+        f"报告标题：{payload.get('headline') or row['headline'] or ''}",
+    ]
+    points = payload.get("key_points") or []
+    sel = (selection or "").strip()
+    if point_index is not None and isinstance(points, list) and 0 <= int(point_index) < len(points):
+        context_parts.append(
+            "聚焦要点：\n" + json.dumps(points[int(point_index)], ensure_ascii=False)
+        )
+    elif sel:
+        context_parts.append(f"用户选中片段：\n{sel[:2000]}")
+    else:
+        brief = []
+        for i, p in enumerate(points[:12] if isinstance(points, list) else []):
+            if not isinstance(p, dict):
+                brief.append({"index": i, "title": str(p)})
+                continue
+            dive = p.get("deep_dive") if isinstance(p.get("deep_dive"), dict) else {}
+            brief.append(
+                {
+                    "index": i,
+                    "title": p.get("title"),
+                    "summary": p.get("summary"),
+                    "deep_dive_excerpt": str((dive or {}).get("detail") or "")[:400],
+                    "evidence": str((dive or {}).get("evidence") or "")[:300],
+                }
+            )
+        context_parts.append("要点摘要：\n" + json.dumps(brief, ensure_ascii=False))
+
+    user_prompt = (
+        "\n\n".join(context_parts)
+        + "\n\n用户问题：\n"
+        + q
+        + "\n\n请直接回答。"
+    )
+    answer, usage = await chat_complete(
+        provider,
+        model=model_name,
+        system=ASK_REPORT_SYSTEM,
+        user=user_prompt,
+        timeout_sec=90,
+        max_tokens=1024,
+    )
+    text = (answer or "").strip()
+    return {
+        "ok": True,
+        "answer": text,
+        "model": model_name,
+        "tokenUsage": usage.as_dict() if usage else {},
+    }

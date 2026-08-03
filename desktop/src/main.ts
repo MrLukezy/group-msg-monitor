@@ -5,6 +5,25 @@ import gsap from "gsap";
 import QRCode from "qrcode";
 import { formatTime, renderMsgHtml } from "./cq";
 import { setupUiSounds } from "./ui-sounds";
+import {
+  CUSTOM_QUICK_COLORS,
+  DEFAULT_CUSTOM_THEME,
+  DEFAULT_THEME_ID,
+  applyTheme as applyThemeCore,
+  applyOpacityVars,
+  clearCustomWall,
+  fileToWallpaperDataUrl,
+  isValidCustomHex,
+  loadCustomWall,
+  normalizeCustomTheme,
+  samplePaletteFromImage,
+  saveCustomWall,
+  themeDefaultWallOpacity,
+  themesByCategory,
+  type CustomThemePrefs,
+  type ThemeCategory,
+  type ThemeDef,
+} from "./theme";
 
 type StatusInfo = {
   napcatInstalled: boolean;
@@ -105,6 +124,13 @@ type AppSettings = {
   };
   ui?: {
     theme?: string;
+    custom?: {
+      baseColor?: string;
+      mode?: "dark" | "light" | string;
+      source?: "color" | "image" | string;
+    };
+    wallOpacity?: number | null;
+    panelOpacity?: number | null;
   };
 };
 
@@ -137,15 +163,50 @@ type GroupConfig = {
   };
 };
 
+type ReportKeyPoint = {
+  title?: string;
+  summary?: string;
+  deep_dive?: { detail?: string; evidence?: string };
+  nouns?: Array<{ term?: string; meaning?: string } | string>;
+  links?: Array<{ url?: string; summary?: string } | string>;
+  notes?: string[];
+};
+
+type ReportStructured = {
+  headline?: string;
+  sentiment?: string;
+  topics?: Array<{ title?: string; summary?: string; heat?: string } | string>;
+  keyPoints?: ReportKeyPoint[];
+  risks?: Array<{ level?: string; detail?: string; type?: string } | string>;
+  actionItems?: Array<{ task?: string; owner_hint?: string; priority?: string } | string>;
+  notableUsers?: Array<{ name?: string; user_id?: string; summary?: string; role?: string } | string>;
+  appendix?: {
+    nouns?: Array<{ term?: string; meaning?: string } | string>;
+    links?: Array<{ url?: string; summary?: string } | string>;
+    notes?: string[];
+  };
+  contextUsage?: {
+    used_earlier_context?: boolean;
+    earlier_rounds?: number;
+    earlier_messages?: number;
+    summary?: string;
+  };
+  failed?: boolean;
+  skipped?: boolean;
+};
+
 type ReportRow = {
   id: number;
   jobId?: number | null;
   groupId: string;
   headline?: string | null;
+  sentiment?: string | null;
   riskMax?: string | null;
   msgCount?: number | null;
   createdAt: string;
   reportMd?: string | null;
+  reportJson?: ReportStructured | null;
+  hasStructuredPoints?: boolean;
   windowStart?: number | null;
   windowEnd?: number | null;
   windowExtended?: boolean;
@@ -183,8 +244,25 @@ type ReportRow = {
   hasFavoriteMessages?: boolean;
 };
 
+type ReportSubview = "overview" | "point" | "summary";
+
+type AnalysisFavorite = {
+  reportId: number;
+  kind: "point" | "clip";
+  pointIndex?: number;
+  text: string;
+  title?: string;
+  createdAt: string;
+};
+
 const FAVORITES_GROUP_ID = "__favorites__";
+const ANALYSIS_FAV_KEY = "analysisFavorites.v1";
 let monitoredDetailReportId: number | null = null;
+let reportSubview: ReportSubview = "overview";
+let reportSubviewPointIndex: number | null = null;
+let reportDetailMessagesCache: MessageRow[] = [];
+let reportAskContext: { selection?: string; pointIndex?: number | null } = {};
+
 
 const PROVIDER_PRESETS: Record<
   string,
@@ -228,62 +306,6 @@ const PROVIDER_PRESETS: Record<
   },
 };
 
-const THEMES: {
-  id: string;
-  name: string;
-  tagline: string;
-  mode: "dark" | "light";
-  atmosphere?: string;
-  swatches: [string, string, string];
-}[] = [
-  {
-    id: "midnight",
-    name: "星渚",
-    tagline: "星沉沧海，灯火孤洲",
-    mode: "dark",
-    atmosphere: "/theme-atmospheres/midnight.webp",
-    swatches: ["#0a0d12", "#d4a574", "#6b9e9a"],
-  },
-  {
-    id: "daylight",
-    name: "素笺",
-    tagline: "素纸落墨，清光入卷",
-    mode: "light",
-    atmosphere: "/theme-atmospheres/dawn.webp",
-    swatches: ["#f6f3ec", "#5a7a72", "#b08958"],
-  },
-  {
-    id: "ocean",
-    name: "秩序工坊",
-    tagline: "旧线拆解，结构重新归位",
-    mode: "dark",
-    atmosphere: "/theme-atmospheres/refactor.webp",
-    swatches: ["#081015", "#63a5a0", "#728fa8"],
-  },
-  {
-    id: "forest",
-    name: "竹影",
-    tagline: "翠叶筛光，静影沉璧",
-    mode: "light",
-    swatches: ["#f0f5ef", "#5a8a68", "#8aaa7a"],
-  },
-  {
-    id: "rose",
-    name: "杏雨",
-    tagline: "细雨湿春，杏花微照",
-    mode: "light",
-    swatches: ["#f8f1ec", "#c4886a", "#8a9e8a"],
-  },
-  {
-    id: "graphite",
-    name: "无限月读",
-    tagline: "虚空生白，万象皆寂",
-    mode: "dark",
-    atmosphere: "/theme-atmospheres/void.webp",
-    swatches: ["#040408", "#9a7ac8", "#6a98c4"],
-  },
-];
-
 const READ_IDS_KEY = "gmm_read_report_ids";
 const HIDE_SKIPPED_KEY = "gmm_hide_skipped_reports";
 const $ = <T extends HTMLElement>(id: string) => document.getElementById(id) as T;
@@ -315,7 +337,13 @@ const liveUnreadGroups = new Set<string>();
 let monitoredSelectedGroupId: string | null = null;
 let monitoredReportsCache: ReportRow[] = [];
 let monitoredReportTab: "success" | "errors" = "success";
-let selectedTheme = "midnight";
+let selectedTheme = DEFAULT_THEME_ID;
+let customThemePrefs: CustomThemePrefs = { ...DEFAULT_CUSTOM_THEME };
+let themeCategoryTab: ThemeCategory = "image";
+let customThemeDebounce = 0;
+/** null = 跟随皮肤默认 */
+let wallOpacityPref: number | null = null;
+let panelOpacityPref = 0.82;
 let unreadCount = 0;
 let unreadByGroup = new Map<string, number>();
 let unreadReportIds = new Set<number>();
@@ -478,42 +506,346 @@ function syncMonitoredReportTabs(reports: ReportRow[]) {
     ?.classList.toggle("hidden", showingErrors);
 }
 
-function applyTheme(themeId: string) {
-  const theme = THEMES.find((t) => t.id === themeId) || THEMES[0];
-  selectedTheme = theme.id;
-  document.body.setAttribute("data-theme", theme.id);
-  document.documentElement.setAttribute("data-theme", theme.id);
-  document.documentElement.setAttribute("data-theme-mode", theme.mode);
-  document.documentElement.setAttribute(
-    "data-theme-category",
-    theme.atmosphere ? "achievement" : "palette",
+function readCustomPrefsFromForm(): CustomThemePrefs {
+  const colorEl = document.getElementById("custom-base-color") as HTMLInputElement | null;
+  const hexEl = document.getElementById("custom-base-hex") as HTMLInputElement | null;
+  const modeEl = document.querySelector(
+    'input[name="custom-mode"]:checked',
+  ) as HTMLInputElement | null;
+  const sourceBtn = document.querySelector(
+    ".custom-source-tabs .theme-cat-tab.active",
+  ) as HTMLElement | null;
+  const hex = (hexEl?.value || colorEl?.value || customThemePrefs.baseColor || "").trim();
+  return (
+    normalizeCustomTheme({
+      baseColor: isValidCustomHex(hex) ? hex : customThemePrefs.baseColor,
+      mode: modeEl?.value === "light" ? "light" : "dark",
+      source: sourceBtn?.getAttribute("data-custom-source") === "image" ? "image" : "color",
+    }) ?? { ...DEFAULT_CUSTOM_THEME }
   );
+}
+
+function syncCustomThemeForm(prefs: CustomThemePrefs = customThemePrefs) {
+  const colorEl = document.getElementById("custom-base-color") as HTMLInputElement | null;
+  const hexEl = document.getElementById("custom-base-hex") as HTMLInputElement | null;
+  if (colorEl) colorEl.value = prefs.baseColor;
+  if (hexEl) hexEl.value = prefs.baseColor;
+  document.querySelectorAll<HTMLInputElement>('input[name="custom-mode"]').forEach((el) => {
+    el.checked = el.value === prefs.mode;
+  });
+  document.querySelectorAll<HTMLElement>(".custom-source-tabs .theme-cat-tab").forEach((btn) => {
+    const on = btn.getAttribute("data-custom-source") === (prefs.source || "color");
+    btn.classList.toggle("active", on);
+  });
+  document.getElementById("custom-color-fields")?.classList.toggle("hidden", prefs.source === "image");
+  document.getElementById("custom-image-fields")?.classList.toggle("hidden", prefs.source !== "image");
+  const preview = document.getElementById("custom-theme-preview");
+  if (preview) {
+    const wall = prefs.source === "image" ? loadCustomWall() : "";
+    preview.style.backgroundImage = wall
+      ? `linear-gradient(160deg, ${prefs.baseColor}88, transparent 70%), url(${wall})`
+      : `linear-gradient(145deg, ${prefs.baseColor} 0%, color-mix(in srgb, ${prefs.baseColor} 40%, #fff) 100%)`;
+  }
+  const hint = document.getElementById("custom-sample-hint");
+  if (hint && prefs.source === "image") {
+    hint.textContent = loadCustomWall()
+      ? `已采样主色 ${prefs.baseColor}；图片同时作为氛围壁纸。`
+      : "上传后自动采样主色并调整整套配色；图片同时作为氛围壁纸。";
+  }
+}
+
+function effectiveWallOpacity(): number {
+  if (typeof wallOpacityPref === "number") {
+    return Math.max(0, Math.min(1, wallOpacityPref));
+  }
+  return themeDefaultWallOpacity(
+    selectedTheme,
+    selectedTheme === "custom" ? customThemePrefs : null,
+  );
+}
+
+function syncOpacityForm() {
+  const wallEl = document.getElementById("s-wall-opacity") as HTMLInputElement | null;
+  const wallVal = document.getElementById("s-wall-opacity-val");
+  const wallHint = document.getElementById("wall-opacity-hint");
+  const panelEl = document.getElementById("s-panel-opacity") as HTMLInputElement | null;
+  const panelVal = document.getElementById("s-panel-opacity-val");
+  const eff = effectiveWallOpacity();
+  const pct = Math.round(eff * 100);
+  if (wallEl && document.activeElement !== wallEl) wallEl.value = String(pct);
+  if (wallVal) wallVal.textContent = `${pct}%`;
+  if (panelEl && document.activeElement !== panelEl) {
+    panelEl.value = String(Math.round(panelOpacityPref * 100));
+  }
+  if (panelVal) panelVal.textContent = `${Math.round(panelOpacityPref * 100)}%`;
+  const hasWall =
+    themeDefaultWallOpacity(
+      selectedTheme,
+      selectedTheme === "custom" ? customThemePrefs : null,
+    ) > 0 ||
+    (selectedTheme === "custom" && customThemePrefs.source === "image" && !!loadCustomWall());
+  if (wallEl) wallEl.disabled = !hasWall;
+  if (wallHint) {
+    wallHint.textContent = hasWall
+      ? wallOpacityPref == null
+        ? "当前跟随皮肤默认透明度，拖动后将锁定为自定义值。"
+        : "已使用自定义壁纸透明度。点「默认」可恢复皮肤预设。"
+      : "纯色皮肤无壁纸时，此项不生效。";
+  }
+}
+
+function currentThemeHasAtmosphere(): boolean {
+  if (selectedTheme === "custom") {
+    return customThemePrefs.source === "image" && !!loadCustomWall();
+  }
+  return themeDefaultWallOpacity(selectedTheme, null) > 0;
+}
+
+function pushOpacityToDom() {
+  applyOpacityVars({
+    wallOpacity: effectiveWallOpacity(),
+    panelOpacity: panelOpacityPref,
+    hasAtmosphere: currentThemeHasAtmosphere(),
+  });
+}
+
+function applyTheme(themeId: string, prefs?: CustomThemePrefs | null) {
+  if (prefs) customThemePrefs = normalizeCustomTheme(prefs) ?? customThemePrefs;
+  const id = themeId || DEFAULT_THEME_ID;
+  selectedTheme = id === "custom" ? "custom" : id;
+  applyThemeCore(selectedTheme, selectedTheme === "custom" ? customThemePrefs : null, {
+    wallOpacity: wallOpacityPref,
+    panelOpacity: panelOpacityPref,
+  });
+  if (selectedTheme === "custom") themeCategoryTab = "custom";
+  else {
+    const cat = themesByCategory("image").some((t) => t.id === selectedTheme)
+      ? "image"
+      : themesByCategory("palette").some((t) => t.id === selectedTheme)
+        ? "palette"
+        : themeCategoryTab;
+    themeCategoryTab = cat;
+  }
   renderThemePicker();
+  syncCustomThemeForm();
+  syncOpacityForm();
+}
+
+function themeCardHtml(t: ThemeDef): string {
+  const active = t.id === selectedTheme ? "active" : "";
+  const wall = t.atmosphere
+    ? `style="background-image:url(${t.atmosphere})"`
+    : `style="background:linear-gradient(145deg, ${t.preview.bg0}, ${t.preview.accent})"`;
+  return `<button class="theme-card ${active}" type="button" data-theme-id="${t.id}">
+    <div class="theme-swatches ${t.atmosphere ? "has-wall" : ""}" ${wall}>
+      <span style="background:${t.preview.bg0}"></span>
+      <span style="background:${t.preview.accent}"></span>
+      <span style="background:${t.preview.accent2}"></span>
+    </div>
+    <div class="theme-card-name">${escapeHtml(t.name)}</div>
+    <div class="theme-card-tagline">${escapeHtml(t.tagline)}</div>
+  </button>`;
 }
 
 function renderThemePicker() {
-  const box = document.getElementById("theme-picker");
-  if (!box) return;
-  box.innerHTML = THEMES.map((t) => {
-    const active = t.id === selectedTheme ? "active" : "";
-    return `<button class="theme-card ${active}" type="button" data-theme-id="${t.id}">
-      <div class="theme-swatches ${t.atmosphere ? "has-wall" : ""}" ${
-        t.atmosphere ? `style="background-image:url(${t.atmosphere})"` : ""
-      }>
-        <span style="background:${t.swatches[0]}"></span>
-        <span style="background:${t.swatches[1]}"></span>
-        <span style="background:${t.swatches[2]}"></span>
-      </div>
-      <div class="theme-card-name">${escapeHtml(t.name)}</div>
-      <div class="theme-card-tagline">${escapeHtml(t.tagline)}</div>
-    </button>`;
-  }).join("");
-  box.querySelectorAll<HTMLButtonElement>(".theme-card").forEach((btn) => {
+  document.querySelectorAll<HTMLElement>(".theme-category-tabs .theme-cat-tab").forEach((btn) => {
+    btn.classList.toggle("active", btn.getAttribute("data-theme-cat") === themeCategoryTab);
+  });
+  document.querySelectorAll<HTMLElement>(".theme-cat-panel").forEach((panel) => {
+    const id = panel.id.replace("theme-panel-", "") as ThemeCategory;
+    panel.classList.toggle("hidden", id !== themeCategoryTab);
+  });
+
+  const imageBox = document.getElementById("theme-picker-image");
+  const paletteBox = document.getElementById("theme-picker-palette");
+  if (imageBox) {
+    imageBox.innerHTML = themesByCategory("image").map(themeCardHtml).join("");
+    imageBox.querySelectorAll<HTMLButtonElement>(".theme-card").forEach((btn) => {
+      btn.onclick = () => {
+        applyTheme(btn.dataset.themeId || DEFAULT_THEME_ID);
+        scheduleSettingsAutoSave(150);
+      };
+    });
+  }
+  if (paletteBox) {
+    paletteBox.innerHTML = themesByCategory("palette").map(themeCardHtml).join("");
+    paletteBox.querySelectorAll<HTMLButtonElement>(".theme-card").forEach((btn) => {
+      btn.onclick = () => {
+        applyTheme(btn.dataset.themeId || DEFAULT_THEME_ID);
+        scheduleSettingsAutoSave(150);
+      };
+    });
+  }
+
+  const quick = document.getElementById("custom-quick-colors");
+  if (quick && !quick.dataset.ready) {
+    quick.dataset.ready = "1";
+    quick.innerHTML = CUSTOM_QUICK_COLORS.map(
+      (c) =>
+        `<button type="button" class="quick-swatch" data-color="${c}" style="background:${c}" title="${c}"></button>`,
+    ).join("");
+  }
+  syncCustomThemeForm();
+}
+
+function setupThemeAppearanceUi() {
+  document.querySelectorAll<HTMLElement>(".theme-category-tabs .theme-cat-tab").forEach((btn) => {
     btn.onclick = () => {
-      applyTheme(btn.dataset.themeId || "midnight");
+      const cat = (btn.getAttribute("data-theme-cat") || "image") as ThemeCategory;
+      themeCategoryTab = cat;
+      if (cat === "custom") {
+        applyTheme("custom", customThemePrefs);
+        scheduleSettingsAutoSave(150);
+      } else {
+        renderThemePicker();
+      }
+    };
+  });
+
+  document.querySelectorAll<HTMLElement>(".custom-source-tabs .theme-cat-tab").forEach((btn) => {
+    btn.onclick = () => {
+      const source = btn.getAttribute("data-custom-source") === "image" ? "image" : "color";
+      customThemePrefs = { ...customThemePrefs, source };
+      syncCustomThemeForm();
+      applyTheme("custom", customThemePrefs);
       scheduleSettingsAutoSave(150);
     };
   });
+
+  const colorEl = document.getElementById("custom-base-color") as HTMLInputElement | null;
+  const hexEl = document.getElementById("custom-base-hex") as HTMLInputElement | null;
+  const commitColor = () => {
+    const prefs = readCustomPrefsFromForm();
+    customThemePrefs = prefs;
+    applyTheme("custom", prefs);
+    scheduleSettingsAutoSave(200);
+  };
+  if (colorEl) {
+    colorEl.oninput = () => {
+      if (hexEl) hexEl.value = colorEl.value;
+      window.clearTimeout(customThemeDebounce);
+      customThemeDebounce = window.setTimeout(commitColor, 60);
+    };
+  }
+  if (hexEl) {
+    hexEl.onchange = () => {
+      if (!isValidCustomHex(hexEl.value)) {
+        toast("请输入合法十六进制颜色，如 #3d8b8b", true);
+        return;
+      }
+      if (colorEl) colorEl.value = hexEl.value;
+      commitColor();
+    };
+  }
+  document.querySelectorAll<HTMLInputElement>('input[name="custom-mode"]').forEach((el) => {
+    el.onchange = () => commitColor();
+  });
+  document.getElementById("custom-quick-colors")?.addEventListener("click", (ev) => {
+    const t = (ev.target as HTMLElement | null)?.closest("[data-color]") as HTMLElement | null;
+    if (!t) return;
+    const c = t.getAttribute("data-color") || "";
+    if (!isValidCustomHex(c)) return;
+    customThemePrefs = { ...customThemePrefs, baseColor: c, source: "color" };
+    syncCustomThemeForm();
+    applyTheme("custom", customThemePrefs);
+    scheduleSettingsAutoSave(150);
+  });
+
+  const fileEl = document.getElementById("custom-wall-file") as HTMLInputElement | null;
+  if (fileEl) {
+    fileEl.onchange = async () => {
+      const file = fileEl.files?.[0];
+      if (!file) return;
+      try {
+        const sampled = await samplePaletteFromImage(file);
+        const dataUrl = await fileToWallpaperDataUrl(file);
+        saveCustomWall(dataUrl);
+        customThemePrefs = {
+          baseColor: sampled.baseColor,
+          mode: sampled.suggestedMode,
+          source: "image",
+        };
+        syncCustomThemeForm();
+        applyTheme("custom", customThemePrefs);
+        scheduleSettingsAutoSave(150);
+        toast(`已采样主色 ${sampled.baseColor}，并切换为${sampled.suggestedMode === "light" ? "浅色" : "深色"}`);
+      } catch (e) {
+        toast(String(e), true);
+      } finally {
+        fileEl.value = "";
+      }
+    };
+  }
+  document.getElementById("btn-clear-custom-wall")?.addEventListener("click", () => {
+    clearCustomWall();
+    customThemePrefs = { ...customThemePrefs, source: "color" };
+    syncCustomThemeForm();
+    applyTheme("custom", customThemePrefs);
+    scheduleSettingsAutoSave(150);
+    toast("已清除自定义壁纸");
+  });
+  document.getElementById("btn-apply-custom-theme")?.addEventListener("click", () => {
+    const prefs = readCustomPrefsFromForm();
+    customThemePrefs = prefs;
+    applyTheme("custom", prefs);
+    scheduleSettingsAutoSave(100);
+    toast("已应用自定义皮肤");
+  });
+
+  const wallEl = document.getElementById("s-wall-opacity") as HTMLInputElement | null;
+  const panelEl = document.getElementById("s-panel-opacity") as HTMLInputElement | null;
+  if (wallEl) {
+    wallEl.oninput = () => {
+      wallOpacityPref = Math.max(0, Math.min(1, Number(wallEl.value) / 100));
+      const wallVal = document.getElementById("s-wall-opacity-val");
+      if (wallVal) wallVal.textContent = `${Math.round(wallOpacityPref * 100)}%`;
+      // 只改 CSS 变量，避免整页换肤 / 重建皮肤列表 / 频繁写盘
+      pushOpacityToDom();
+    };
+    wallEl.onchange = () => {
+      scheduleSettingsAutoSave(100);
+    };
+  }
+  if (panelEl) {
+    panelEl.oninput = () => {
+      panelOpacityPref = Math.max(0.35, Math.min(1, Number(panelEl.value) / 100));
+      const panelVal = document.getElementById("s-panel-opacity-val");
+      if (panelVal) panelVal.textContent = `${Math.round(panelOpacityPref * 100)}%`;
+      pushOpacityToDom();
+    };
+    panelEl.onchange = () => {
+      scheduleSettingsAutoSave(100);
+    };
+  }
+  document.getElementById("btn-wall-opacity-reset")?.addEventListener("click", () => {
+    wallOpacityPref = null;
+    pushOpacityToDom();
+    syncOpacityForm();
+    scheduleSettingsAutoSave(100);
+    toast("已恢复皮肤默认壁纸透明度");
+  });
+}
+
+function applyThemeFromSettings(settings?: AppSettings | null) {
+  const themeId = settings?.ui?.theme || DEFAULT_THEME_ID;
+  const custom =
+    normalizeCustomTheme({
+      baseColor: settings?.ui?.custom?.baseColor,
+      mode: settings?.ui?.custom?.mode as "dark" | "light",
+      source: settings?.ui?.custom?.source as "color" | "image",
+    }) ?? { ...DEFAULT_CUSTOM_THEME };
+  customThemePrefs = custom;
+  const wall = settings?.ui?.wallOpacity;
+  wallOpacityPref =
+    typeof wall === "number" && Number.isFinite(wall)
+      ? Math.max(0, Math.min(1, wall))
+      : null;
+  const panel = settings?.ui?.panelOpacity;
+  panelOpacityPref =
+    typeof panel === "number" && Number.isFinite(panel)
+      ? Math.max(0.35, Math.min(1, panel))
+      : 0.82;
+  applyTheme(themeId, custom);
 }
 
 async function refreshUnreadBadge() {
@@ -669,8 +1001,10 @@ let reconnectAllInFlight = false;
 let reconnectAllStep = "";
 
 function currentQqMode(settings?: AppSettings | null): "onebot" | "passive" {
-  void settings;
-  return "onebot";
+  const mode = (settings || settingsCache)?.channels?.qq?.mode
+    || (document.getElementById("s-qq-mode") as HTMLSelectElement | null)?.value
+    || "onebot";
+  return mode === "passive" ? "passive" : "onebot";
 }
 
 function syncQqModeFields(settings?: AppSettings | null) {
@@ -692,7 +1026,7 @@ function syncQqModeFields(settings?: AppSettings | null) {
   if (hint) {
     hint.textContent = passive
       ? "被动模式：主号只跑官方 QQ。用系统通知采集后台消息，用当前聊天窗口补采；静音群/历史/原图可能缺失。"
-      : "当前仅支持 NapCat / OneBot 完整监听。";
+      : "OneBot 模式：通过 NapCat 完整监听群消息（含历史与媒体，推荐）。";
   }
   const qq = (settings || settingsCache)?.channels?.qq;
   const poll = document.getElementById("s-qq-poll") as HTMLInputElement | null;
@@ -1634,13 +1968,27 @@ function reportTotalTokens(r: ReportRow): number {
   return Number.isFinite(n) ? Math.max(0, Number(n)) : 0;
 }
 
-/** 展示 token 数：千级用 k。 */
+/** 展示 token 数：自动按 k / m / b 缩放。 */
 function formatTokenCount(n?: number | null): string {
   const v = Number(n);
   if (!Number.isFinite(v) || v <= 0) return "0";
-  if (v < 1000) return String(Math.round(v));
-  if (v < 10000) return `${(v / 1000).toFixed(1)}k`;
-  return `${Math.round(v / 1000)}k`;
+  const abs = Math.abs(v);
+  if (abs < 1000) return String(Math.round(v));
+  let scaled = v;
+  let unit = "k";
+  if (abs >= 1_000_000_000) {
+    scaled = v / 1_000_000_000;
+    unit = "b";
+  } else if (abs >= 1_000_000) {
+    scaled = v / 1_000_000;
+    unit = "m";
+  } else {
+    scaled = v / 1000;
+    unit = "k";
+  }
+  const digits = scaled >= 100 ? 0 : scaled >= 10 ? 1 : 2;
+  const body = scaled.toFixed(digits).replace(/\.?0+$/, "");
+  return `${body}${unit}`;
 }
 
 function clampReportKeepLimit(n: number): number {
@@ -1747,8 +2095,736 @@ function renderReportMdHtml(md: string, extraUserNames: string[] = []): string {
     .join("");
 }
 
+function loadAnalysisFavorites(): AnalysisFavorite[] {
+  try {
+    const raw = localStorage.getItem(ANALYSIS_FAV_KEY);
+    if (!raw) return [];
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? (parsed as AnalysisFavorite[]) : [];
+  } catch {
+    return [];
+  }
+}
+
+function saveAnalysisFavorites(items: AnalysisFavorite[]) {
+  localStorage.setItem(ANALYSIS_FAV_KEY, JSON.stringify(items.slice(0, 500)));
+}
+
+function favoritesForReport(reportId: number): AnalysisFavorite[] {
+  return loadAnalysisFavorites().filter((x) => x.reportId === reportId);
+}
+
+function isPointFavorited(reportId: number, pointIndex: number): boolean {
+  return favoritesForReport(reportId).some(
+    (x) => x.kind === "point" && x.pointIndex === pointIndex,
+  );
+}
+
+function addAnalysisFavorite(item: AnalysisFavorite) {
+  const all = loadAnalysisFavorites().filter((x) => {
+    if (item.kind === "point") {
+      return !(
+        x.reportId === item.reportId &&
+        x.kind === "point" &&
+        x.pointIndex === item.pointIndex
+      );
+    }
+    return !(
+      x.reportId === item.reportId &&
+      x.kind === "clip" &&
+      x.text === item.text
+    );
+  });
+  all.unshift(item);
+  saveAnalysisFavorites(all);
+  syncReportClipsButton();
+}
+
+function removePointFavorite(reportId: number, pointIndex: number) {
+  saveAnalysisFavorites(
+    loadAnalysisFavorites().filter(
+      (x) =>
+        !(x.reportId === reportId && x.kind === "point" && x.pointIndex === pointIndex),
+    ),
+  );
+  syncReportClipsButton();
+}
+
+function syncReportClipsButton() {
+  const btn = document.getElementById("btn-report-clips");
+  if (!btn || monitoredDetailReportId == null) return;
+  const n = favoritesForReport(monitoredDetailReportId).length;
+  btn.classList.toggle("hidden", n === 0);
+  btn.textContent = n ? `本地收藏 (${n})` : "本地收藏";
+}
+
+function reportKeyPoints(report: ReportRow): ReportKeyPoint[] {
+  const pts = report.reportJson?.keyPoints;
+  return Array.isArray(pts) ? pts.filter((p) => p && typeof p === "object") : [];
+}
+
+function useStructuredReport(report: ReportRow): boolean {
+  return !!report.hasStructuredPoints && reportKeyPoints(report).length > 0;
+}
+
+function sentimentLabel(s?: string): string {
+  const map: Record<string, string> = {
+    positive: "积极",
+    neutral: "中性",
+    negative: "负面",
+    mixed: "复杂",
+    error: "错误",
+  };
+  return map[(s || "").toLowerCase()] || s || "-";
+}
+
+function evidenceFilterTokens(evidence: string): string[] {
+  const raw = (evidence || "").trim();
+  if (!raw) return [];
+  const parts = raw
+    .split(/[\s,，。；;、|/\\]+/)
+    .map((x) => x.trim())
+    .filter((x) => x.length >= 2);
+  const chunks: string[] = [];
+  if (raw.length >= 6) chunks.push(raw.slice(0, Math.min(24, raw.length)));
+  for (const p of parts) {
+    if (p.length >= 2 && p.length <= 40) chunks.push(p);
+  }
+  return [...new Set(chunks)].slice(0, 12);
+}
+
+function messageMatchesEvidence(content: string, tokens: string[]): boolean {
+  if (!tokens.length) return true;
+  const text = content || "";
+  return tokens.some((t) => text.includes(t));
+}
+
+function renderNounList(
+  nouns: Array<{ term?: string; meaning?: string } | string> | undefined,
+): string {
+  if (!nouns?.length) return "";
+  const items = nouns
+    .map((n) => {
+      if (typeof n === "string") return `<li>${escapeHtml(n)}</li>`;
+      const term = escapeHtml(n.term || "");
+      const meaning = escapeHtml(n.meaning || "");
+      return `<li><strong>${term}</strong>：${meaning}</li>`;
+    })
+    .join("");
+  return `<div class="report-block"><h4 class="report-block-title">名词解析</h4><ul class="report-block-list">${items}</ul></div>`;
+}
+
+function renderLinkList(
+  links: Array<{ url?: string; summary?: string } | string> | undefined,
+): string {
+  if (!links?.length) return "";
+  const items = links
+    .map((lk) => {
+      if (typeof lk === "string") {
+        const safe = escapeHtml(lk);
+        return `<li><a class="report-link" href="${safe}" data-ext-url="${safe}">${safe}</a></li>`;
+      }
+      const url = escapeHtml(lk.url || "");
+      const summary = escapeHtml(lk.summary || "");
+      return `<li><a class="report-link" href="${url}" data-ext-url="${url}">${url || summary}</a>${
+        summary ? ` — ${summary}` : ""
+      }</li>`;
+    })
+    .join("");
+  return `<div class="report-block"><h4 class="report-block-title">相关链接</h4><ul class="report-block-list">${items}</ul></div>`;
+}
+
+function renderNotesList(notes: string[] | undefined): string {
+  if (!notes?.length) return "";
+  const items = notes.map((n) => `<li>${escapeHtml(n)}</li>`).join("");
+  return `<div class="report-block"><h4 class="report-block-title">补充说明</h4><ul class="report-block-list">${items}</ul></div>`;
+}
+
+function renderCompactSection(
+  title: string,
+  itemsHtml: string,
+): string {
+  if (!itemsHtml) return "";
+  return `<section class="report-section"><h3 class="report-section-title">${escapeHtml(
+    title,
+  )}</h3><div class="report-section-body">${itemsHtml}</div></section>`;
+}
+
+function renderStructuredOverview(report: ReportRow): string {
+  const data = report.reportJson || {};
+  const points = reportKeyPoints(report);
+  const sentiment = data.sentiment || report.sentiment || "";
+  const topics = (data.topics || [])
+    .map((t) => {
+      if (typeof t === "string") return `<li>${escapeHtml(t)}</li>`;
+      return `<li><strong>${escapeHtml(t.title || "")}</strong>${
+        t.summary ? ` — ${escapeHtml(t.summary)}` : ""
+      }</li>`;
+    })
+    .join("");
+  const risks = (data.risks || [])
+    .map((r) => {
+      if (typeof r === "string") return `<li>${escapeHtml(r)}</li>`;
+      return `<li><span class="risk-tag risk-${escapeHtml(r.level || "mid")}">${escapeHtml(
+        r.level || "-",
+      )}</span> ${escapeHtml(r.detail || "")}</li>`;
+    })
+    .join("");
+  const actions = (data.actionItems || [])
+    .map((a) => {
+      if (typeof a === "string") return `<li>${escapeHtml(a)}</li>`;
+      return `<li>${escapeHtml(a.task || "")}${
+        a.owner_hint ? `（${escapeHtml(a.owner_hint)}）` : ""
+      }</li>`;
+    })
+    .join("");
+  const notables = (data.notableUsers || [])
+    .map((u) => {
+      if (typeof u === "string") return `<li>${escapeHtml(u)}</li>`;
+      const name = escapeHtml(u.name || u.user_id || "");
+      const role = u.role ? `（${escapeHtml(u.role)}）` : "";
+      const summary = u.summary ? ` — ${escapeHtml(u.summary)}` : "";
+      return `<li><strong>${name}</strong>${role}${summary}</li>`;
+    })
+    .join("");
+
+  const pointCards = points
+    .map((p, i) => {
+      const fav = isPointFavorited(report.id, i);
+      return `<article class="key-point-card" data-point-index="${i}">
+        <div class="key-point-card-head">
+          <span class="key-point-index">${i + 1}</span>
+          <h4 class="key-point-title">${escapeHtml(p.title || `要点 ${i + 1}`)}</h4>
+          <button type="button" class="key-point-star ${fav ? "is-on" : ""}" data-fav-point="${i}" title="${
+            fav ? "取消收藏要点" : "收藏此要点"
+          }">${fav ? "★" : "☆"}</button>
+        </div>
+        ${p.summary ? `<p class="key-point-summary">${escapeHtml(p.summary)}</p>` : ""}
+        <div class="key-point-card-foot">
+          <button type="button" class="key-point-link" data-open-point="${i}">查看详情 →</button>
+        </div>
+      </article>`;
+    })
+    .join("");
+
+  const appendix = data.appendix || {};
+  const appendixHtml =
+    renderNounList(appendix.nouns) +
+    renderLinkList(appendix.links) +
+    renderNotesList(appendix.notes);
+
+  return `<div class="report-overview">
+    <div class="report-hero">
+      <p class="report-hero-kicker">分析摘要</p>
+      <h3 class="report-hero-title">${escapeHtml(report.headline || data.headline || "(无标题)")}</h3>
+      <div class="report-meta-chips">
+        <span class="chip">情绪 ${escapeHtml(sentimentLabel(sentiment))}</span>
+        <span class="chip">风险 ${escapeHtml(report.riskMax || "-")}</span>
+        <span class="chip">${escapeHtml(String(report.msgCount ?? "-"))} 条消息</span>
+      </div>
+    </div>
+    ${renderCompactSection("主题", topics ? `<ul class="report-block-list">${topics}</ul>` : "")}
+    ${renderCompactSection("风险", risks ? `<ul class="report-block-list">${risks}</ul>` : "")}
+    ${renderCompactSection("待办", actions ? `<ul class="report-block-list">${actions}</ul>` : "")}
+    ${renderCompactSection("活跃成员", notables ? `<ul class="report-block-list">${notables}</ul>` : "")}
+    <section class="report-section report-section-points">
+      <h3 class="report-section-title">要点</h3>
+      <div class="key-point-list">${pointCards || `<div class="empty">暂无要点</div>`}</div>
+      ${
+        points.length
+          ? `<button type="button" class="key-point-summary-link" data-open-summary="1">查看全部要点汇总 →</button>`
+          : ""
+      }
+    </section>
+    ${appendixHtml ? `<section class="report-section"><h3 class="report-section-title">全局附录</h3>${appendixHtml}</section>` : ""}
+  </div>`;
+}
+
+function renderPointDetail(report: ReportRow, index: number): string {
+  const points = reportKeyPoints(report);
+  const p = points[index];
+  if (!p) return `<div class="empty">要点不存在</div>`;
+  const dive = p.deep_dive || {};
+  const fav = isPointFavorited(report.id, index);
+  return `<div class="report-point-detail" data-point-index="${index}">
+    <div class="report-point-detail-head">
+      <h3 class="report-hero-title">${escapeHtml(p.title || `要点 ${index + 1}`)}</h3>
+      <button type="button" class="key-point-star ${fav ? "is-on" : ""}" data-fav-point="${index}" title="${
+        fav ? "取消收藏要点" : "收藏此要点"
+      }">${fav ? "★" : "☆"}</button>
+    </div>
+    ${p.summary ? `<p class="key-point-summary large">${escapeHtml(p.summary)}</p>` : ""}
+    <div class="report-block">
+      <h4 class="report-block-title">深入分析</h4>
+      <div class="report-prose">${escapeHtml(dive.detail || "（暂无深入分析）").replace(/\n/g, "<br>")}</div>
+      ${
+        dive.evidence
+          ? `<blockquote class="report-evidence">依据：${escapeHtml(dive.evidence)}</blockquote>`
+          : ""
+      }
+    </div>
+    ${renderNounList(p.nouns)}
+    ${renderLinkList(p.links)}
+    ${renderNotesList(p.notes)}
+  </div>`;
+}
+
+function renderPointsSummary(report: ReportRow): string {
+  const points = reportKeyPoints(report);
+  if (!points.length) return `<div class="empty">暂无要点</div>`;
+  const blocks = points
+    .map((p, i) => {
+      const dive = p.deep_dive || {};
+      return `<article class="summary-point-card">
+        <h4 class="key-point-title"><span class="key-point-index">${i + 1}</span> ${escapeHtml(
+          p.title || `要点 ${i + 1}`,
+        )}</h4>
+        ${p.summary ? `<p class="key-point-summary">${escapeHtml(p.summary)}</p>` : ""}
+        ${
+          dive.detail
+            ? `<div class="report-prose muted">${escapeHtml(dive.detail).replace(/\n/g, "<br>")}</div>`
+            : ""
+        }
+        ${dive.evidence ? `<blockquote class="report-evidence">${escapeHtml(dive.evidence)}</blockquote>` : ""}
+        <button type="button" class="key-point-link" data-open-point="${i}">查看该要点详情 →</button>
+      </article>`;
+    })
+    .join("");
+  return `<div class="report-points-summary">
+    <p class="report-hero-kicker">全部要点汇总</p>
+    <h3 class="report-hero-title">${escapeHtml(report.headline || "(无标题)")}</h3>
+    <div class="summary-point-list">${blocks}</div>
+  </div>`;
+}
+
 function setReportDetailBody(md: string, extraUserNames: string[] = []) {
   $("monitored-report-detail-body").innerHTML = renderReportMdHtml(md, extraUserNames);
+}
+
+function updateReportBackButton() {
+  const btn = $("btn-back-monitored-report");
+  if (reportSubview === "overview") {
+    btn.textContent = "← 返回主题列表";
+  } else {
+    btn.textContent = "← 返回分析总览";
+  }
+}
+
+function paintReportMessages(filterTokens: string[] | null) {
+  const msgsBox = $("monitored-report-detail-msgs");
+  const rows = reportDetailMessagesCache;
+  if (!rows.length) {
+    msgsBox.innerHTML = `<div class="empty">该时间窗内无落库消息</div>`;
+    return;
+  }
+  let shown = rows;
+  let matched = 0;
+  if (filterTokens && filterTokens.length) {
+    const hits = rows.filter((m) => messageMatchesEvidence(m.content || "", filterTokens));
+    if (hits.length) {
+      shown = hits;
+      matched = hits.length;
+    }
+  }
+  const hint = $("monitored-report-msgs-hint");
+  const report =
+    monitoredDetailReportId != null
+      ? monitoredReportsCache.find((r) => r.id === monitoredDetailReportId)
+      : undefined;
+  if (filterTokens && filterTokens.length) {
+    hint.textContent =
+      matched > 0
+        ? `与当前要点相关 · ${matched} / ${rows.length} 条`
+        : `未精确匹配证据，显示全部 ${rows.length} 条`;
+  } else if (report) {
+    hint.textContent = report.favorited
+      ? `收藏快照 · 共 ${rows.length} 条 · ${formatReportWindow(report)}`
+      : `共 ${rows.length} 条 · ${formatReportWindow(report)}`;
+  }
+  msgsBox.innerHTML = shown
+    .map((m) => {
+      const hit =
+        filterTokens && filterTokens.length
+          ? messageMatchesEvidence(m.content || "", filterTokens)
+          : false;
+      const html = messageArticleHtml(m, { hideGroup: true });
+      return hit ? html.replace('class="msg"', 'class="msg is-evidence-hit"') : html;
+    })
+    .join("");
+  msgsBox.scrollTop = 0;
+}
+
+function renderReportAnalysisView(report: ReportRow, senderNames: string[] = []) {
+  const body = $("monitored-report-detail-body");
+  const titleEl = $("monitored-report-analysis-title");
+  updateReportBackButton();
+  syncReportClipsButton();
+
+  if (!useStructuredReport(report)) {
+    titleEl.textContent = "分析结果";
+    setReportDetailBody((report.reportMd || "").trim() || "（无详细内容）", senderNames);
+    paintReportMessages(null);
+    return;
+  }
+
+  if (reportSubview === "point" && reportSubviewPointIndex != null) {
+    titleEl.textContent = "要点详情";
+    body.innerHTML = renderPointDetail(report, reportSubviewPointIndex);
+    const dive = reportKeyPoints(report)[reportSubviewPointIndex]?.deep_dive;
+    paintReportMessages(evidenceFilterTokens(dive?.evidence || ""));
+  } else if (reportSubview === "summary") {
+    titleEl.textContent = "要点汇总";
+    body.innerHTML = renderPointsSummary(report);
+    paintReportMessages(null);
+  } else {
+    titleEl.textContent = "分析结果";
+    body.innerHTML = renderStructuredOverview(report);
+    paintReportMessages(null);
+  }
+}
+
+function navigateReportSubview(view: ReportSubview, pointIndex: number | null = null) {
+  reportSubview = view;
+  reportSubviewPointIndex = pointIndex;
+  if (monitoredDetailReportId == null) return;
+  const report = monitoredReportsCache.find((r) => r.id === monitoredDetailReportId);
+  if (!report) return;
+  const senderNames = [
+    ...new Set(
+      reportDetailMessagesCache.map((m) => (m.senderName || "").trim()).filter(Boolean),
+    ),
+  ];
+  renderReportAnalysisView(report, senderNames);
+  const panel = document.getElementById("monitored-report-analysis-panel");
+  if (panel) panel.scrollTop = 0;
+  animateViewEnter($("monitored-report-analysis-panel"));
+}
+
+function bindReportAnalysisActions(root: HTMLElement) {
+  root.addEventListener("click", (ev) => {
+    const t = ev.target as HTMLElement | null;
+    if (!t) return;
+    const openPoint = t.closest("[data-open-point]") as HTMLElement | null;
+    if (openPoint) {
+      const idx = Number(openPoint.getAttribute("data-open-point"));
+      if (Number.isFinite(idx)) navigateReportSubview("point", idx);
+      return;
+    }
+    if (t.closest("[data-open-summary]")) {
+      navigateReportSubview("summary", null);
+      return;
+    }
+    const favBtn = t.closest("[data-fav-point]") as HTMLElement | null;
+    if (favBtn && monitoredDetailReportId != null) {
+      const idx = Number(favBtn.getAttribute("data-fav-point"));
+      const report = monitoredReportsCache.find((r) => r.id === monitoredDetailReportId);
+      const point = report ? reportKeyPoints(report)[idx] : null;
+      if (!point || !Number.isFinite(idx)) return;
+      if (isPointFavorited(monitoredDetailReportId, idx)) {
+        removePointFavorite(monitoredDetailReportId, idx);
+        toast("已取消要点收藏");
+      } else {
+        addAnalysisFavorite({
+          reportId: monitoredDetailReportId,
+          kind: "point",
+          pointIndex: idx,
+          text: point.summary || point.title || "",
+          title: point.title || `要点 ${idx + 1}`,
+          createdAt: new Date().toISOString(),
+        });
+        toast("已收藏要点");
+      }
+      navigateReportSubview(reportSubview, reportSubviewPointIndex);
+    }
+  });
+}
+
+function hideReportCtxMenu() {
+  const menu = document.getElementById("report-ctx-menu");
+  if (!menu) return;
+  menu.classList.add("hidden");
+  menu.setAttribute("hidden", "");
+}
+
+function showReportCtxMenu(
+  x: number,
+  y: number,
+  opts: { hasSelection: boolean; pointIndex: number | null },
+) {
+  const menu = document.getElementById("report-ctx-menu");
+  if (!menu) return;
+  const favClip = menu.querySelector('[data-ctx="fav-clip"]') as HTMLElement | null;
+  const favPoint = menu.querySelector('[data-ctx="fav-point"]') as HTMLElement | null;
+  const askSel = menu.querySelector('[data-ctx="ask-sel"]') as HTMLElement | null;
+  const askPoint = menu.querySelector('[data-ctx="ask-point"]') as HTMLElement | null;
+  if (favClip) favClip.style.display = opts.hasSelection ? "" : "none";
+  if (askSel) askSel.style.display = opts.hasSelection ? "" : "none";
+  if (favPoint) favPoint.style.display = opts.pointIndex != null ? "" : "none";
+  if (askPoint) askPoint.style.display = opts.pointIndex != null ? "" : "none";
+  menu.classList.remove("hidden");
+  menu.removeAttribute("hidden");
+  const pad = 8;
+  const mw = menu.offsetWidth || 180;
+  const mh = menu.offsetHeight || 160;
+  const left = Math.min(x, window.innerWidth - mw - pad);
+  const top = Math.min(y, window.innerHeight - mh - pad);
+  menu.style.left = `${Math.max(pad, left)}px`;
+  menu.style.top = `${Math.max(pad, top)}px`;
+}
+
+function setupReportContextMenu() {
+  const panel = document.getElementById("monitored-report-analysis-panel");
+  const menu = document.getElementById("report-ctx-menu");
+  if (!panel || !menu) return;
+
+  panel.addEventListener("contextmenu", (ev) => {
+    if (monitoredDetailReportId == null) return;
+    ev.preventDefault();
+    const sel = (window.getSelection()?.toString() || "").trim();
+    const target = ev.target as HTMLElement | null;
+    const pointEl = target?.closest("[data-point-index]") as HTMLElement | null;
+    let pointIndex: number | null = null;
+    if (pointEl) {
+      const idx = Number(pointEl.getAttribute("data-point-index"));
+      if (Number.isFinite(idx)) pointIndex = idx;
+    } else if (reportSubview === "point" && reportSubviewPointIndex != null) {
+      pointIndex = reportSubviewPointIndex;
+    }
+    (menu as HTMLElement).dataset.selection = sel;
+    (menu as HTMLElement).dataset.pointIndex =
+      pointIndex != null ? String(pointIndex) : "";
+    showReportCtxMenu(ev.clientX, ev.clientY, {
+      hasSelection: !!sel,
+      pointIndex,
+    });
+  });
+
+  menu.addEventListener("click", (ev) => {
+    const btn = (ev.target as HTMLElement | null)?.closest("[data-ctx]") as HTMLElement | null;
+    if (!btn || monitoredDetailReportId == null) return;
+    const action = btn.getAttribute("data-ctx") || "";
+    const selection = (menu as HTMLElement).dataset.selection || "";
+    const pointRaw = (menu as HTMLElement).dataset.pointIndex || "";
+    const pointIndex = pointRaw === "" ? null : Number(pointRaw);
+    const report = monitoredReportsCache.find((r) => r.id === monitoredDetailReportId);
+    hideReportCtxMenu();
+
+    if (action === "fav-clip") {
+      if (!selection) {
+        toast("请先选中文字", true);
+        return;
+      }
+      addAnalysisFavorite({
+        reportId: monitoredDetailReportId,
+        kind: "clip",
+        text: selection.slice(0, 2000),
+        title: selection.slice(0, 40),
+        createdAt: new Date().toISOString(),
+      });
+      toast("已收藏选中内容");
+      return;
+    }
+    if (action === "fav-point" && pointIndex != null && report) {
+      const point = reportKeyPoints(report)[pointIndex];
+      if (!point) return;
+      if (isPointFavorited(monitoredDetailReportId, pointIndex)) {
+        removePointFavorite(monitoredDetailReportId, pointIndex);
+        toast("已取消要点收藏");
+      } else {
+        addAnalysisFavorite({
+          reportId: monitoredDetailReportId,
+          kind: "point",
+          pointIndex,
+          text: point.summary || point.title || "",
+          title: point.title || `要点 ${pointIndex + 1}`,
+          createdAt: new Date().toISOString(),
+        });
+        toast("已收藏要点");
+      }
+      navigateReportSubview(reportSubview, reportSubviewPointIndex);
+      return;
+    }
+    if (action === "ask-sel") {
+      openReportAskPopup({ selection });
+      return;
+    }
+    if (action === "ask-point" && pointIndex != null) {
+      openReportAskPopup({ pointIndex });
+      return;
+    }
+    if (action === "ask-report") {
+      openReportAskPopup({});
+    }
+  });
+
+  document.addEventListener("click", (ev) => {
+    if (!(ev.target as HTMLElement | null)?.closest("#report-ctx-menu")) {
+      hideReportCtxMenu();
+    }
+  });
+  document.addEventListener("keydown", (ev) => {
+    if (ev.key === "Escape") hideReportCtxMenu();
+  });
+}
+
+function closeReportAskPopup() {
+  const overlay = document.getElementById("report-ask-overlay");
+  if (!overlay) return;
+  overlay.classList.add("hidden");
+  overlay.setAttribute("hidden", "");
+  reportAskContext = {};
+  const answer = document.getElementById("report-ask-answer");
+  if (answer) {
+    answer.className = "report-ask-answer empty-hint";
+    answer.textContent = "回答将显示在这里";
+  }
+  const input = document.getElementById("report-ask-input") as HTMLTextAreaElement | null;
+  if (input) input.value = "";
+}
+
+function openReportAskPopup(ctx: { selection?: string; pointIndex?: number | null }) {
+  if (monitoredDetailReportId == null) {
+    toast("请先打开分析报告", true);
+    return;
+  }
+  reportAskContext = {
+    selection: (ctx.selection || "").trim(),
+    pointIndex: ctx.pointIndex ?? null,
+  };
+  const overlay = document.getElementById("report-ask-overlay");
+  const ctxEl = document.getElementById("report-ask-context");
+  if (!overlay || !ctxEl) return;
+  const report = monitoredReportsCache.find((r) => r.id === monitoredDetailReportId);
+  let hint = `基于报告：${report?.headline || ""}`;
+  if (reportAskContext.pointIndex != null && report) {
+    const p = reportKeyPoints(report)[reportAskContext.pointIndex];
+    hint = `聚焦要点：${p?.title || `要点 ${reportAskContext.pointIndex + 1}`}`;
+  } else if (reportAskContext.selection) {
+    hint = `选中片段：${reportAskContext.selection.slice(0, 80)}${
+      reportAskContext.selection.length > 80 ? "…" : ""
+    }`;
+  }
+  ctxEl.textContent = hint;
+  const answer = document.getElementById("report-ask-answer");
+  if (answer) {
+    answer.className = "report-ask-answer empty-hint";
+    answer.textContent = "回答将显示在这里";
+  }
+  overlay.classList.remove("hidden");
+  overlay.removeAttribute("hidden");
+  const input = document.getElementById("report-ask-input") as HTMLTextAreaElement | null;
+  input?.focus();
+}
+
+async function sendReportAsk() {
+  if (monitoredDetailReportId == null) return;
+  const input = document.getElementById("report-ask-input") as HTMLTextAreaElement | null;
+  const answerEl = document.getElementById("report-ask-answer");
+  const sendBtn = document.getElementById("btn-report-ask-send") as HTMLButtonElement | null;
+  const question = (input?.value || "").trim();
+  if (!question) {
+    toast("请输入问题", true);
+    return;
+  }
+  if (answerEl) {
+    answerEl.className = "report-ask-answer";
+    answerEl.textContent = "思考中…";
+  }
+  if (sendBtn) sendBtn.disabled = true;
+  try {
+    const res = await invoke<{ ok?: boolean; answer?: string; error?: string }>("api_ask_report", {
+      reportId: monitoredDetailReportId,
+      question,
+      selection: reportAskContext.selection || "",
+      pointIndex: reportAskContext.pointIndex ?? null,
+    });
+    if (answerEl) {
+      answerEl.className = "report-ask-answer";
+      answerEl.textContent = res.answer || res.error || "（无回答）";
+    }
+  } catch (e) {
+    if (answerEl) {
+      answerEl.className = "report-ask-answer error";
+      answerEl.textContent = String(e);
+    }
+  } finally {
+    if (sendBtn) sendBtn.disabled = false;
+  }
+}
+
+function setupReportAskPopup() {
+  const overlay = document.getElementById("report-ask-overlay");
+  if (!overlay) return;
+  overlay.querySelectorAll("[data-ask-close]").forEach((el) => {
+    (el as HTMLElement).onclick = () => closeReportAskPopup();
+  });
+  const sendBtn = document.getElementById("btn-report-ask-send");
+  if (sendBtn) {
+    sendBtn.onclick = () => {
+      sendReportAsk().catch((e) => toast(String(e), true));
+    };
+  }
+  const input = document.getElementById("report-ask-input") as HTMLTextAreaElement | null;
+  if (input) {
+    input.onkeydown = (ev) => {
+      if (ev.key === "Enter" && (ev.ctrlKey || ev.metaKey)) {
+        ev.preventDefault();
+        sendReportAsk().catch((e) => toast(String(e), true));
+      }
+    };
+  }
+}
+
+function closeReportClipsOverlay() {
+  const overlay = document.getElementById("report-clips-overlay");
+  if (!overlay) return;
+  overlay.classList.add("hidden");
+  overlay.setAttribute("hidden", "");
+}
+
+function openReportClipsOverlay() {
+  if (monitoredDetailReportId == null) return;
+  const overlay = document.getElementById("report-clips-overlay");
+  const list = document.getElementById("report-clips-list");
+  if (!overlay || !list) return;
+  const items = favoritesForReport(monitoredDetailReportId);
+  if (!items.length) {
+    list.innerHTML = `<div class="empty">暂无本地收藏</div>`;
+  } else {
+    list.innerHTML = items
+      .map((it, i) => {
+        const label =
+          it.kind === "point"
+            ? `要点 · ${escapeHtml(it.title || "")}`
+            : `片段 · ${escapeHtml(it.title || it.text.slice(0, 40))}`;
+        return `<button type="button" class="report-clip-item" data-clip-i="${i}">
+          <strong>${label}</strong>
+          <span>${escapeHtml(it.text.slice(0, 160))}</span>
+        </button>`;
+      })
+      .join("");
+    list.querySelectorAll("[data-clip-i]").forEach((el) => {
+      (el as HTMLElement).onclick = () => {
+        const i = Number((el as HTMLElement).getAttribute("data-clip-i"));
+        const it = items[i];
+        if (!it) return;
+        closeReportClipsOverlay();
+        if (it.kind === "point" && it.pointIndex != null) {
+          navigateReportSubview("point", it.pointIndex);
+        }
+      };
+    });
+  }
+  overlay.classList.remove("hidden");
+  overlay.removeAttribute("hidden");
+}
+
+function setupReportClipsOverlay() {
+  const overlay = document.getElementById("report-clips-overlay");
+  if (!overlay) return;
+  overlay.querySelectorAll("[data-clips-close]").forEach((el) => {
+    (el as HTMLElement).onclick = () => closeReportClipsOverlay();
+  });
 }
 
 function renderMonitoredReportList(reports: ReportRow[]) {
@@ -1864,6 +2940,9 @@ async function openMonitoredReportDetail(reportId: number) {
   }
   markReportRead(reportId);
   monitoredDetailReportId = reportId;
+  reportSubview = "overview";
+  reportSubviewPointIndex = null;
+  reportDetailMessagesCache = [];
   $("monitored-master").classList.add("hidden");
   $("monitored-report-detail").classList.remove("hidden");
   animateViewEnter($("monitored-report-detail"));
@@ -1880,8 +2959,9 @@ async function openMonitoredReportDetail(reportId: number) {
     }`;
   syncFavoriteButton(!!report.favorited);
   syncIssueButton(report);
-  const reportMd = (report.reportMd || "").trim() || "（无详细内容）";
-  setReportDetailBody(reportMd);
+  syncReportClipsButton();
+  updateReportBackButton();
+  renderReportAnalysisView(report);
 
   const msgsBox = $("monitored-report-detail-msgs");
   msgsBox.dataset.fp = "";
@@ -1923,6 +3003,7 @@ async function openMonitoredReportDetail(reportId: number) {
             report.lookbackMessages ? ` ${report.lookbackMessages} 条` : ""
           }${reasons ? `（${reasons}）` : ""} · ${formatReportWindow(report)}`
         : `共 ${rows.length} 条 · ${formatReportWindow(report)}`;
+    reportDetailMessagesCache = rows;
     if (!rows.length) {
       msgsBox.innerHTML = `<div class="empty">${
         report.favorited
@@ -1934,10 +3015,8 @@ async function openMonitoredReportDetail(reportId: number) {
     const senderNames = [
       ...new Set(rows.map((m) => (m.senderName || "").trim()).filter(Boolean)),
     ];
-    setReportDetailBody(reportMd, senderNames);
-    msgsBox.innerHTML = rows.map((m) => messageArticleHtml(m, { hideGroup: true })).join("");
+    renderReportAnalysisView(report, senderNames);
     msgsBox.dataset.fp = idsFingerprint(rows);
-    msgsBox.scrollTop = 0;
   } catch (e) {
     msgsBox.innerHTML = `<div class="empty">加载对话失败：${escapeHtml(String(e))}</div>`;
   }
@@ -2651,8 +3730,8 @@ async function persistSettingsSnapshot(): Promise<AppSettings> {
     );
   }
   const prev = settingsCache.channels || {};
-  const qqMode = "onebot";
-  const prevMode = "onebot";
+  const qqMode = currentQqMode();
+  const prevMode = prev.qq?.mode === "passive" ? "passive" : "onebot";
   const next: AppSettings = {
     onebotWsUrl: $<HTMLInputElement>("s-ws").value.trim(),
     onebotAccessToken: $<HTMLInputElement>("s-token").value.trim(),
@@ -2715,11 +3794,18 @@ async function persistSettingsSnapshot(): Promise<AppSettings> {
     },
     ui: {
       theme: selectedTheme,
+      custom: {
+        baseColor: customThemePrefs.baseColor,
+        mode: customThemePrefs.mode,
+        source: customThemePrefs.source || "color",
+      },
+      wallOpacity: wallOpacityPref,
+      panelOpacity: panelOpacityPref,
     },
   };
   await invoke("api_save_settings", { settings: next });
   settingsCache = next;
-  applyTheme(selectedTheme);
+  applyTheme(selectedTheme, customThemePrefs);
   renderChannelBindings(next);
   if (prevMode !== qqMode && next.channels?.qq?.bound) {
     try {
@@ -2958,7 +4044,7 @@ async function loadSettingsView() {
   $<HTMLInputElement>("s-wx-keys").value = "";
   $<HTMLInputElement>("s-tg-api-id").value = String(settingsCache.channels?.telegram?.apiId || "");
   $<HTMLInputElement>("s-tg-api-hash").value = settingsCache.channels?.telegram?.apiHash || "";
-  applyTheme(settingsCache.ui?.theme || "midnight");
+  applyThemeFromSettings(settingsCache);
   renderChannelBindings(settingsCache);
   syncReportKeepSlider(settingsCache.llm?.reportKeepLimit ?? 100);
   fillGlobalDefaultConfig();
@@ -3117,6 +4203,7 @@ window.addEventListener("DOMContentLoaded", async () => {
   reduceMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
   loadHideSkippedToggle();
   setupUiSounds();
+  setupThemeAppearanceUi();
 
   const hideSkippedEl = document.getElementById(
     "monitored-hide-skipped",
@@ -3287,8 +4374,15 @@ window.addEventListener("DOMContentLoaded", async () => {
     clearAllUnread().catch((e) => toast(String(e), true));
   };
   $("btn-back-monitored-report").onclick = () => {
+    if (reportSubview !== "overview" && monitoredDetailReportId != null) {
+      navigateReportSubview("overview", null);
+      return;
+    }
     showMonitoredMaster();
     monitoredDetailReportId = null;
+    reportSubview = "overview";
+    reportSubviewPointIndex = null;
+    reportDetailMessagesCache = [];
     animateViewEnter($("monitored-master"));
     if (monitoredSelectedGroupId) {
       selectMonitoredGroup(monitoredSelectedGroupId).catch(() => undefined);
@@ -3300,6 +4394,14 @@ window.addEventListener("DOMContentLoaded", async () => {
       toggleFavoriteCurrentReport().catch((e) => toast(String(e), true));
     };
   }
+  const clipsBtn = document.getElementById("btn-report-clips");
+  if (clipsBtn) {
+    clipsBtn.onclick = () => openReportClipsOverlay();
+  }
+  bindReportAnalysisActions($("monitored-report-detail-body"));
+  setupReportContextMenu();
+  setupReportAskPopup();
+  setupReportClipsOverlay();
   $("btn-report-issue").onclick = () => {
     openIssueReportModal().catch((e) => toast(String(e), true));
   };
@@ -4028,10 +5130,10 @@ window.addEventListener("DOMContentLoaded", async () => {
 
   try {
     settingsCache = await invoke<AppSettings>("api_get_settings");
-    applyTheme(settingsCache.ui?.theme || "midnight");
+    applyThemeFromSettings(settingsCache);
     syncReportKeepSlider(settingsCache.llm?.reportKeepLimit ?? 100);
   } catch {
-    applyTheme("midnight");
+    applyThemeFromSettings(null);
     syncReportKeepSlider(100);
   }
   settingsAutoSaveReady = true;

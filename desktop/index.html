@@ -1,9 +1,11 @@
 <!doctype html>
-<html lang="zh-CN" data-theme="midnight" data-theme-mode="dark" data-theme-category="achievement">
+<html lang="zh-CN" data-theme="midnight" data-theme-mode="dark" data-theme-category="image">
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>QQ 群消息监听</title>
+    <link rel="icon" type="image/png" sizes="32x32" href="/favicon-32.png" />
+    <link rel="apple-touch-icon" href="/icon-192.png" />
     <link rel="preconnect" href="https://fonts.googleapis.com" />
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
     <link
@@ -200,17 +202,18 @@
                 <p id="monitored-report-detail-meta"></p>
               </div>
               <div class="page-head-actions">
+                <button id="btn-report-clips" class="btn ghost hidden" type="button" title="查看本报告本地收藏的要点与片段">本地收藏</button>
                 <button id="btn-report-issue" class="btn danger hidden" type="button">上报 Issue</button>
                 <button id="btn-favorite-report" class="btn ghost favorite-btn" type="button" title="收藏后永久保留分析与聊天记录">☆ 收藏</button>
               </div>
             </header>
             <div class="report-detail-split fill">
-              <div class="panel fill scroll report-detail-panel">
-                <h3 class="pane-title">分析结果</h3>
-                <pre id="monitored-report-detail-body" class="report-detail-body"></pre>
+              <div class="panel fill scroll report-detail-panel" id="monitored-report-analysis-panel">
+                <h3 class="pane-title" id="monitored-report-analysis-title">分析结果</h3>
+                <div id="monitored-report-detail-body" class="report-detail-body report-structured ui-selectable"></div>
               </div>
               <div class="panel fill scroll report-detail-msgs-panel">
-                <h3 class="pane-title">相关对话</h3>
+                <h3 class="pane-title" id="monitored-report-msgs-title">相关对话</h3>
                 <p class="field-hint" id="monitored-report-msgs-hint">分析窗口内的原始消息</p>
                 <div id="monitored-report-detail-msgs" class="messages report-detail-msgs"></div>
               </div>
@@ -339,7 +342,7 @@
                     <label>
                       分析提示词
                       <textarea id="g-llm-prompt" rows="6" placeholder="会作用于多轮前文审查与最终分析。例如：出现 GitHub/AI 名词时深入展开…"></textarea>
-                      <p class="field-hint">保存后下次分析即生效。会参与多轮前文审查与最终报告；内置也会对 GitHub/AI 名词强制深挖并扩充 deep_dives。</p>
+                      <p class="field-hint">保存后下次分析即生效。会参与多轮前文审查与最终报告；内置也会对 GitHub/AI 名词强制深挖，并写入对应要点的 deep_dive。</p>
                     </label>
                   </div>
                   </div>
@@ -417,8 +420,15 @@
                   <span class="channel-badge" id="ch-qq-badge">未绑定</span>
                 </div>
                 <p class="settings-desc" id="qq-mode-hint">
-                  当前仅支持 NapCat / OneBot 完整监听。
+                  可选 NapCat / OneBot 完整监听，或官方 QQ 被动采集（通知 + 当前会话）。
                 </p>
+                <div class="setting-item">
+                  <label>QQ 采集模式</label>
+                  <select id="s-qq-mode">
+                    <option value="onebot">NapCat / OneBot（完整）</option>
+                    <option value="passive">官方 QQ 被动（低风险，可能漏消息）</option>
+                  </select>
+                </div>
                 <div id="qq-onebot-fields">
                   <div class="setting-item">
                     <label>OneBot WS 地址</label>
@@ -429,11 +439,21 @@
                     <input id="s-token" type="password" placeholder="与 NapCat 一致" />
                   </div>
                 </div>
+                <div id="qq-passive-fields" class="hidden">
+                  <div class="setting-item">
+                    <label>轮询间隔（秒）</label>
+                    <input id="s-qq-poll" type="number" min="0.8" max="30" step="0.1" value="1.5" />
+                  </div>
+                  <p class="field-hint" id="qq-passive-status">
+                    被动模式依赖系统通知与当前聊天窗口；请勿同时运行 NapCat。
+                  </p>
+                </div>
                 <div class="channel-actions">
                   <button id="btn-bind-qq" class="btn primary" type="button">绑定 QQ</button>
                   <button id="btn-unbind-qq" class="btn" type="button">解绑</button>
                   <button id="btn-test-onebot" class="btn ghost" type="button">测试连通</button>
                   <button id="btn-pull-onebot-groups" class="btn ghost" type="button">拉取 QQ 群</button>
+                  <button id="btn-detect-qq-passive" class="btn ghost hidden" type="button">探测官方 QQ</button>
                 </div>
                 <div id="onebot-test-result" class="test-result" hidden></div>
               </div>
@@ -616,9 +636,70 @@
 
             <div id="stab-appearance" class="settings-body hidden">
               <div class="setting-item">
-                <label>皮肤配色</label>
-                <p class="settings-desc">选择一套配色方案，立即预览，保存后持久生效。</p>
-                <div id="theme-picker" class="theme-picker"></div>
+                <label>皮肤</label>
+                <p class="settings-desc">图片皮肤带氛围壁纸；纯色皮肤仅配色；自定义支持取色或从图片采样自动配色。</p>
+                <div class="theme-category-tabs" role="tablist" aria-label="皮肤分类">
+                  <button type="button" class="theme-cat-tab active" data-theme-cat="image">图片皮肤</button>
+                  <button type="button" class="theme-cat-tab" data-theme-cat="palette">纯色皮肤</button>
+                  <button type="button" class="theme-cat-tab" data-theme-cat="custom">自定义</button>
+                </div>
+
+                <div id="theme-panel-image" class="theme-cat-panel">
+                  <div id="theme-picker-image" class="theme-picker"></div>
+                </div>
+                <div id="theme-panel-palette" class="theme-cat-panel hidden">
+                  <div id="theme-picker-palette" class="theme-picker"></div>
+                </div>
+                <div id="theme-panel-custom" class="theme-cat-panel hidden">
+                  <div class="custom-theme-card">
+                    <div class="custom-theme-preview" id="custom-theme-preview" aria-hidden="true"></div>
+                    <div class="custom-theme-controls">
+                      <div class="custom-source-tabs" role="tablist">
+                        <button type="button" class="theme-cat-tab active" data-custom-source="color">纯色自动</button>
+                        <button type="button" class="theme-cat-tab" data-custom-source="image">图片采样</button>
+                      </div>
+                      <div id="custom-color-fields" class="custom-fields">
+                        <label class="inline-color">
+                          主色
+                          <input id="custom-base-color" type="color" value="#3d8b8b" />
+                          <input id="custom-base-hex" type="text" maxlength="7" value="#3d8b8b" placeholder="#3d8b8b" />
+                        </label>
+                        <div class="custom-quick-colors" id="custom-quick-colors"></div>
+                      </div>
+                      <div id="custom-image-fields" class="custom-fields hidden">
+                        <label class="file-pick">
+                          选择壁纸图片
+                          <input id="custom-wall-file" type="file" accept="image/*" />
+                        </label>
+                        <p class="field-hint" id="custom-sample-hint">上传后自动采样主色并调整整套配色；图片同时作为氛围壁纸。</p>
+                        <button id="btn-clear-custom-wall" class="btn ghost sm" type="button">清除壁纸</button>
+                      </div>
+                      <div class="custom-mode-row">
+                        <label><input type="radio" name="custom-mode" value="dark" checked /> 深色</label>
+                        <label><input type="radio" name="custom-mode" value="light" /> 浅色</label>
+                      </div>
+                      <button id="btn-apply-custom-theme" class="btn primary" type="button">应用自定义皮肤</button>
+                    </div>
+                  </div>
+                </div>
+
+                <div class="appearance-opacity-block">
+                  <label>透明度</label>
+                  <p class="settings-desc">调整壁纸氛围与面板毛玻璃的通透程度，立即预览，自动保存。</p>
+                  <div class="range-row">
+                    <span class="range-min">壁纸</span>
+                    <input id="s-wall-opacity" type="range" min="0" max="100" step="1" value="40" />
+                    <strong id="s-wall-opacity-val" class="range-val">40%</strong>
+                    <button id="btn-wall-opacity-reset" class="btn ghost sm" type="button" title="恢复当前皮肤默认壁纸透明度">默认</button>
+                  </div>
+                  <p class="field-hint" id="wall-opacity-hint">纯色皮肤无壁纸时，此项不生效。</p>
+                  <div class="range-row">
+                    <span class="range-min">面板</span>
+                    <input id="s-panel-opacity" type="range" min="35" max="100" step="1" value="82" />
+                    <strong id="s-panel-opacity-val" class="range-val">82%</strong>
+                  </div>
+                  <p class="field-hint">面板越大越不透明；调低可更清楚地看见壁纸。</p>
+                </div>
               </div>
             </div>
           </div>
@@ -664,6 +745,42 @@
         </div>
       </div>
     </div>
+
+    <div id="report-ctx-menu" class="report-ctx-menu hidden" role="menu" hidden>
+      <button type="button" data-ctx="fav-clip" role="menuitem">收藏选中内容</button>
+      <button type="button" data-ctx="fav-point" role="menuitem">收藏此要点</button>
+      <button type="button" data-ctx="ask-sel" role="menuitem">追问选中内容</button>
+      <button type="button" data-ctx="ask-point" role="menuitem">追问此要点</button>
+      <button type="button" data-ctx="ask-report" role="menuitem">追问本报告</button>
+    </div>
+
+    <div id="report-ask-overlay" class="report-ask-overlay hidden" hidden>
+      <div class="report-ask-backdrop" data-ask-close="1"></div>
+      <div class="report-ask-popup" role="dialog" aria-modal="true" aria-label="分析追问">
+        <div class="report-ask-head">
+          <strong>追问分析</strong>
+          <button type="button" class="btn ghost sm" data-ask-close="1">关闭</button>
+        </div>
+        <p id="report-ask-context" class="field-hint report-ask-context"></p>
+        <textarea id="report-ask-input" class="report-ask-input" rows="3" placeholder="输入你的问题…"></textarea>
+        <div class="report-ask-actions">
+          <button id="btn-report-ask-send" class="btn" type="button">发送</button>
+        </div>
+        <div id="report-ask-answer" class="report-ask-answer empty-hint">回答将显示在这里</div>
+      </div>
+    </div>
+
+    <div id="report-clips-overlay" class="report-ask-overlay hidden" hidden>
+      <div class="report-ask-backdrop" data-clips-close="1"></div>
+      <div class="report-ask-popup report-clips-popup" role="dialog" aria-modal="true" aria-label="本地收藏">
+        <div class="report-ask-head">
+          <strong>本报告本地收藏</strong>
+          <button type="button" class="btn ghost sm" data-clips-close="1">关闭</button>
+        </div>
+        <div id="report-clips-list" class="report-clips-list"></div>
+      </div>
+    </div>
+
     <script type="module" src="/src/main.ts"></script>
   </body>
 </html>

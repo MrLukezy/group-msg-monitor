@@ -15,14 +15,17 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 from app.llm.service import (  # noqa: E402
+    ask_about_report,
     build_github_issue_preview,
     get_report_favorite_messages,
+    has_structured_key_points,
     list_reports,
     record_llm_failure,
     run_group_summary,
     set_report_github_issue_url,
     set_report_favorited,
     sqlite_path,
+    structured_report_for_api,
     sum_report_tokens,
 )
 from app.settings_store import (  # noqa: E402
@@ -309,8 +312,24 @@ def cmd_save_settings(raw: str) -> None:
 
     ui = mapped.get("ui") or {}
     if isinstance(ui, dict):
+        custom = ui.get("custom") or {}
+        if not isinstance(custom, dict):
+            custom = {}
+        wall_raw = ui.get("wallOpacity", ui.get("wall_opacity", None))
+        panel_raw = ui.get("panelOpacity", ui.get("panel_opacity", 0.82))
         mapped["ui"] = {
             "theme": (ui.get("theme") or "midnight").strip() or "midnight",
+            "custom": {
+                "base_color": (
+                    custom.get("baseColor")
+                    or custom.get("base_color")
+                    or "#3d8b8b"
+                ),
+                "mode": custom.get("mode") or "dark",
+                "source": custom.get("source") or "color",
+            },
+            "wall_opacity": wall_raw,
+            "panel_opacity": panel_raw,
         }
 
     channels = mapped.get("channels") or {}
@@ -1116,6 +1135,7 @@ def cmd_list_reports(group_id: str | None, limit: int, favorites_only: bool = Fa
         if not skipped and ("[定时跳过]" in headline or "[跳过]" in headline):
             skipped = True
         token_usage = token_usage_from_row(r, payload)
+        structured = structured_report_for_api(payload) if payload else {}
         items.append(
             {
                 "id": r["id"],
@@ -1129,6 +1149,8 @@ def cmd_list_reports(group_id: str | None, limit: int, favorites_only: bool = Fa
                 "msgCount": r["msg_count"],
                 "createdAt": r["created_at"],
                 "reportMd": r["report_md"],
+                "reportJson": structured,
+                "hasStructuredPoints": has_structured_key_points(payload),
                 "skipped": skipped,
                 "failed": failed,
                 "error": payload.get("error") if isinstance(payload.get("error"), dict) else {},
@@ -1169,6 +1191,26 @@ def cmd_set_report_favorite(report_id: int, favorited: bool) -> None:
 def cmd_report_favorite_messages(report_id: int) -> None:
     rows = get_report_favorite_messages(int(report_id))
     out(rows)
+
+
+def cmd_ask_report(
+    report_id: int,
+    question: str,
+    selection: str = "",
+    point_index: int | None = None,
+) -> None:
+    try:
+        result = asyncio.run(
+            ask_about_report(
+                int(report_id),
+                question,
+                selection=selection or "",
+                point_index=point_index,
+            )
+        )
+        out(result)
+    except Exception as e:
+        out({"ok": False, "error": str(e), "answer": ""})
 
 
 def token_usage_from_row(r: dict, payload: dict) -> dict[str, int]:
@@ -1460,6 +1502,12 @@ def main() -> None:
     p_fav_msgs = sub.add_parser("report-favorite-messages")
     p_fav_msgs.add_argument("--report-id", type=int, required=True)
 
+    p_ask = sub.add_parser("ask-report")
+    p_ask.add_argument("--report-id", type=int, required=True)
+    p_ask.add_argument("--question", required=True)
+    p_ask.add_argument("--selection", default="")
+    p_ask.add_argument("--point-index", type=int, default=None)
+
     p_issue_preview = sub.add_parser("github-issue-preview")
     p_issue_preview.add_argument("--report-id", type=int, required=True)
 
@@ -1537,6 +1585,13 @@ def main() -> None:
         cmd_set_report_favorite(args.report_id, bool(args.favorited))
     elif args.cmd == "report-favorite-messages":
         cmd_report_favorite_messages(args.report_id)
+    elif args.cmd == "ask-report":
+        cmd_ask_report(
+            args.report_id,
+            args.question,
+            selection=getattr(args, "selection", "") or "",
+            point_index=getattr(args, "point_index", None),
+        )
     elif args.cmd == "github-issue-preview":
         cmd_github_issue_preview(args.report_id)
     elif args.cmd == "set-report-issue":

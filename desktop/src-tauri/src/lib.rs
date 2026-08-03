@@ -351,7 +351,35 @@ struct StatusInfo {
 }
 
 fn qq_mode_from_settings() -> String {
-    "onebot".into()
+    fs::read_to_string(project_root().join("data").join("app_settings.json"))
+        .ok()
+        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+        .and_then(|v| {
+            v.get("channels")
+                .and_then(|c| c.get("qq"))
+                .and_then(|q| q.get("mode"))
+                .and_then(Value::as_str)
+                .map(|s| s.to_string())
+        })
+        .filter(|m| m == "onebot" || m == "passive")
+        .unwrap_or_else(|| "onebot".into())
+}
+
+fn qq_passive_meta_from_settings() -> (String, bool) {
+    let Some(qq) = fs::read_to_string(project_root().join("data").join("app_settings.json"))
+        .ok()
+        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+        .and_then(|v| v.get("channels")?.get("qq").cloned())
+    else {
+        return (String::new(), false);
+    };
+    let access = qq
+        .get("notification_access")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let uia = qq.get("uia_ready").and_then(Value::as_bool).unwrap_or(false);
+    (access, uia)
 }
 
 fn process_running(image_name: &str) -> bool {
@@ -367,17 +395,19 @@ fn process_running(image_name: &str) -> bool {
 #[tauri::command]
 fn get_status(state: tauri::State<'_, AppState>) -> StatusInfo {
     let (onebot_host, onebot_port) = read_onebot_endpoint();
+    let mode = qq_mode_from_settings();
+    let (notification_access, uia_ready) = qq_passive_meta_from_settings();
     StatusInfo {
         napcat_installed: napcat_dir().join("launcher-user.bat").exists()
             || napcat_dir().join("launcher.bat").exists(),
         napcat_webui_up: port_open("127.0.0.1", read_webui_port()),
         onebot_ws_up: port_open(&onebot_host, onebot_port),
         monitor_running: monitor_service_running(&state),
-        qq_mode: "onebot".into(),
-        official_qq_running: false,
-        napcat_process_running: false,
-        notification_access: String::new(),
-        uia_ready: false,
+        qq_mode: mode,
+        official_qq_running: process_running("QQ.exe"),
+        napcat_process_running: process_running("NapCatWinBootMain.exe"),
+        notification_access,
+        uia_ready,
     }
 }
 
@@ -1173,6 +1203,34 @@ fn api_report_favorite_messages(report_id: i64) -> Result<Value, String> {
 }
 
 #[tauri::command]
+fn api_ask_report(
+    report_id: i64,
+    question: String,
+    selection: Option<String>,
+    point_index: Option<i64>,
+) -> Result<Value, String> {
+    let rid = report_id.to_string();
+    let sel = selection.unwrap_or_default();
+    let idx_s = point_index.map(|i| i.to_string());
+    let mut args: Vec<&str> = vec![
+        "ask-report",
+        "--report-id",
+        &rid,
+        "--question",
+        &question,
+    ];
+    if !sel.is_empty() {
+        args.push("--selection");
+        args.push(&sel);
+    }
+    if let Some(ref s) = idx_s {
+        args.push("--point-index");
+        args.push(s);
+    }
+    py_api_json(&args)
+}
+
+#[tauri::command]
 fn api_github_issue_preview(report_id: i64) -> Result<Value, String> {
     let rid = report_id.to_string();
     let mut preview = py_api_json(&["github-issue-preview", "--report-id", &rid])?;
@@ -1361,12 +1419,33 @@ fn settings_to_camel(v: Value) -> Value {
     );
     let ui = obj.remove("ui").unwrap_or(Value::Object(Default::default()));
     let mut ui_obj = ui.as_object().cloned().unwrap_or_default();
+    let custom = ui_obj
+        .remove("custom")
+        .unwrap_or(Value::Object(Default::default()));
+    let mut custom_o = custom.as_object().cloned().unwrap_or_default();
     out.insert(
         "ui".into(),
         serde_json::json!({
             "theme": ui_obj
                 .remove("theme")
                 .unwrap_or(Value::String("midnight".into())),
+            "custom": {
+                "baseColor": custom_o
+                    .remove("base_color")
+                    .unwrap_or(Value::String("#3d8b8b".into())),
+                "mode": custom_o
+                    .remove("mode")
+                    .unwrap_or(Value::String("dark".into())),
+                "source": custom_o
+                    .remove("source")
+                    .unwrap_or(Value::String("color".into())),
+            },
+            "wallOpacity": ui_obj
+                .remove("wall_opacity")
+                .unwrap_or(Value::Null),
+            "panelOpacity": ui_obj
+                .remove("panel_opacity")
+                .unwrap_or(Value::from(0.82)),
         }),
     );
     Value::Object(out)
@@ -1834,6 +1913,7 @@ pub fn run() {
             api_list_reports,
             api_set_report_favorite,
             api_report_favorite_messages,
+            api_ask_report,
             api_github_issue_preview,
             api_report_github_issue,
             api_token_stats,

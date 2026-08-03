@@ -41,8 +41,8 @@ LLM_REPORT_KEEP_DEFAULT = 100
 
 LEGACY_LLM_MONITOR_PROMPT = (
     "请基于群聊做中文分析。若出现 GitHub 仓库或 AI/大模型相关名词，"
-    "必须多轮补齐相关上下文，并在 deep_dives 中深入展开、扩充回答；"
-    "仓库写入 appendix.links，名词写入 appendix.nouns。"
+    "必须多轮补齐相关上下文，并在对应 key_point 的 deep_dive 中深入展开、扩充回答；"
+    "仓库写入要点 links（或 appendix.links），名词写入要点 nouns（或 appendix.nouns）。"
     "同时关注主题、风险、待办；禁止编造，不确定写「记录不足」。"
 )
 
@@ -66,17 +66,72 @@ def clamp_report_keep_limit(value: Any) -> int:
     return max(LLM_REPORT_KEEP_MIN, min(LLM_REPORT_KEEP_MAX, n))
 
 
+class CustomThemeSettings(BaseModel):
+    """自定义皮肤：纯色自动配色，或图片采样自动配色。"""
+
+    base_color: str = "#3d8b8b"
+    mode: str = "dark"  # dark | light
+    source: str = "color"  # color | image
+
+    @field_validator("mode", mode="before")
+    @classmethod
+    def normalize_mode(cls, value: Any) -> str:
+        return "light" if str(value or "").strip().lower() == "light" else "dark"
+
+    @field_validator("source", mode="before")
+    @classmethod
+    def normalize_source(cls, value: Any) -> str:
+        return "image" if str(value or "").strip().lower() == "image" else "color"
+
+    @field_validator("base_color", mode="before")
+    @classmethod
+    def normalize_color(cls, value: Any) -> str:
+        raw = str(value or "").strip()
+        if not raw.startswith("#"):
+            raw = f"#{raw}"
+        if len(raw) == 4 and all(c in "0123456789abcdefABCDEF#" for c in raw):
+            raw = f"#{raw[1]*2}{raw[2]*2}{raw[3]*2}"
+        if len(raw) == 7 and all(c in "0123456789abcdefABCDEF#" for c in raw):
+            return raw.lower()
+        return "#3d8b8b"
+
+
 class UiSettings(BaseModel):
     """桌面端外观与交互偏好。"""
 
-    theme: str = "midnight"  # midnight | daylight | ocean | forest | rose | graphite
+    theme: str = "midnight"
+    custom: CustomThemeSettings = Field(default_factory=CustomThemeSettings)
+    # 壁纸氛围透明度 0~1；None 表示跟随当前皮肤默认
+    wall_opacity: float | None = None
+    # 面板毛玻璃透明度 0.35~1，越大越不透明
+    panel_opacity: float = 0.82
+
+    @field_validator("wall_opacity", mode="before")
+    @classmethod
+    def normalize_wall_opacity(cls, value: Any) -> float | None:
+        if value is None or value == "":
+            return None
+        try:
+            n = float(value)
+        except Exception:
+            return None
+        return max(0.0, min(1.0, n))
+
+    @field_validator("panel_opacity", mode="before")
+    @classmethod
+    def normalize_panel_opacity(cls, value: Any) -> float:
+        try:
+            n = float(value)
+        except Exception:
+            n = 0.82
+        return max(0.35, min(1.0, n))
 
 
 class QqChannelSettings(BaseModel):
     bound: bool = False
     label: str = ""
     last_error: str = ""
-    # 当前仅支持 NapCat / OneBot 完整监听。
+    # onebot = NapCat / OneBot；passive = 官方 QQ 通知+UIA 被动采集
     mode: str = "onebot"
     notification_access: str = ""  # allowed | denied | unsupported | unknown
     uia_ready: bool = False
@@ -87,7 +142,9 @@ class QqChannelSettings(BaseModel):
     @field_validator("mode", mode="before")
     @classmethod
     def normalize_mode(cls, value: Any) -> str:
-        _ = value
+        mode = str(value or "onebot").strip().lower()
+        if mode in ("passive", "safe", "official", "qq_passive", "qqp"):
+            return "passive"
         return "onebot"
 
 
@@ -247,7 +304,7 @@ def _migrate_channel_defaults(settings: AppSettings) -> AppSettings:
         settings.llm.default_prompt = DEFAULT_LLM_MONITOR_PROMPT
         changed = True
     qq = settings.channels.qq
-    if qq.mode != "onebot":
+    if qq.mode not in ("onebot", "passive"):
         qq.mode = "onebot"
         changed = True
     if not qq.bound and (settings.onebot_ws_url or settings.onebot_access_token):
@@ -307,7 +364,8 @@ def save_app_settings(settings: AppSettings) -> None:
         WECHAT_DISABLED_MESSAGE,
     )
 
-    settings.channels.qq.mode = "onebot"
+    if settings.channels.qq.mode not in ("onebot", "passive"):
+        settings.channels.qq.mode = "onebot"
     if not WECHAT_CHANNEL_ENABLED:
         settings.channels.wechat.bound = False
         settings.channels.wechat.label = ""

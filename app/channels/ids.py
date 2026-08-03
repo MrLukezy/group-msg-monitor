@@ -8,6 +8,10 @@ def make_group_id(channel: str, raw_id: str | int) -> str:
     rid = str(raw_id).strip()
     if ch in ("qq", ""):
         return rid
+    if ch in ("qq_passive", "qqpassive", "qqp"):
+        if rid.startswith("qqp:"):
+            return rid
+        return f"qqp:{rid}"
     if ch in ("wechat", "wx"):
         if rid.startswith("wx:"):
             return rid
@@ -21,6 +25,8 @@ def make_group_id(channel: str, raw_id: str | int) -> str:
 
 def parse_group_id(group_id: str) -> tuple[str, str]:
     gid = str(group_id or "").strip()
+    if gid.startswith("qqp:"):
+        return "qq", gid
     if gid.startswith("wx:"):
         return "wechat", gid[3:]
     if gid.startswith("wechat:"):
