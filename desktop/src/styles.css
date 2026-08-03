@@ -2037,6 +2037,8 @@ input::placeholder, textarea::placeholder {
 .report-ask-actions {
   display: flex;
   justify-content: flex-end;
+  align-items: center;
+  gap: 8px;
 }
 .report-ask-answer {
   min-height: 64px;

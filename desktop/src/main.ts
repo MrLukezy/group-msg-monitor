@@ -258,9 +258,11 @@ type ReportSubview = "overview" | "point" | "summary";
 
 type AnalysisFavorite = {
   reportId: number;
-  kind: "point" | "clip";
+  kind: "point" | "clip" | "ask";
   pointIndex?: number;
+  /** 要点摘要 / 选中片段 / 追问回答 */
   text: string;
+  /** 要点标题 / 片段备注 / 追问问题 */
   title?: string;
   createdAt: string;
 };
@@ -276,6 +278,8 @@ let reportDetailMessagesCache: MessageRow[] = [];
 let reportAskContext: { selection?: string; pointIndex?: number | null } = {};
 /** 追问请求世代号：关闭弹窗或新发送时递增，丢弃过期结果 */
 let reportAskSeq = 0;
+/** 最近一次成功的追问，用于收藏 */
+let lastAskResult: { question: string; answer: string } | null = null;
 
 
 const PROVIDER_PRESETS: Record<
@@ -2275,6 +2279,14 @@ function addAnalysisFavorite(item: AnalysisFavorite) {
         x.pointIndex === item.pointIndex
       );
     }
+    if (item.kind === "ask") {
+      // 同一报告同一问题只保留一份，后写覆盖
+      return !(
+        x.reportId === item.reportId &&
+        x.kind === "ask" &&
+        (x.title || "") === (item.title || "")
+      );
+    }
     return !(
       x.reportId === item.reportId &&
       x.kind === "clip" &&
@@ -2294,6 +2306,67 @@ function removePointFavorite(reportId: number, pointIndex: number) {
     ),
   );
   syncReportClipsButton();
+}
+
+function isAskFavorited(reportId: number, question: string): boolean {
+  const q = (question || "").trim();
+  if (!q) return false;
+  return favoritesForReport(reportId).some(
+    (x) => x.kind === "ask" && (x.title || "").trim() === q,
+  );
+}
+
+function removeAskFavorite(reportId: number, question: string) {
+  const q = (question || "").trim();
+  saveAnalysisFavorites(
+    loadAnalysisFavorites().filter(
+      (x) =>
+        !(x.reportId === reportId && x.kind === "ask" && (x.title || "").trim() === q),
+    ),
+  );
+  syncReportClipsButton();
+}
+
+function syncAskFavoriteButton() {
+  const btn = document.getElementById("btn-report-ask-fav") as HTMLButtonElement | null;
+  if (!btn) return;
+  if (
+    monitoredDetailReportId == null ||
+    !lastAskResult?.answer ||
+    !lastAskResult.question
+  ) {
+    btn.hidden = true;
+    return;
+  }
+  btn.hidden = false;
+  const on = isAskFavorited(monitoredDetailReportId, lastAskResult.question);
+  btn.classList.toggle("is-favorited", on);
+  btn.textContent = on ? "★ 已收藏" : "☆ 收藏追问";
+  btn.title = on ? "取消收藏此追问" : "收藏问题与回答到本报告本地收藏";
+}
+
+function toggleAskFavorite() {
+  if (monitoredDetailReportId == null || !lastAskResult?.answer) {
+    toast("请先完成一次追问", true);
+    return;
+  }
+  const reportId = monitoredDetailReportId;
+  const { question, answer } = lastAskResult;
+  if (isAskFavorited(reportId, question)) {
+    removeAskFavorite(reportId, question);
+    toast("已取消追问收藏");
+  } else {
+    addAnalysisFavorite({
+      reportId,
+      kind: "ask",
+      title: question,
+      text: answer,
+      pointIndex: reportAskContext.pointIndex ?? undefined,
+      createdAt: new Date().toISOString(),
+    });
+    toast("已收藏追问");
+  }
+  syncAskFavoriteButton();
 }
 
 function syncReportClipsButton() {
@@ -2911,6 +2984,7 @@ function setupReportContextMenu() {
 function closeReportAskPopup() {
   // 作废进行中的追问结果，避免关闭后仍写回 UI
   reportAskSeq += 1;
+  lastAskResult = null;
   const overlay = document.getElementById("report-ask-overlay");
   if (!overlay) return;
   overlay.classList.add("hidden");
@@ -2931,9 +3005,15 @@ function closeReportAskPopup() {
     sendBtn.disabled = false;
     sendBtn.textContent = "发送";
   }
+  syncAskFavoriteButton();
 }
 
-function openReportAskPopup(ctx: { selection?: string; pointIndex?: number | null }) {
+function openReportAskPopup(ctx: {
+  selection?: string;
+  pointIndex?: number | null;
+  presetQuestion?: string;
+  presetAnswer?: string;
+}) {
   if (monitoredDetailReportId == null) {
     toast("请先打开分析报告", true);
     return;
@@ -2947,7 +3027,9 @@ function openReportAskPopup(ctx: { selection?: string; pointIndex?: number | nul
   const overlay = document.getElementById("report-ask-overlay");
   const ctxEl = document.getElementById("report-ask-context");
   if (!overlay || !ctxEl) return;
-  const report = monitoredReportsCache.find((r) => r.id === monitoredDetailReportId);
+  const report =
+    monitoredReportsCache.find((r) => r.id === monitoredDetailReportId) ||
+    favoritesReportsCache.find((r) => r.id === monitoredDetailReportId);
   let hint = `基于报告：${report?.headline || ""}`;
   if (reportAskContext.pointIndex != null && report) {
     const p = reportKeyPoints(report)[reportAskContext.pointIndex];
@@ -2959,17 +3041,32 @@ function openReportAskPopup(ctx: { selection?: string; pointIndex?: number | nul
   }
   ctxEl.textContent = hint;
   const answer = document.getElementById("report-ask-answer");
-  if (answer) {
-    answer.className = "report-ask-answer empty-hint";
-    answer.textContent = "回答将分段标注【来自群聊/报告】与【来自模型知识】";
+  const input = document.getElementById("report-ask-input") as HTMLTextAreaElement | null;
+  const presetQ = (ctx.presetQuestion || "").trim();
+  const presetA = (ctx.presetAnswer || "").trim();
+  if (presetQ && presetA) {
+    lastAskResult = { question: presetQ, answer: presetA };
+    if (input) input.value = presetQ;
+    if (answer) {
+      answer.className = "report-ask-answer";
+      answer.textContent = presetA;
+    }
+  } else {
+    lastAskResult = null;
+    if (answer) {
+      answer.className = "report-ask-answer empty-hint";
+      answer.textContent = "回答将分段标注【来自群聊/报告】与【来自模型知识】";
+    }
+    if (input && !presetQ) input.value = "";
+    else if (input && presetQ) input.value = presetQ;
   }
   const sendBtn = document.getElementById("btn-report-ask-send") as HTMLButtonElement | null;
   if (sendBtn) {
     sendBtn.disabled = false;
     sendBtn.textContent = "发送";
   }
-  const input = document.getElementById("report-ask-input") as HTMLTextAreaElement | null;
   if (input) input.disabled = false;
+  syncAskFavoriteButton();
   overlay.classList.remove("hidden");
   overlay.removeAttribute("hidden");
   input?.focus();
@@ -2989,6 +3086,8 @@ async function sendReportAsk() {
   const selection = reportAskContext.selection || "";
   const pointIndex = reportAskContext.pointIndex ?? null;
   const seq = ++reportAskSeq;
+  lastAskResult = null;
+  syncAskFavoriteButton();
 
   if (answerEl) {
     answerEl.className = "report-ask-answer";
@@ -3007,16 +3106,31 @@ async function sendReportAsk() {
       pointIndex,
     });
     if (seq !== reportAskSeq) return; // 已关闭或已发起新追问
+    const answerText = (res.answer || "").trim();
+    const errText = (res.error || "").trim();
     if (answerEl) {
-      answerEl.className = "report-ask-answer";
-      answerEl.textContent = res.answer || res.error || "（无回答）";
+      if (answerText) {
+        answerEl.className = "report-ask-answer";
+        answerEl.textContent = answerText;
+      } else {
+        answerEl.className = "report-ask-answer error";
+        answerEl.textContent = errText || "（无回答）";
+      }
     }
+    if (answerText && res.ok !== false) {
+      lastAskResult = { question, answer: answerText };
+    } else {
+      lastAskResult = null;
+    }
+    syncAskFavoriteButton();
   } catch (e) {
     if (seq !== reportAskSeq) return;
     if (answerEl) {
       answerEl.className = "report-ask-answer error";
       answerEl.textContent = String(e);
     }
+    lastAskResult = null;
+    syncAskFavoriteButton();
   } finally {
     if (seq === reportAskSeq && sendBtn) {
       sendBtn.disabled = false;
@@ -3041,6 +3155,10 @@ function setupReportAskPopup() {
     sendBtn.onclick = () => {
       sendReportAsk().catch((e) => toast(String(e), true));
     };
+  }
+  const favBtn = document.getElementById("btn-report-ask-fav");
+  if (favBtn) {
+    favBtn.onclick = () => toggleAskFavorite();
   }
   const input = document.getElementById("report-ask-input") as HTMLTextAreaElement | null;
   if (input) {
@@ -3081,10 +3199,14 @@ function openReportClipsOverlay() {
   } else {
     list.innerHTML = items
       .map((it, i) => {
-        const label =
-          it.kind === "point"
-            ? `要点 · ${escapeHtml(it.title || "")}`
-            : `片段 · ${escapeHtml(it.title || it.text.slice(0, 40))}`;
+        let label = "";
+        if (it.kind === "point") {
+          label = `要点 · ${escapeHtml(it.title || "")}`;
+        } else if (it.kind === "ask") {
+          label = `追问 · ${escapeHtml(it.title || "问题")}`;
+        } else {
+          label = `片段 · ${escapeHtml(it.title || it.text.slice(0, 40))}`;
+        }
         return `<button type="button" class="report-clip-item" data-clip-i="${i}">
           <strong>${label}</strong>
           <span>${escapeHtml(it.text.slice(0, 160))}</span>
@@ -3099,6 +3221,12 @@ function openReportClipsOverlay() {
         closeReportClipsOverlay();
         if (it.kind === "point" && it.pointIndex != null) {
           navigateReportSubview("point", it.pointIndex);
+        } else if (it.kind === "ask") {
+          openReportAskPopup({
+            pointIndex: it.pointIndex ?? null,
+            presetQuestion: it.title || "",
+            presetAnswer: it.text || "",
+          });
         }
       };
     });
