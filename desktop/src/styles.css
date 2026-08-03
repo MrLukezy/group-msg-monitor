@@ -634,6 +634,7 @@ html[data-theme-mode="light"] .app-bg::before {
   min-width: 0;
   min-height: 0;
   gap: 14px;
+  overflow: hidden;
 }
 
 .view {
@@ -1307,6 +1308,23 @@ input::placeholder, textarea::placeholder {
   min-height: 0;
 }
 
+.favorites-list-pane {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  overflow: hidden;
+  padding: 14px 16px;
+}
+
+.report-detail-overlay {
+  position: absolute;
+  inset: 0;
+  z-index: 30;
+  background: color-mix(in srgb, var(--bg) 92%, transparent);
+  padding: 18px 20px 20px;
+  box-sizing: border-box;
+}
+
 .live-messages-pane {
   min-height: 0;
   overflow: hidden;
@@ -1748,6 +1766,43 @@ input::placeholder, textarea::placeholder {
   font-weight: 700;
   color: var(--text);
 }
+.report-block-subtitle {
+  margin: 0;
+  font-size: 13px;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+  color: var(--accent);
+}
+.report-block-hint,
+.report-empty-hint {
+  margin: 0;
+  font-size: 13px;
+  line-height: 1.5;
+  color: var(--text-dim);
+}
+.report-dive-section {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 10px 12px;
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--bg-2) 70%, transparent);
+  border: 1px solid color-mix(in srgb, var(--border) 80%, transparent);
+}
+.report-knowledge-list .report-knowledge-source {
+  display: inline-block;
+  margin-left: 6px;
+  font-size: 11px;
+  color: var(--text-dim);
+  opacity: 0.85;
+}
+.report-mini-label {
+  display: inline-block;
+  margin-right: 8px;
+  font-size: 11px;
+  font-weight: 700;
+  color: var(--accent);
+}
 .report-prose {
   font-size: 16px;
   line-height: 1.8;
@@ -1765,6 +1820,11 @@ input::placeholder, textarea::placeholder {
   color: var(--text-dim);
   font-size: 14px;
   line-height: 1.65;
+}
+.key-point-card.is-focus-return {
+  border-color: color-mix(in srgb, var(--accent) 55%, var(--border));
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent) 22%, transparent);
+  transition: border-color 0.2s ease, box-shadow 0.2s ease;
 }
 .risk-tag {
   display: inline-block;

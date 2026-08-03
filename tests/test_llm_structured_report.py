@@ -13,8 +13,33 @@ from app.llm.service import (
 def test_normalize_string_key_point():
     p = normalize_key_point("群里在讨论部署", index=0)
     assert p["title"] == "群里在讨论部署"
-    assert p["deep_dive"] == {"detail": "", "evidence": ""}
+    assert p["deep_dive"] == {"detail": "", "evidence": "", "knowledge": []}
     assert p["nouns"] == []
+
+
+def test_normalize_deep_dive_knowledge():
+    p = normalize_key_point(
+        {
+            "title": "RAG",
+            "summary": "讨论检索增强",
+            "deep_dive": {
+                "detail": "群里认为要上 RAG",
+                "evidence": "上个 RAG 吧",
+                "knowledge": [
+                    {
+                        "topic": "RAG",
+                        "content": "Retrieval-Augmented Generation，检索增强生成",
+                        "source": "model_knowledge",
+                    }
+                ],
+            },
+            "nouns": [{"term": "RAG", "meaning": "检索增强生成"}],
+        },
+        index=0,
+    )
+    assert p["deep_dive"]["detail"].startswith("群里")
+    assert p["deep_dive"]["knowledge"][0]["topic"] == "RAG"
+    assert p["nouns"][0]["term"] == "RAG"
 
 
 def test_normalize_merges_top_level_deep_dives():
@@ -30,6 +55,7 @@ def test_normalize_merges_top_level_deep_dives():
     assert len(report["key_points"]) >= 1
     assert report["key_points"][0]["deep_dive"]["detail"].startswith("这是深入内容")
     assert report["key_points"][0]["title"] == "仓库分析"
+    assert report["key_points"][0]["deep_dive"]["knowledge"] == []
 
 
 def test_has_structured_object_points():
@@ -38,7 +64,11 @@ def test_has_structured_object_points():
             {
                 "title": "部署方案",
                 "summary": "讨论了灰度发布",
-                "deep_dive": {"detail": "详细分析", "evidence": "原文"},
+                "deep_dive": {
+                    "detail": "详细分析",
+                    "evidence": "原文",
+                    "knowledge": [{"topic": "灰度", "content": "分批发布", "source": "model_knowledge"}],
+                },
                 "nouns": [],
                 "links": [],
                 "notes": [],
@@ -72,7 +102,11 @@ def test_structured_report_for_api_camel_case():
             {
                 "title": "T",
                 "summary": "S",
-                "deep_dive": {"detail": "D", "evidence": "E"},
+                "deep_dive": {
+                    "detail": "D",
+                    "evidence": "E",
+                    "knowledge": [{"topic": "X", "content": "Y", "source": "model_knowledge"}],
+                },
                 "nouns": [{"term": "LLM", "meaning": "大模型"}],
                 "links": [],
                 "notes": [],
@@ -88,5 +122,6 @@ def test_structured_report_for_api_camel_case():
     assert out["headline"] == "标题"
     assert out["keyPoints"][0]["title"] == "T"
     assert out["keyPoints"][0]["nouns"][0]["term"] == "LLM"
+    assert out["keyPoints"][0]["deep_dive"]["knowledge"][0]["topic"] == "X"
     assert "actionItems" in out
     assert "notableUsers" in out

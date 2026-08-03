@@ -40,12 +40,19 @@ DEFAULT_SYSTEM = (
     "notable_users 项含 user_id/name/role/summary。"
     "key_points 必须是对象数组（禁止纯字符串），每项含："
     "title（一句话要点）、summary（2～4 句简述）、"
-    "deep_dive（{detail, evidence}：detail 建议 120～400 字深入分析，evidence 为原文摘录）、"
-    "nouns（[{term, meaning}] 本要点相关名词/黑话）、"
+    "deep_dive（{detail, evidence, knowledge}："
+    "detail 为基于群聊讨论的观点/脉络深入分析（建议 120～400 字）；"
+    "evidence 为聊天原文摘录；"
+    "knowledge 为 [{topic, content, source}] 数组，写你基于已有知识补充的背景、"
+    "概念解释、技术/仓库概况等（不是群友原话复述；无外网检索时 source 填 model_knowledge；"
+    "不确定处写明「依据模型知识/记录不足」；无则空数组）、"
+    "nouns（[{term, meaning}] 本要点名词剖析：特有名词、黑话、英文简称必须解释）、"
     "links（[{url, summary}] 本要点相关链接）、notes（[string] 本要点补充说明）。"
-    "每个要点都必须有独立的 deep_dive，深入分析绑定在对应要点内，不要把深入分析单独拆到别处。"
+    "每个要点都必须有独立的 deep_dive；深入分析须同时覆盖群内观点（detail）与背景知识（knowledge），"
+    "不要把深入分析单独拆到别处。"
     "当出现 GitHub 仓库、AI/大模型相关名词，或用户自定义要求需深挖时，"
-    "必须在对应要点的 deep_dive.detail 中写长文展开，不要只写一句话。"
+    "必须在对应要点的 deep_dive.detail 与 deep_dive.knowledge 中写长文展开，不要只写一句话；"
+    "相关术语必须写入该要点 nouns。"
     "appendix 为全局附录对象，含：nouns、links、notes（格式同上）；"
     "要点相关内容优先写在该要点的 nouns/links/notes 中；appendix 仅放跨要点或无法归类的补充。"
     "若某类数组无内容，用空数组；有 GitHub/AI 内容时要点内 appendix 字段也应尽量充实。"
@@ -56,7 +63,7 @@ DEFAULT_SYSTEM = (
     "记录可能含「补前文/补后文/引用补全」标记，请把它们当作同一段多轮对话理解。"
     "消息中可能含「[图片描述: …]」，这是对聊天图片的视觉识别结果，必须纳入主题与风险分析。"
     "用户消息中的「本群自定义分析要求」与「主题深挖规则」优先级最高，必须遵守；"
-    "允许并鼓励在 key_points（含 deep_dive/nouns/notes）中明显扩充篇幅，不要为了短而省略。"
+    "允许并鼓励在 key_points（含 deep_dive/nouns/notes/knowledge）中明显扩充篇幅，不要为了短而省略。"
 )
 
 CONTEXT_CHECK_SYSTEM = (
@@ -80,9 +87,11 @@ TOPIC_DEEP_DIVE_RULES = (
     "OpenAI、Anthropic、通义、文心、DeepSeek 等），必须："
     "1) 通过多轮向前补文尽量凑齐相关讨论上下文；"
     "2) 为每个仓库/名词建立独立 key_point，并在该要点的 deep_dive 中深入分析、明显扩充篇幅；"
-    "3) 仓库链接写入对应要点的 links（或全局 appendix.links；说明用途、讨论结论；不确定处标明「记录不足」）；"
-    "4) AI 名词写入对应要点的 nouns（或全局 appendix.nouns；解释含义与群内用法）；"
-    "5) 禁止只给一句带过。"
+    "3) deep_dive.detail 写群内讨论观点与结论，deep_dive.knowledge 写背景知识"
+    "（技术定位、常见用途、与讨论的关联；非聊天复述）；"
+    "4) 仓库链接写入对应要点的 links（或全局 appendix.links；说明用途、讨论结论；不确定处标明「记录不足」）；"
+    "5) AI/特有名词写入对应要点的 nouns（名词剖析：含义与群内用法），不得留空；"
+    "6) 禁止只给一句带过。"
 )
 
 _AI_TOPIC_RE = re.compile(
@@ -1607,29 +1616,66 @@ def _normalize_note_items(raw: Any) -> list[str]:
     return [str(x).strip() for x in raw if str(x).strip()]
 
 
-def _normalize_deep_dive(raw: Any, *, fallback_topic: str = "") -> dict[str, str]:
+def _normalize_knowledge_items(raw: Any) -> list[dict[str, str]]:
+    """规范化 deep_dive.knowledge：LLM 补充的背景知识（非聊天原文）。"""
+    out: list[dict[str, str]] = []
+    if isinstance(raw, str) and raw.strip():
+        return [{"topic": "", "content": raw.strip(), "source": "model_knowledge"}]
+    if not isinstance(raw, list):
+        return out
+    for item in raw:
+        if isinstance(item, dict):
+            topic = str(
+                item.get("topic") or item.get("title") or item.get("term") or ""
+            ).strip()
+            content = str(
+                item.get("content")
+                or item.get("claim")
+                or item.get("text")
+                or item.get("meaning")
+                or ""
+            ).strip()
+            source = str(item.get("source") or "").strip() or "model_knowledge"
+            if content or topic:
+                out.append({"topic": topic, "content": content, "source": source})
+        elif isinstance(item, str) and item.strip():
+            out.append(
+                {"topic": "", "content": item.strip(), "source": "model_knowledge"}
+            )
+    return out
+
+
+def _normalize_deep_dive(raw: Any, *, fallback_topic: str = "") -> dict[str, Any]:
     if isinstance(raw, dict):
         detail = str(raw.get("detail") or "").strip()
         evidence = str(raw.get("evidence") or "").strip()
         if not detail and raw.get("topic"):
             # 兼容旧 deep_dives 项被误塞进来
             detail = str(raw.get("topic") or "").strip()
-        return {"detail": detail, "evidence": evidence}
+        knowledge = _normalize_knowledge_items(
+            raw.get("knowledge")
+            if raw.get("knowledge") is not None
+            else raw.get("queried_knowledge")
+            if raw.get("queried_knowledge") is not None
+            else raw.get("background")
+        )
+        return {"detail": detail, "evidence": evidence, "knowledge": knowledge}
     if isinstance(raw, str) and raw.strip():
-        return {"detail": raw.strip(), "evidence": ""}
+        return {"detail": raw.strip(), "evidence": "", "knowledge": []}
     if fallback_topic:
-        return {"detail": "", "evidence": ""}
-    return {"detail": "", "evidence": ""}
+        return {"detail": "", "evidence": "", "knowledge": []}
+    return {"detail": "", "evidence": "", "knowledge": []}
 
 
 def normalize_key_point(item: Any, *, index: int = 0) -> dict[str, Any]:
     """将要点规范为绑定 deep_dive 的对象结构。"""
+    empty_dive: dict[str, Any] = {"detail": "", "evidence": "", "knowledge": []}
     if isinstance(item, str):
         title = item.strip()
         return {
             "title": title or f"要点 {index + 1}",
             "summary": "",
-            "deep_dive": {"detail": "", "evidence": ""},
+            "deep_dive": dict(empty_dive),
             "nouns": [],
             "links": [],
             "notes": [],
@@ -1638,7 +1684,7 @@ def normalize_key_point(item: Any, *, index: int = 0) -> dict[str, Any]:
         return {
             "title": f"要点 {index + 1}",
             "summary": "",
-            "deep_dive": {"detail": "", "evidence": ""},
+            "deep_dive": dict(empty_dive),
             "nouns": [],
             "links": [],
             "notes": [],
@@ -1650,8 +1696,12 @@ def normalize_key_point(item: Any, *, index: int = 0) -> dict[str, Any]:
     if not title:
         title = f"要点 {index + 1}"
     dive_raw = item.get("deep_dive")
-    if dive_raw is None and (item.get("detail") or item.get("evidence")):
-        dive_raw = {"detail": item.get("detail"), "evidence": item.get("evidence")}
+    if dive_raw is None and (item.get("detail") or item.get("evidence") or item.get("knowledge")):
+        dive_raw = {
+            "detail": item.get("detail"),
+            "evidence": item.get("evidence"),
+            "knowledge": item.get("knowledge"),
+        }
     return {
         "title": title,
         "summary": summary,
@@ -1739,13 +1789,29 @@ def report_to_md(report: dict[str, Any]) -> str:
                 dive = p.get("deep_dive") if isinstance(p.get("deep_dive"), dict) else {}
                 detail = str((dive or {}).get("detail") or "").strip()
                 evidence = str((dive or {}).get("evidence") or "").strip()
+                knowledge = (dive or {}).get("knowledge") or []
+                if detail or evidence or knowledge:
+                    lines.append("\n**深入分析**")
                 if detail:
-                    lines.append(f"\n**深入分析**\n{detail}")
+                    lines.append(f"\n*群内观点*\n{detail}")
                 if evidence:
                     lines.append(f"\n> 依据：{evidence}")
+                if isinstance(knowledge, list) and knowledge:
+                    lines.append("\n*背景知识*")
+                    for k in knowledge:
+                        if isinstance(k, dict):
+                            topic = str(k.get("topic") or "").strip()
+                            content = str(k.get("content") or "").strip()
+                            source = str(k.get("source") or "").strip()
+                            head = f"**{topic}**：" if topic else ""
+                            src = f"（{source}）" if source else ""
+                            if content or topic:
+                                lines.append(f"- {head}{content}{src}".strip())
+                        else:
+                            lines.append(f"- {k}")
                 nouns = p.get("nouns") or []
                 if nouns:
-                    lines.append("\n**名词解析**")
+                    lines.append("\n**名词剖析**")
                     for n in nouns:
                         if isinstance(n, dict):
                             lines.append(f"- **{n.get('term', '')}**：{n.get('meaning', '')}")
@@ -1849,7 +1915,7 @@ def report_to_md(report: dict[str, Any]) -> str:
         if nouns or links or notes:
             lines.append("\n## 附录")
             if nouns:
-                lines.append("\n### 名词解析")
+                lines.append("\n### 名词剖析")
                 for n in nouns:
                     if isinstance(n, dict):
                         lines.append(f"- **{n.get('term', '')}**：{n.get('meaning', '')}")
@@ -2386,9 +2452,10 @@ async def run_group_summary(
         f"{base_meta}\n"
         "请输出完整分析 JSON（必须含 key_points、appendix、context_usage）。\n"
         "key_points 必须是对象数组：每项含 title/summary/deep_dive/nouns/links/notes，"
-        "深入分析写在对应要点的 deep_dive 内，不要单独拆开。\n"
+        "deep_dive 含 detail（群内观点）、evidence（原文）、knowledge（[{topic,content,source}] 背景知识）；"
+        "深入分析写在对应要点的 deep_dive 内，不要单独拆开；名词剖析写入 nouns。\n"
         "若检测到 GitHub/AI 主题或自定义要求深挖：至少产出 1～3 个带长文 deep_dive 的要点，"
-        "相关 links/nouns 写在对应要点内，整体篇幅明显长于普通摘要。\n"
+        "相关 links/nouns/knowledge 写在对应要点内，整体篇幅明显长于普通摘要。\n"
         f"\n聊天记录:\n{transcript}"
     )
 
@@ -2709,8 +2776,15 @@ def has_structured_key_points(payload: dict[str, Any]) -> bool:
 
 
 ASK_REPORT_SYSTEM = (
-    "你是群聊分析追问助手。仅基于用户提供的分析摘录作答，禁止编造聊天原文或未给出的事实。"
-    "若信息不足，明确说明「记录不足」。回答简洁、中文、直接给出结论；不要复述整份报告。"
+    "你是群聊分析追问助手。综合两路信息作答："
+    "（1）用户提供的报告/群聊摘录；（2）你自身的通用知识与概念解释。"
+    "禁止伪造「群里说过但摘录中没有」的聊天原文或发言人；"
+    "摘录不足时不要只回「记录不足」，应改用模型知识回答概念/背景问题，并标明来源。"
+    "回答必须用中文，结构清晰，并按来源分段标注，建议格式：\n"
+    "【来自群聊/报告】……（仅写摘录能支撑的内容；没有就写「摘录未直接说明」）\n"
+    "【来自模型知识】……（概念定义、背景、常见说法；不确定处标明「依据模型知识，可能不完整」）\n"
+    "若两路可互相印证，可在末尾用一两句做综合判断。"
+    "不要复述整份报告；不要输出 JSON。"
 )
 
 
@@ -2721,7 +2795,7 @@ async def ask_about_report(
     selection: str = "",
     point_index: int | None = None,
 ) -> dict[str, Any]:
-    """基于已有报告做单轮追问，返回纯文本答案。"""
+    """基于已有报告 + 模型知识做单轮追问，返回带来源标注的纯文本答案。"""
     q = (question or "").strip()
     if not q:
         raise ValueError("问题不能为空")
@@ -2772,15 +2846,51 @@ async def ask_about_report(
     context_parts: list[str] = [
         f"报告标题：{payload.get('headline') or row['headline'] or ''}",
     ]
+    topics = payload.get("topics") or []
+    if topics:
+        context_parts.append(
+            "主题：\n" + json.dumps(topics[:8], ensure_ascii=False)
+        )
     points = payload.get("key_points") or []
     sel = (selection or "").strip()
+    focused_point: dict[str, Any] | None = None
     if point_index is not None and isinstance(points, list) and 0 <= int(point_index) < len(points):
-        context_parts.append(
-            "聚焦要点：\n" + json.dumps(points[int(point_index)], ensure_ascii=False)
-        )
-    elif sel:
+        raw_point = points[int(point_index)]
+        if isinstance(raw_point, dict):
+            focused_point = raw_point
+            context_parts.append(
+                "聚焦要点：\n" + json.dumps(raw_point, ensure_ascii=False)
+            )
+    if sel:
         context_parts.append(f"用户选中片段：\n{sel[:2000]}")
-    else:
+        # 选中短词时，尽量附上匹配的要点/名词，便于结合群聊语境
+        if focused_point is None and isinstance(points, list) and len(sel) <= 80:
+            related: list[dict[str, Any]] = []
+            needle = sel.lower()
+            for i, p in enumerate(points[:20]):
+                if not isinstance(p, dict):
+                    continue
+                blob = json.dumps(p, ensure_ascii=False).lower()
+                if needle and needle in blob:
+                    dive = p.get("deep_dive") if isinstance(p.get("deep_dive"), dict) else {}
+                    related.append(
+                        {
+                            "index": i,
+                            "title": p.get("title"),
+                            "summary": p.get("summary"),
+                            "deep_dive_excerpt": str((dive or {}).get("detail") or "")[:400],
+                            "knowledge": (dive or {}).get("knowledge") or [],
+                            "nouns": p.get("nouns") or [],
+                            "evidence": str((dive or {}).get("evidence") or "")[:300],
+                        }
+                    )
+                if len(related) >= 3:
+                    break
+            if related:
+                context_parts.append(
+                    "与选中片段相关的要点：\n" + json.dumps(related, ensure_ascii=False)
+                )
+    if focused_point is None and not sel:
         brief = []
         for i, p in enumerate(points[:12] if isinstance(points, list) else []):
             if not isinstance(p, dict):
@@ -2793,16 +2903,33 @@ async def ask_about_report(
                     "title": p.get("title"),
                     "summary": p.get("summary"),
                     "deep_dive_excerpt": str((dive or {}).get("detail") or "")[:400],
+                    "knowledge": ((dive or {}).get("knowledge") or [])[:3],
+                    "nouns": (p.get("nouns") or [])[:5],
                     "evidence": str((dive or {}).get("evidence") or "")[:300],
                 }
             )
         context_parts.append("要点摘要：\n" + json.dumps(brief, ensure_ascii=False))
 
+    appendix = payload.get("appendix") if isinstance(payload.get("appendix"), dict) else {}
+    if appendix.get("nouns") or appendix.get("notes"):
+        context_parts.append(
+            "全局附录：\n"
+            + json.dumps(
+                {
+                    "nouns": (appendix.get("nouns") or [])[:12],
+                    "notes": (appendix.get("notes") or [])[:8],
+                },
+                ensure_ascii=False,
+            )
+        )
+
     user_prompt = (
-        "\n\n".join(context_parts)
+        "下面是可供参考的群聊/报告摘录（可能不完整）：\n\n"
+        + "\n\n".join(context_parts)
         + "\n\n用户问题：\n"
         + q
-        + "\n\n请直接回答。"
+        + "\n\n请综合摘录与模型知识回答；必须分段标注【来自群聊/报告】与【来自模型知识】。"
+        "不要只回答「记录不足」。"
     )
     answer, usage = await chat_complete(
         provider,
@@ -2810,7 +2937,8 @@ async def ask_about_report(
         system=ASK_REPORT_SYSTEM,
         user=user_prompt,
         timeout_sec=90,
-        max_tokens=1024,
+        max_tokens=1600,
+        force_json=False,
     )
     text = (answer or "").strip()
     return {

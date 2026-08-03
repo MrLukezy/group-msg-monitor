@@ -1203,31 +1203,37 @@ fn api_report_favorite_messages(report_id: i64) -> Result<Value, String> {
 }
 
 #[tauri::command]
-fn api_ask_report(
+async fn api_ask_report(
     report_id: i64,
     question: String,
     selection: Option<String>,
     point_index: Option<i64>,
 ) -> Result<Value, String> {
-    let rid = report_id.to_string();
-    let sel = selection.unwrap_or_default();
-    let idx_s = point_index.map(|i| i.to_string());
-    let mut args: Vec<&str> = vec![
-        "ask-report",
-        "--report-id",
-        &rid,
-        "--question",
-        &question,
-    ];
-    if !sel.is_empty() {
-        args.push("--selection");
-        args.push(&sel);
-    }
-    if let Some(ref s) = idx_s {
-        args.push("--point-index");
-        args.push(s);
-    }
-    py_api_json(&args)
+    // 追问会调 LLM，可能数十秒；必须放到阻塞线程，避免卡住 UI。
+    let v = tauri::async_runtime::spawn_blocking(move || {
+        let rid = report_id.to_string();
+        let sel = selection.unwrap_or_default();
+        let idx_s = point_index.map(|i| i.to_string());
+        let mut args: Vec<&str> = vec![
+            "ask-report",
+            "--report-id",
+            &rid,
+            "--question",
+            &question,
+        ];
+        if !sel.is_empty() {
+            args.push("--selection");
+            args.push(&sel);
+        }
+        if let Some(ref s) = idx_s {
+            args.push("--point-index");
+            args.push(s);
+        }
+        py_api_json(&args)
+    })
+    .await
+    .map_err(|e| format!("追问后台任务异常: {e}"))??;
+    Ok(v)
 }
 
 #[tauri::command]

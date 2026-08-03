@@ -163,10 +163,20 @@ type GroupConfig = {
   };
 };
 
+type ReportKnowledgeItem = {
+  topic?: string;
+  content?: string;
+  source?: string;
+};
+
 type ReportKeyPoint = {
   title?: string;
   summary?: string;
-  deep_dive?: { detail?: string; evidence?: string };
+  deep_dive?: {
+    detail?: string;
+    evidence?: string;
+    knowledge?: Array<ReportKnowledgeItem | string>;
+  };
   nouns?: Array<{ term?: string; meaning?: string } | string>;
   links?: Array<{ url?: string; summary?: string } | string>;
   notes?: string[];
@@ -260,8 +270,12 @@ const ANALYSIS_FAV_KEY = "analysisFavorites.v1";
 let monitoredDetailReportId: number | null = null;
 let reportSubview: ReportSubview = "overview";
 let reportSubviewPointIndex: number | null = null;
+/** 从要点详情返回总览时，滚动回到该要点卡片 */
+let reportOverviewFocusPointIndex: number | null = null;
 let reportDetailMessagesCache: MessageRow[] = [];
 let reportAskContext: { selection?: string; pointIndex?: number | null } = {};
+/** 追问请求世代号：关闭弹窗或新发送时递增，丢弃过期结果 */
+let reportAskSeq = 0;
 
 
 const PROVIDER_PRESETS: Record<
@@ -336,7 +350,12 @@ const liveActivityWatermarks = new Map<string, number>();
 const liveUnreadGroups = new Set<string>();
 let monitoredSelectedGroupId: string | null = null;
 let monitoredReportsCache: ReportRow[] = [];
+let favoritesReportsCache: ReportRow[] = [];
+/** 分析详情从哪一页打开，用于返回 */
+let reportDetailSource: "monitored" | "favorites" = "monitored";
 let monitoredReportTab: "success" | "errors" = "success";
+/** 上一次渲染主题列表对应的群，用于判断是否保留滚动位置 */
+let lastRenderedMonitoredGroupId: string | null = null;
 let selectedTheme = DEFAULT_THEME_ID;
 let customThemePrefs: CustomThemePrefs = { ...DEFAULT_CUSTOM_THEME };
 let themeCategoryTab: ThemeCategory = "image";
@@ -347,6 +366,10 @@ let panelOpacityPref = 0.82;
 let unreadCount = 0;
 let unreadByGroup = new Map<string, number>();
 let unreadReportIds = new Set<number>();
+/** 已见过的 LLM 报告 id，用于发现新分析并即时刷新列表 */
+let knownReportIds = new Set<number>();
+let knownReportIdsSeeded = false;
+let lastDetectedNewReports: ReportRow[] = [];
 
 function motionOk() {
   return !reduceMotion;
@@ -854,10 +877,26 @@ async function refreshUnreadBadge() {
     groupId: null,
     limit: 200,
   }).catch(() => [] as ReportRow[]);
+  const rows = reports || [];
+  const newReports: ReportRow[] = [];
+  if (knownReportIdsSeeded) {
+    for (const r of rows) {
+      if (r.id && !knownReportIds.has(r.id)) newReports.push(r);
+    }
+  }
+  for (const r of rows) {
+    if (r.id) knownReportIds.add(r.id);
+  }
+  if (knownReportIds.size > 2500) {
+    knownReportIds = new Set(rows.map((r) => r.id).filter((id): id is number => !!id));
+  }
+  knownReportIdsSeeded = true;
+  lastDetectedNewReports = newReports;
+
   const enabledIds = new Set(
     groupsCache.filter((g) => g.enabled).map((g) => g.groupId),
   );
-  const unread = (reports || []).filter(
+  const unread = rows.filter(
     (r) =>
       r.id &&
       !read.has(r.id) &&
@@ -957,22 +996,120 @@ function updateMonitoredGroupUnreadBadges() {
     });
 }
 
+async function softRefreshMonitoredReportsCache(groupId: string) {
+  if (!groupId || groupId === FAVORITES_GROUP_ID) return;
+  const reports = await invoke<ReportRow[]>("api_list_reports", {
+    groupId,
+    limit: 80,
+  }).catch(() => [] as ReportRow[]);
+  monitoredReportsCache = reports || [];
+}
+
+async function refreshDetailReports(groupId: string) {
+  if (!groupId) return;
+  const reports = await invoke<ReportRow[]>("api_list_reports", {
+    groupId,
+    limit: 30,
+  }).catch(() => [] as ReportRow[]);
+  const box = $("detail-reports");
+  if (!box) return;
+  const rows = reports || [];
+  const shown = visibleReports(rows).filter((r) => !isFailedReport(r));
+  if (!rows.length) {
+    box.innerHTML = `<div class="empty">暂无 LLM 报告，可点「立即执行」</div>`;
+    return;
+  }
+  if (!shown.length) {
+    const hasErrors = rows.some(isFailedReport);
+    box.innerHTML = `<div class="empty">${
+      hasErrors
+        ? "暂无成功的 LLM 分析结果；错误记录请到「监听中 → 错误记录」查看"
+        : "当前仅有定时跳过记录；可在「监听中」关闭「忽略定时跳过」查看"
+    }</div>`;
+    return;
+  }
+  box.innerHTML = shown
+    .map((r) => {
+      const risk = (r.riskMax || "none").toLowerCase();
+      const skipped = isSkippedReport(r);
+      const unread = !skipped && isReportUnread(r.id);
+      return `<button class="report-title-item ${risk === "high" ? "high" : ""} ${
+        skipped ? "skipped" : ""
+      } ${unread ? "is-unread" : ""}" type="button" data-id="${r.id}">
+          ${reportUnreadDotHtml(unread ? r.id : 0)}
+          <div class="report-title-text">${escapeHtml(r.headline || "(无标题)")}</div>
+          <div class="report-title-meta">${escapeHtml(r.createdAt || "")} · 风险 ${escapeHtml(
+            r.riskMax || "-",
+          )} · ${r.msgCount ?? "-"} 条${escapeHtml(reportTokenMeta(r))}</div>
+        </button>`;
+    })
+    .join("");
+  box.querySelectorAll<HTMLButtonElement>(".report-title-item").forEach((btn) => {
+    btn.onclick = () => {
+      const id = Number(btn.dataset.id || 0);
+      const report = rows.find((x) => x.id === id);
+      if (!report) return;
+      monitoredSelectedGroupId = groupId;
+      monitoredReportsCache = rows;
+      switchTab("monitored");
+      refreshMonitored()
+        .then(() => openMonitoredReportDetail(id))
+        .catch((e) => toast(String(e), true));
+    };
+  });
+}
+
+async function refreshUiForNewLlmReports(newReports: ReportRow[]) {
+  if (!newReports.length || document.hidden) return;
+  const groupIds = new Set(
+    newReports.map((r) => r.groupId).filter((id): id is string => !!id),
+  );
+  const onMonitored = $("view-monitored").classList.contains("active");
+  const detailOpen = !$("monitored-report-detail").classList.contains("hidden");
+  const selected = monitoredSelectedGroupId;
+
+  if (onMonitored && selected) {
+    const affectsSelected =
+      selected !== FAVORITES_GROUP_ID && groupIds.has(selected);
+    if (affectsSelected) {
+      if (detailOpen) {
+        await softRefreshMonitoredReportsCache(selected);
+      } else {
+        await selectMonitoredGroup(selected);
+      }
+    }
+  }
+
+  const onGroups = $("view-groups").classList.contains("active");
+  const groupsMasterHidden = $("groups-master").classList.contains("hidden");
+  if (
+    onGroups &&
+    groupsMasterHidden &&
+    currentGroupId &&
+    groupIds.has(currentGroupId)
+  ) {
+    await refreshDetailReports(currentGroupId);
+  }
+}
+
 async function pollLlmTipsAndUnread() {
   await refreshUnreadBadge();
+  if (lastDetectedNewReports.length) {
+    await refreshUiForNewLlmReports(lastDetectedNewReports);
+  }
 }
 
 async function refreshVisibleMonitoredReports() {
-  if (
-    document.hidden ||
-    !$("view-monitored").classList.contains("active") ||
-    !$("monitored-report-detail").classList.contains("hidden")
-  ) {
+  if (document.hidden || !$("view-monitored").classList.contains("active")) {
     return;
   }
   await refreshUnreadBadge();
-  if (monitoredSelectedGroupId) {
-    await selectMonitoredGroup(monitoredSelectedGroupId);
+  if (!monitoredSelectedGroupId) return;
+  if (!$("monitored-report-detail").classList.contains("hidden")) {
+    await softRefreshMonitoredReportsCache(monitoredSelectedGroupId);
+    return;
   }
+  await selectMonitoredGroup(monitoredSelectedGroupId);
 }
 
 function setPill(key: string, on: boolean, label: string) {
@@ -1298,6 +1435,10 @@ function animateViewEnter(view: HTMLElement) {
 }
 
 function switchTab(name: string) {
+  closeReportDetailOverlay();
+  monitoredDetailReportId = null;
+  reportSubview = "overview";
+  reportSubviewPointIndex = null;
   document.querySelectorAll(".nav-item").forEach((t) => {
     t.classList.toggle("active", (t as HTMLElement).dataset.tab === name);
   });
@@ -1310,9 +1451,6 @@ function switchTab(name: string) {
     $("groups-master").classList.remove("hidden");
     $("group-detail").classList.add("hidden");
     currentGroupId = null;
-  }
-  if (name === "monitored") {
-    showMonitoredMaster();
   }
 }
 
@@ -1947,8 +2085,16 @@ async function refreshGroups() {
 }
 
 function showMonitoredMaster() {
-  $("monitored-master").classList.remove("hidden");
-  $("monitored-report-detail").classList.add("hidden");
+  closeReportDetailOverlay();
+}
+
+function closeReportDetailOverlay() {
+  const detail = document.getElementById("monitored-report-detail");
+  if (detail) detail.classList.add("hidden");
+  const master = document.getElementById("monitored-master");
+  if (master) master.classList.remove("hidden");
+  const favMaster = document.getElementById("favorites-master");
+  if (favMaster) favMaster.classList.remove("hidden");
 }
 
 function formatReportWindow(r: ReportRow): string {
@@ -2201,8 +2347,15 @@ function messageMatchesEvidence(content: string, tokens: string[]): boolean {
 
 function renderNounList(
   nouns: Array<{ term?: string; meaning?: string } | string> | undefined,
+  opts?: { title?: string; always?: boolean },
 ): string {
-  if (!nouns?.length) return "";
+  const title = opts?.title || "名词剖析";
+  if (!nouns?.length) {
+    if (!opts?.always) return "";
+    return `<div class="report-block"><h4 class="report-block-title">${escapeHtml(
+      title,
+    )}</h4><p class="report-empty-hint">暂无名词剖析</p></div>`;
+  }
   const items = nouns
     .map((n) => {
       if (typeof n === "string") return `<li>${escapeHtml(n)}</li>`;
@@ -2211,7 +2364,59 @@ function renderNounList(
       return `<li><strong>${term}</strong>：${meaning}</li>`;
     })
     .join("");
-  return `<div class="report-block"><h4 class="report-block-title">名词解析</h4><ul class="report-block-list">${items}</ul></div>`;
+  return `<div class="report-block"><h4 class="report-block-title">${escapeHtml(
+    title,
+  )}</h4><ul class="report-block-list">${items}</ul></div>`;
+}
+
+function renderKnowledgeList(
+  knowledge: Array<ReportKnowledgeItem | string> | undefined,
+): string {
+  if (!knowledge?.length) {
+    return `<p class="report-empty-hint">暂无独立背景知识（旧报告可重新分析以生成）</p>`;
+  }
+  const items = knowledge
+    .map((k) => {
+      if (typeof k === "string") return `<li>${escapeHtml(k)}</li>`;
+      const topic = escapeHtml(k.topic || "");
+      const content = escapeHtml(k.content || "").replace(/\n/g, "<br>");
+      const source = escapeHtml(k.source || "");
+      const head = topic ? `<strong>${topic}</strong>：` : "";
+      const src = source ? `<span class="report-knowledge-source">${source}</span>` : "";
+      return `<li>${head}${content}${src ? ` ${src}` : ""}</li>`;
+    })
+    .join("");
+  return `<ul class="report-block-list report-knowledge-list">${items}</ul>`;
+}
+
+function renderDeepDiveBlock(dive: {
+  detail?: string;
+  evidence?: string;
+  knowledge?: Array<ReportKnowledgeItem | string>;
+}): string {
+  const detail = (dive.detail || "").trim();
+  const evidence = (dive.evidence || "").trim();
+  return `<div class="report-block report-deep-dive">
+      <h4 class="report-block-title">深入分析</h4>
+      <div class="report-dive-section">
+        <h5 class="report-block-subtitle">群内观点</h5>
+        <div class="report-prose">${
+          detail
+            ? escapeHtml(detail).replace(/\n/g, "<br>")
+            : `<span class="report-empty-hint">（暂无群内观点分析）</span>`
+        }</div>
+        ${
+          evidence
+            ? `<blockquote class="report-evidence">依据：${escapeHtml(evidence)}</blockquote>`
+            : ""
+        }
+      </div>
+      <div class="report-dive-section">
+        <h5 class="report-block-subtitle">背景知识</h5>
+        <p class="report-block-hint">基于模型知识的补充说明（非群聊原话）</p>
+        ${renderKnowledgeList(dive.knowledge)}
+      </div>
+    </div>`;
 }
 
 function renderLinkList(
@@ -2354,16 +2559,8 @@ function renderPointDetail(report: ReportRow, index: number): string {
       }">${fav ? "★" : "☆"}</button>
     </div>
     ${p.summary ? `<p class="key-point-summary large">${escapeHtml(p.summary)}</p>` : ""}
-    <div class="report-block">
-      <h4 class="report-block-title">深入分析</h4>
-      <div class="report-prose">${escapeHtml(dive.detail || "（暂无深入分析）").replace(/\n/g, "<br>")}</div>
-      ${
-        dive.evidence
-          ? `<blockquote class="report-evidence">依据：${escapeHtml(dive.evidence)}</blockquote>`
-          : ""
-      }
-    </div>
-    ${renderNounList(p.nouns)}
+    ${renderDeepDiveBlock(dive)}
+    ${renderNounList(p.nouns, { title: "名词剖析", always: true })}
     ${renderLinkList(p.links)}
     ${renderNotesList(p.notes)}
   </div>`;
@@ -2375,6 +2572,17 @@ function renderPointsSummary(report: ReportRow): string {
   const blocks = points
     .map((p, i) => {
       const dive = p.deep_dive || {};
+      const knowledgePreview = Array.isArray(dive.knowledge)
+        ? dive.knowledge
+            .slice(0, 2)
+            .map((k) => {
+              if (typeof k === "string") return escapeHtml(k);
+              const topic = k.topic ? `<strong>${escapeHtml(k.topic)}</strong>：` : "";
+              return `${topic}${escapeHtml(k.content || "")}`;
+            })
+            .filter(Boolean)
+            .join("<br>")
+        : "";
       return `<article class="summary-point-card">
         <h4 class="key-point-title"><span class="key-point-index">${i + 1}</span> ${escapeHtml(
           p.title || `要点 ${i + 1}`,
@@ -2382,10 +2590,18 @@ function renderPointsSummary(report: ReportRow): string {
         ${p.summary ? `<p class="key-point-summary">${escapeHtml(p.summary)}</p>` : ""}
         ${
           dive.detail
-            ? `<div class="report-prose muted">${escapeHtml(dive.detail).replace(/\n/g, "<br>")}</div>`
+            ? `<div class="report-prose muted"><span class="report-mini-label">群内观点</span>${escapeHtml(
+                dive.detail,
+              ).replace(/\n/g, "<br>")}</div>`
+            : ""
+        }
+        ${
+          knowledgePreview
+            ? `<div class="report-prose muted"><span class="report-mini-label">背景知识</span>${knowledgePreview}</div>`
             : ""
         }
         ${dive.evidence ? `<blockquote class="report-evidence">${escapeHtml(dive.evidence)}</blockquote>` : ""}
+        ${renderNounList(p.nouns, { title: "名词剖析" })}
         <button type="button" class="key-point-link" data-open-point="${i}">查看该要点详情 →</button>
       </article>`;
     })
@@ -2404,7 +2620,8 @@ function setReportDetailBody(md: string, extraUserNames: string[] = []) {
 function updateReportBackButton() {
   const btn = $("btn-back-monitored-report");
   if (reportSubview === "overview") {
-    btn.textContent = "← 返回主题列表";
+    btn.textContent =
+      reportDetailSource === "favorites" ? "← 返回收藏夹" : "← 返回主题列表";
   } else {
     btn.textContent = "← 返回分析总览";
   }
@@ -2484,6 +2701,9 @@ function renderReportAnalysisView(report: ReportRow, senderNames: string[] = [])
 }
 
 function navigateReportSubview(view: ReportSubview, pointIndex: number | null = null) {
+  if (view === "point" && pointIndex != null && Number.isFinite(pointIndex)) {
+    reportOverviewFocusPointIndex = pointIndex;
+  }
   reportSubview = view;
   reportSubviewPointIndex = pointIndex;
   if (monitoredDetailReportId == null) return;
@@ -2496,7 +2716,28 @@ function navigateReportSubview(view: ReportSubview, pointIndex: number | null = 
   ];
   renderReportAnalysisView(report, senderNames);
   const panel = document.getElementById("monitored-report-analysis-panel");
-  if (panel) panel.scrollTop = 0;
+  if (!panel) return;
+
+  if (view === "overview" && reportOverviewFocusPointIndex != null) {
+    const focusIdx = reportOverviewFocusPointIndex;
+    requestAnimationFrame(() => {
+      const card = panel.querySelector<HTMLElement>(
+        `.key-point-card[data-point-index="${focusIdx}"]`,
+      );
+      if (card) {
+        card.classList.add("is-focus-return");
+        card.scrollIntoView({
+          block: "center",
+          behavior: motionOk() ? "smooth" : "auto",
+        });
+        window.setTimeout(() => card.classList.remove("is-focus-return"), 1600);
+      } else {
+        panel.scrollTop = 0;
+      }
+    });
+  } else {
+    panel.scrollTop = 0;
+  }
   animateViewEnter($("monitored-report-analysis-panel"));
 }
 
@@ -2668,6 +2909,8 @@ function setupReportContextMenu() {
 }
 
 function closeReportAskPopup() {
+  // 作废进行中的追问结果，避免关闭后仍写回 UI
+  reportAskSeq += 1;
   const overlay = document.getElementById("report-ask-overlay");
   if (!overlay) return;
   overlay.classList.add("hidden");
@@ -2676,10 +2919,18 @@ function closeReportAskPopup() {
   const answer = document.getElementById("report-ask-answer");
   if (answer) {
     answer.className = "report-ask-answer empty-hint";
-    answer.textContent = "回答将显示在这里";
+    answer.textContent = "回答将分段标注【来自群聊/报告】与【来自模型知识】";
   }
   const input = document.getElementById("report-ask-input") as HTMLTextAreaElement | null;
-  if (input) input.value = "";
+  if (input) {
+    input.value = "";
+    input.disabled = false;
+  }
+  const sendBtn = document.getElementById("btn-report-ask-send") as HTMLButtonElement | null;
+  if (sendBtn) {
+    sendBtn.disabled = false;
+    sendBtn.textContent = "发送";
+  }
 }
 
 function openReportAskPopup(ctx: { selection?: string; pointIndex?: number | null }) {
@@ -2687,6 +2938,8 @@ function openReportAskPopup(ctx: { selection?: string; pointIndex?: number | nul
     toast("请先打开分析报告", true);
     return;
   }
+  // 打开新弹窗时也作废上一次未完成追问
+  reportAskSeq += 1;
   reportAskContext = {
     selection: (ctx.selection || "").trim(),
     pointIndex: ctx.pointIndex ?? null,
@@ -2708,11 +2961,17 @@ function openReportAskPopup(ctx: { selection?: string; pointIndex?: number | nul
   const answer = document.getElementById("report-ask-answer");
   if (answer) {
     answer.className = "report-ask-answer empty-hint";
-    answer.textContent = "回答将显示在这里";
+    answer.textContent = "回答将分段标注【来自群聊/报告】与【来自模型知识】";
   }
+  const sendBtn = document.getElementById("btn-report-ask-send") as HTMLButtonElement | null;
+  if (sendBtn) {
+    sendBtn.disabled = false;
+    sendBtn.textContent = "发送";
+  }
+  const input = document.getElementById("report-ask-input") as HTMLTextAreaElement | null;
+  if (input) input.disabled = false;
   overlay.classList.remove("hidden");
   overlay.removeAttribute("hidden");
-  const input = document.getElementById("report-ask-input") as HTMLTextAreaElement | null;
   input?.focus();
 }
 
@@ -2726,29 +2985,43 @@ async function sendReportAsk() {
     toast("请输入问题", true);
     return;
   }
+  const reportId = monitoredDetailReportId;
+  const selection = reportAskContext.selection || "";
+  const pointIndex = reportAskContext.pointIndex ?? null;
+  const seq = ++reportAskSeq;
+
   if (answerEl) {
     answerEl.className = "report-ask-answer";
-    answerEl.textContent = "思考中…";
+    answerEl.textContent = "后台思考中…（可点空白处关闭，不卡界面）";
   }
-  if (sendBtn) sendBtn.disabled = true;
+  if (sendBtn) {
+    sendBtn.disabled = true;
+    sendBtn.textContent = "思考中…";
+  }
+  // 输入框保持可编辑，方便继续改问题；发送中由 seq 防串答
   try {
     const res = await invoke<{ ok?: boolean; answer?: string; error?: string }>("api_ask_report", {
-      reportId: monitoredDetailReportId,
+      reportId,
       question,
-      selection: reportAskContext.selection || "",
-      pointIndex: reportAskContext.pointIndex ?? null,
+      selection,
+      pointIndex,
     });
+    if (seq !== reportAskSeq) return; // 已关闭或已发起新追问
     if (answerEl) {
       answerEl.className = "report-ask-answer";
       answerEl.textContent = res.answer || res.error || "（无回答）";
     }
   } catch (e) {
+    if (seq !== reportAskSeq) return;
     if (answerEl) {
       answerEl.className = "report-ask-answer error";
       answerEl.textContent = String(e);
     }
   } finally {
-    if (sendBtn) sendBtn.disabled = false;
+    if (seq === reportAskSeq && sendBtn) {
+      sendBtn.disabled = false;
+      sendBtn.textContent = "发送";
+    }
   }
 }
 
@@ -2758,6 +3031,11 @@ function setupReportAskPopup() {
   overlay.querySelectorAll("[data-ask-close]").forEach((el) => {
     (el as HTMLElement).onclick = () => closeReportAskPopup();
   });
+  // 点遮罩空白处关闭并结束追问
+  const backdrop = overlay.querySelector(".report-ask-backdrop") as HTMLElement | null;
+  if (backdrop) {
+    backdrop.onclick = () => closeReportAskPopup();
+  }
   const sendBtn = document.getElementById("btn-report-ask-send");
   if (sendBtn) {
     sendBtn.onclick = () => {
@@ -2767,12 +3045,22 @@ function setupReportAskPopup() {
   const input = document.getElementById("report-ask-input") as HTMLTextAreaElement | null;
   if (input) {
     input.onkeydown = (ev) => {
-      if (ev.key === "Enter" && (ev.ctrlKey || ev.metaKey)) {
+      if (ev.key === "Escape") {
         ev.preventDefault();
-        sendReportAsk().catch((e) => toast(String(e), true));
+        closeReportAskPopup();
+        return;
       }
+      if (ev.key !== "Enter") return;
+      if (ev.shiftKey) return; // Shift+Enter 换行
+      ev.preventDefault();
+      sendReportAsk().catch((e) => toast(String(e), true));
     };
   }
+  window.addEventListener("keydown", (ev) => {
+    if (ev.key !== "Escape") return;
+    if (overlay.classList.contains("hidden") || overlay.hasAttribute("hidden")) return;
+    closeReportAskPopup();
+  });
 }
 
 function closeReportClipsOverlay() {
@@ -2827,10 +3115,17 @@ function setupReportClipsOverlay() {
   });
 }
 
-function renderMonitoredReportList(reports: ReportRow[]) {
+function renderMonitoredReportList(
+  reports: ReportRow[],
+  opts?: { resetScroll?: boolean },
+) {
   const box = $("monitored-report-list");
+  const sameGroup = lastRenderedMonitoredGroupId === monitoredSelectedGroupId;
+  const preserveScroll = !opts?.resetScroll && sameGroup;
+  const scrollTop = preserveScroll ? box.scrollTop : 0;
   syncMonitoredReportTabs(reports);
   if (!monitoredSelectedGroupId) {
+    lastRenderedMonitoredGroupId = null;
     box.innerHTML = `<div class="empty">请选择左侧群查看分析主题</div>`;
     return;
   }
@@ -2839,15 +3134,15 @@ function renderMonitoredReportList(reports: ReportRow[]) {
     monitoredReportTab === "errors"
       ? reports.filter(isFailedReport)
       : visible.filter((r) => !isFailedReport(r));
+  lastRenderedMonitoredGroupId = monitoredSelectedGroupId;
   if (!reports.length) {
-    const isFav = monitoredSelectedGroupId === FAVORITES_GROUP_ID;
     const g = groupsCache.find((x) => x.groupId === monitoredSelectedGroupId);
     box.innerHTML = `<div class="empty">${
-      isFav
-        ? "暂无收藏。打开某次分析详情后点「收藏」，可永久保留分析与聊天记录。"
-        : g?.llmEnabled
-          ? "暂无 LLM 分析主题，可在群配置中「立即 LLM 分析」"
-          : "该群未开启 LLM 检测"
+      g?.llmEnabled
+        ? "暂无 LLM 分析主题，可在群配置中「立即 LLM 分析」"
+        : monitoredSelectedGroupId
+          ? "该群未开启 LLM 检测"
+          : "请选择左侧群查看分析主题"
     }</div>`;
     return;
   }
@@ -2888,30 +3183,68 @@ function renderMonitoredReportList(reports: ReportRow[]) {
       openMonitoredReportDetail(id).catch((e) => toast(String(e), true));
     };
   });
+  box.scrollTop = scrollTop;
+}
+
+function monitoredReportListFingerprint(reports: ReportRow[]): string {
+  if (!monitoredSelectedGroupId) return "";
+  const visible = visibleReports(reports);
+  const shown =
+    monitoredReportTab === "errors"
+      ? reports.filter(isFailedReport)
+      : visible.filter((r) => !isFailedReport(r));
+  return shown
+    .map(
+      (r) =>
+        `${r.id}:${r.favorited ? 1 : 0}:${isReportUnread(r.id) ? 1 : 0}:${r.githubIssueUrl ? 1 : 0}`,
+    )
+    .join("|");
+}
+
+function monitoredReportListDomFingerprint(): string {
+  const box = document.getElementById("monitored-report-list");
+  if (!box) return "";
+  return [...box.querySelectorAll<HTMLElement>(".report-title-item")]
+    .map((el) => {
+      const id = el.dataset.id || "";
+      const fav = el.classList.contains("is-favorited") ? 1 : 0;
+      const unread = el.classList.contains("is-unread") ? 1 : 0;
+      const issue = (el.querySelector(".report-title-meta")?.textContent || "").includes(
+        "已上报 Issue",
+      )
+        ? 1
+        : 0;
+      return `${id}:${fav}:${unread}:${issue}`;
+    })
+    .join("|");
+}
+
+/** 从详情返回时：仅在缓存与 DOM 不一致时重绘，并保留滚动位置 */
+function syncMonitoredReportListAfterDetail() {
+  if (!monitoredSelectedGroupId) return;
+  if (
+    monitoredReportListDomFingerprint() ===
+    monitoredReportListFingerprint(monitoredReportsCache)
+  ) {
+    updateReportTitleUnreadBadges();
+    syncMonitoredReportTabs(monitoredReportsCache);
+    return;
+  }
+  renderMonitoredReportList(monitoredReportsCache);
 }
 
 async function selectMonitoredGroup(groupId: string) {
+  if (!groupId || groupId === FAVORITES_GROUP_ID) return;
   monitoredSelectedGroupId = groupId;
   const configBtn = document.getElementById(
     "btn-configure-monitored-group",
   ) as HTMLButtonElement | null;
-  if (configBtn) configBtn.hidden = !groupId || groupId === FAVORITES_GROUP_ID;
-  document.querySelectorAll<HTMLButtonElement>("#monitored-group-list .monitored-group-item").forEach((btn) => {
-    btn.classList.toggle("active", btn.dataset.id === groupId);
-  });
-
-  if (groupId === FAVORITES_GROUP_ID) {
-    $("monitored-reports-title").textContent = "收藏夹 · LLM 主题";
-    $("monitored-reports-hint").textContent = "已收藏的分析永久保留，不受清理影响";
-    const reports = await invoke<ReportRow[]>("api_list_reports", {
-      groupId: null,
-      limit: 500,
-      favoritesOnly: true,
-    }).catch(() => [] as ReportRow[]);
-    monitoredReportsCache = reports || [];
-    renderMonitoredReportList(monitoredReportsCache);
-    return;
-  }
+  if (configBtn) configBtn.hidden = false;
+  document
+    .querySelectorAll<HTMLButtonElement>("#monitored-group-list .monitored-group-item")
+    .forEach((btn) => {
+      btn.classList.toggle("active", btn.dataset.id === groupId);
+    });
 
   const g = groupsCache.find((x) => x.groupId === groupId);
   const name = groupDisplayName(groupId, g?.groupName);
@@ -2933,17 +3266,26 @@ async function openMonitoredGroupConfig(groupId: string) {
 }
 
 async function openMonitoredReportDetail(reportId: number) {
-  const report = monitoredReportsCache.find((r) => r.id === reportId);
+  const report =
+    monitoredReportsCache.find((r) => r.id === reportId) ||
+    favoritesReportsCache.find((r) => r.id === reportId);
   if (!report) {
     toast("未找到该分析报告", true);
     return;
   }
+  // 保证详情页能从当前缓存取到报告
+  if (!monitoredReportsCache.some((r) => r.id === reportId)) {
+    monitoredReportsCache = [report, ...monitoredReportsCache];
+  }
+  reportDetailSource = $("view-favorites").classList.contains("active")
+    ? "favorites"
+    : "monitored";
   markReportRead(reportId);
   monitoredDetailReportId = reportId;
   reportSubview = "overview";
   reportSubviewPointIndex = null;
+  reportOverviewFocusPointIndex = null;
   reportDetailMessagesCache = [];
-  $("monitored-master").classList.add("hidden");
   $("monitored-report-detail").classList.remove("hidden");
   animateViewEnter($("monitored-report-detail"));
   $("monitored-report-detail-title").textContent = report.headline || "(无标题)";
@@ -3126,6 +3468,17 @@ async function toggleFavoriteCurrentReport() {
       report.favorited = !!res.favorited;
       report.hasFavoriteMessages = !!res.favorited;
     }
+    // 同步收藏夹缓存
+    if (res.favorited && report) {
+      if (!favoritesReportsCache.some((r) => r.id === report.id)) {
+        favoritesReportsCache = [report, ...favoritesReportsCache];
+      }
+    } else if (report?.id) {
+      favoritesReportsCache = favoritesReportsCache.filter((r) => r.id !== report.id);
+    }
+    if ($("view-favorites").classList.contains("active")) {
+      renderFavoritesReportList(favoritesReportsCache);
+    }
     syncFavoriteButton(!!res.favorited);
     const meta = $("monitored-report-detail-meta");
     if (report && meta) {
@@ -3136,7 +3489,9 @@ async function toggleFavoriteCurrentReport() {
           : `${base} · 已收藏`
         : base.replace(/\s*·\s*已收藏/g, "");
     }
-    renderMonitoredReportList(monitoredReportsCache);
+    if (reportDetailSource === "monitored") {
+      renderMonitoredReportList(monitoredReportsCache);
+    }
     toast(
       res.favorited
         ? `已收藏（快照 ${res.messageCount ?? 0} 条聊天，清理时不删除）`
@@ -3200,58 +3555,41 @@ async function refreshMonitored() {
   `;
 
   const box = $("monitored-group-list");
-  const favCount = await invoke<ReportRow[]>("api_list_reports", {
-    groupId: null,
-    limit: 500,
-    favoritesOnly: true,
-  })
-    .then((rows) => (rows || []).length)
-    .catch(() => 0);
 
   if (!enabled.length) {
-    monitoredSelectedGroupId = FAVORITES_GROUP_ID;
+    monitoredSelectedGroupId = null;
     monitoredReportsCache = [];
-    box.innerHTML = `
-      <button class="monitored-group-item favorites-item active" type="button" data-id="${FAVORITES_GROUP_ID}">
-        <div class="name">★ 收藏夹</div>
-        <div class="meta">${favCount} 条永久保留</div>
-      </button>
-      <div class="empty">暂无启用监听的群。到「群列表」打开群配置并勾选「启用监听此群」。</div>`;
-    box.querySelectorAll<HTMLButtonElement>(".monitored-group-item").forEach((btn) => {
-      btn.onclick = () => {
-        selectMonitoredGroup(btn.dataset.id || "").catch((e) => toast(String(e), true));
-      };
-    });
-    await selectMonitoredGroup(FAVORITES_GROUP_ID);
+    box.innerHTML = `<div class="empty">暂无启用监听的群。到「群列表」打开群配置并勾选「启用监听此群」。</div>`;
+    $("monitored-reports-title").textContent = "LLM 分析主题";
+    $("monitored-reports-hint").textContent = "请先启用监听群";
+    renderMonitoredReportList([]);
+    const configBtn = document.getElementById(
+      "btn-configure-monitored-group",
+    ) as HTMLButtonElement | null;
+    if (configBtn) configBtn.hidden = true;
     return;
   }
 
   if (
     !monitoredSelectedGroupId ||
-    (monitoredSelectedGroupId !== FAVORITES_GROUP_ID &&
-      !enabled.some((g) => g.groupId === monitoredSelectedGroupId))
+    monitoredSelectedGroupId === FAVORITES_GROUP_ID ||
+    !enabled.some((g) => g.groupId === monitoredSelectedGroupId)
   ) {
     monitoredSelectedGroupId = enabled[0].groupId;
   }
 
-  const favActive = monitoredSelectedGroupId === FAVORITES_GROUP_ID ? "active" : "";
-  box.innerHTML =
-    `<button class="monitored-group-item favorites-item ${favActive}" type="button" data-id="${FAVORITES_GROUP_ID}">
-        <div class="name">★ 收藏夹</div>
-        <div class="meta">${favCount} 条永久保留</div>
-      </button>` +
-    enabled
-      .map((g) => {
-        const last = g.lastTime
-          ? new Date(g.lastTime * 1000).toLocaleString()
-          : "暂无消息";
-        const name = groupDisplayName(g.groupId, g.groupName);
-        const active = g.groupId === monitoredSelectedGroupId ? "active" : "";
-        const unread = groupUnreadCount(g.groupId);
-        const unreadCls = unread > 0 ? "has-unread" : "";
-        return `<button class="monitored-group-item ${active} ${unreadCls}" type="button" data-id="${escapeHtml(
-          g.groupId,
-        )}">
+  box.innerHTML = enabled
+    .map((g) => {
+      const last = g.lastTime
+        ? new Date(g.lastTime * 1000).toLocaleString()
+        : "暂无消息";
+      const name = groupDisplayName(g.groupId, g.groupName);
+      const active = g.groupId === monitoredSelectedGroupId ? "active" : "";
+      const unread = groupUnreadCount(g.groupId);
+      const unreadCls = unread > 0 ? "has-unread" : "";
+      return `<button class="monitored-group-item ${active} ${unreadCls}" type="button" data-id="${escapeHtml(
+        g.groupId,
+      )}">
           ${unreadBadgeHtml(unread)}
           <div class="name">${escapeHtml(name)}</div>
           <div class="meta">群号 ${escapeHtml(g.groupId)}</div>
@@ -3261,8 +3599,8 @@ async function refreshMonitored() {
             <span class="badge ${g.keywordEnabled ? "on" : ""}">关键词</span>
           </div>
         </button>`;
-      })
-      .join("");
+    })
+    .join("");
 
   box.querySelectorAll<HTMLButtonElement>(".monitored-group-item").forEach((btn) => {
     btn.onclick = () => {
@@ -3274,6 +3612,53 @@ async function refreshMonitored() {
   if (monitoredSelectedGroupId) {
     await selectMonitoredGroup(monitoredSelectedGroupId);
   }
+}
+
+function renderFavoritesReportList(reports: ReportRow[]) {
+  const box = document.getElementById("favorites-report-list");
+  const hint = document.getElementById("favorites-list-hint");
+  if (!box) return;
+  if (hint) hint.textContent = `共 ${reports.length} 条`;
+  if (!reports.length) {
+    box.innerHTML = `<div class="empty">暂无收藏。打开某次分析详情后点「收藏」，可永久保留分析与聊天记录。</div>`;
+    return;
+  }
+  box.innerHTML = reports
+    .map((r) => {
+      const risk = (r.riskMax || "none").toLowerCase();
+      const unread = !isSkippedReport(r) && isReportUnread(r.id);
+      const gname = groupDisplayName(r.groupId);
+      return `<button class="report-title-item ${risk === "high" ? "high" : ""} ${
+        unread ? "is-unread" : ""
+      } is-favorited" type="button" data-id="${r.id}">
+        ${reportUnreadDotHtml(unread ? r.id : 0)}
+        <div class="report-title-text">★ ${escapeHtml(r.headline || "(无标题)")}</div>
+        <div class="report-title-meta">${escapeHtml(r.createdAt || "")} · ${escapeHtml(
+          gname,
+        )} · 风险 ${escapeHtml(r.riskMax || "-")} · ${r.msgCount ?? "-"} 条${escapeHtml(
+          reportTokenMeta(r),
+        )}</div>
+      </button>`;
+    })
+    .join("");
+  box.querySelectorAll<HTMLButtonElement>(".report-title-item").forEach((btn) => {
+    btn.onclick = () => {
+      const id = Number(btn.dataset.id || 0);
+      favoritesReportsCache = reports;
+      monitoredReportsCache = reports;
+      openMonitoredReportDetail(id).catch((e) => toast(String(e), true));
+    };
+  });
+}
+
+async function refreshFavorites() {
+  const reports = await invoke<ReportRow[]>("api_list_reports", {
+    groupId: null,
+    limit: 500,
+    favoritesOnly: true,
+  }).catch(() => [] as ReportRow[]);
+  favoritesReportsCache = reports || [];
+  renderFavoritesReportList(favoritesReportsCache);
 }
 
 function genProviderId() {
@@ -3945,49 +4330,7 @@ async function openGroup(groupId: string) {
   const detailBox = $("detail-messages");
   detailBox.dataset.fp = "";
   renderMessages("detail-messages", msgs, { hideGroup: true });
-  const reports = await invoke<ReportRow[]>("api_list_reports", { groupId, limit: 30 });
-  const box = $("detail-reports");
-  const shown = visibleReports(reports || []).filter((r) => !isFailedReport(r));
-  if (!reports.length) {
-    box.innerHTML = `<div class="empty">暂无 LLM 报告，可点「立即执行」</div>`;
-  } else if (!shown.length) {
-    const hasErrors = reports.some(isFailedReport);
-    box.innerHTML = `<div class="empty">${
-      hasErrors
-        ? "暂无成功的 LLM 分析结果；错误记录请到「监听中 → 错误记录」查看"
-        : "当前仅有定时跳过记录；可在「监听中」关闭「忽略定时跳过」查看"
-    }</div>`;
-  } else {
-    box.innerHTML = shown
-      .map((r) => {
-        const risk = (r.riskMax || "none").toLowerCase();
-        const skipped = isSkippedReport(r);
-        const unread = !skipped && isReportUnread(r.id);
-        return `<button class="report-title-item ${risk === "high" ? "high" : ""} ${
-          skipped ? "skipped" : ""
-        } ${unread ? "is-unread" : ""}" type="button" data-id="${r.id}">
-          ${reportUnreadDotHtml(unread ? r.id : 0)}
-          <div class="report-title-text">${escapeHtml(r.headline || "(无标题)")}</div>
-          <div class="report-title-meta">${escapeHtml(r.createdAt || "")} · 风险 ${escapeHtml(
-            r.riskMax || "-",
-          )} · ${r.msgCount ?? "-"} 条${escapeHtml(reportTokenMeta(r))}</div>
-        </button>`;
-      })
-      .join("");
-    box.querySelectorAll<HTMLButtonElement>(".report-title-item").forEach((btn) => {
-      btn.onclick = () => {
-        const id = Number(btn.dataset.id || 0);
-        const report = reports.find((x) => x.id === id);
-        if (!report) return;
-        monitoredSelectedGroupId = groupId;
-        monitoredReportsCache = reports;
-        switchTab("monitored");
-        refreshMonitored()
-          .then(() => openMonitoredReportDetail(id))
-          .catch((e) => toast(String(e), true));
-      };
-    });
-  }
+  await refreshDetailReports(groupId);
 }
 
 function readGroupForm(): GroupConfig {
@@ -4072,8 +4415,8 @@ function startIndependentRefreshLoops() {
   }, 15_000);
   repeat(async () => {
     if (!document.hidden) await pollLlmTipsAndUnread();
-  }, 15_000);
-  repeat(refreshVisibleMonitoredReports, 10_000);
+  }, 5_000);
+  repeat(refreshVisibleMonitoredReports, 8_000);
   repeat(async () => {
     if (document.hidden) return;
     if ($("view-live").classList.contains("active")) {
@@ -4221,11 +4564,11 @@ window.addEventListener("DOMContentLoaded", async () => {
   };
   $("monitored-tab-success").onclick = () => {
     monitoredReportTab = "success";
-    renderMonitoredReportList(monitoredReportsCache);
+    renderMonitoredReportList(monitoredReportsCache, { resetScroll: true });
   };
   $("monitored-tab-errors").onclick = () => {
     monitoredReportTab = "errors";
-    renderMonitoredReportList(monitoredReportsCache);
+    renderMonitoredReportList(monitoredReportsCache, { resetScroll: true });
   };
 
   document.getElementById("btn-lightbox-close")?.addEventListener("click", () => {
@@ -4255,6 +4598,9 @@ window.addEventListener("DOMContentLoaded", async () => {
         refreshMonitored()
           .then(() => refreshUnreadBadge())
           .catch((e) => toast(String(e), true));
+      }
+      if (name === "favorites") {
+        refreshFavorites().catch((e) => toast(String(e), true));
       }
       if (name === "settings") loadSettingsView().catch((e) => toast(String(e), true));
     };
@@ -4364,6 +4710,11 @@ window.addEventListener("DOMContentLoaded", async () => {
     refreshGroups().catch((e) => toast(String(e), true));
   $("btn-refresh-monitored").onclick = () =>
     refreshMonitored().catch((e) => toast(String(e), true));
+  const btnRefreshFavorites = document.getElementById("btn-refresh-favorites");
+  if (btnRefreshFavorites) {
+    btnRefreshFavorites.onclick = () =>
+      refreshFavorites().catch((e) => toast(String(e), true));
+  }
   $("btn-clear-unread").onclick = (ev) => {
     ev.stopPropagation();
     clearAllUnread().catch((e) => toast(String(e), true));
@@ -4378,14 +4729,20 @@ window.addEventListener("DOMContentLoaded", async () => {
       navigateReportSubview("overview", null);
       return;
     }
-    showMonitoredMaster();
+    const fromFavorites = reportDetailSource === "favorites";
+    closeReportDetailOverlay();
     monitoredDetailReportId = null;
     reportSubview = "overview";
     reportSubviewPointIndex = null;
     reportDetailMessagesCache = [];
-    animateViewEnter($("monitored-master"));
-    if (monitoredSelectedGroupId) {
-      selectMonitoredGroup(monitoredSelectedGroupId).catch(() => undefined);
+    if (fromFavorites) {
+      const favMaster = document.getElementById("favorites-master");
+      if (favMaster) animateViewEnter(favMaster);
+      refreshFavorites().catch(() => undefined);
+    } else {
+      animateViewEnter($("monitored-master"));
+      // 不重新拉接口/整表刷新，避免滚动跳回顶部；仅在详情期间缓存有变时带滚动恢复同步
+      syncMonitoredReportListAfterDetail();
     }
   };
   const favBtn = document.getElementById("btn-favorite-report");
@@ -5035,7 +5392,19 @@ window.addEventListener("DOMContentLoaded", async () => {
         await openGroup(groupId);
       }
       await refreshUnreadBadge().catch(() => undefined);
-      await refreshVisibleMonitoredReports().catch(() => undefined);
+      if (lastDetectedNewReports.length) {
+        await refreshUiForNewLlmReports(lastDetectedNewReports).catch(() => undefined);
+      }
+      // 手动触发完成后，无论当前在哪个页，都尽量把「监听中」当前群主题列表刷新
+      if (
+        monitoredSelectedGroupId === groupId &&
+        $("view-monitored").classList.contains("active") &&
+        $("monitored-report-detail").classList.contains("hidden")
+      ) {
+        await selectMonitoredGroup(groupId).catch(() => undefined);
+      } else if (monitoredSelectedGroupId === groupId) {
+        await softRefreshMonitoredReportsCache(groupId).catch(() => undefined);
+      }
     } catch (e) {
       toast(String(e), true);
     } finally {
@@ -5164,6 +5533,7 @@ window.addEventListener("DOMContentLoaded", async () => {
   await refreshStatus().catch(() => undefined);
   await refreshLive(false, true).catch(() => undefined);
   await refreshUnreadBadge().catch(() => undefined);
+  refreshFavorites().catch(() => undefined);
   startIndependentRefreshLoops();
   document.addEventListener("visibilitychange", () => {
     if (document.hidden) return;

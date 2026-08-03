@@ -45,9 +45,13 @@
             <span class="nav-label">实时监听</span>
           </button>
           <button class="nav-item" data-tab="monitored" type="button">
-            <span class="nav-icon" aria-hidden="true">★</span>
+            <span class="nav-icon" aria-hidden="true">◈</span>
             <span class="nav-label">监听中</span>
             <span id="monitored-unread-badge" class="nav-badge" hidden>0</span>
+          </button>
+          <button class="nav-item" data-tab="favorites" type="button">
+            <span class="nav-icon" aria-hidden="true">★</span>
+            <span class="nav-label">收藏夹</span>
           </button>
           <button class="nav-item" data-tab="groups" type="button">
             <span class="nav-icon" aria-hidden="true">☰</span>
@@ -133,7 +137,7 @@
           </div>
         </section>
 
-        <!-- 监听中的群：左群列表 / 右 LLM 主题 / 详情 -->
+        <!-- 监听中的群：左群列表 / 右 LLM 主题 -->
         <section id="view-monitored" class="view">
           <div id="monitored-master" class="stack fill">
             <header class="page-head">
@@ -193,33 +197,58 @@
               </div>
             </div>
           </div>
+        </section>
 
-          <div id="monitored-report-detail" class="stack fill detail hidden">
+        <!-- 收藏夹：永久保留的分析 -->
+        <section id="view-favorites" class="view">
+          <div id="favorites-master" class="stack fill">
             <header class="page-head">
               <div>
-                <button id="btn-back-monitored-report" class="btn ghost back" type="button">← 返回主题列表</button>
-                <h2 id="monitored-report-detail-title">LLM 分析详情</h2>
-                <p id="monitored-report-detail-meta"></p>
+                <h2>收藏夹</h2>
+                <p>已收藏的 LLM 分析永久保留，不受自动清理影响</p>
               </div>
-              <div class="page-head-actions">
-                <button id="btn-report-clips" class="btn ghost hidden" type="button" title="查看本报告本地收藏的要点与片段">本地收藏</button>
-                <button id="btn-report-issue" class="btn danger hidden" type="button">上报 Issue</button>
-                <button id="btn-favorite-report" class="btn ghost favorite-btn" type="button" title="收藏后永久保留分析与聊天记录">☆ 收藏</button>
+              <div class="row actions">
+                <button id="btn-refresh-favorites" class="btn primary" type="button">刷新</button>
               </div>
             </header>
-            <div class="report-detail-split fill">
-              <div class="panel fill scroll report-detail-panel" id="monitored-report-analysis-panel">
-                <h3 class="pane-title" id="monitored-report-analysis-title">分析结果</h3>
-                <div id="monitored-report-detail-body" class="report-detail-body report-structured ui-selectable"></div>
+            <div class="panel fill favorites-list-pane">
+              <div class="monitored-reports-head">
+                <div class="monitored-reports-head-main">
+                  <h3 class="pane-title">收藏的分析</h3>
+                  <p class="field-hint" id="favorites-list-hint">共 0 条</p>
+                </div>
               </div>
-              <div class="panel fill scroll report-detail-msgs-panel">
-                <h3 class="pane-title" id="monitored-report-msgs-title">相关对话</h3>
-                <p class="field-hint" id="monitored-report-msgs-hint">分析窗口内的原始消息</p>
-                <div id="monitored-report-detail-msgs" class="messages report-detail-msgs"></div>
-              </div>
+              <div id="favorites-report-list" class="report-title-list"></div>
             </div>
           </div>
         </section>
+
+        <!-- 分析详情（监听中 / 收藏夹共用） -->
+        <div id="monitored-report-detail" class="stack fill detail report-detail-overlay hidden">
+          <header class="page-head">
+            <div>
+              <button id="btn-back-monitored-report" class="btn ghost back" type="button">← 返回主题列表</button>
+              <h2 id="monitored-report-detail-title">LLM 分析详情</h2>
+              <p id="monitored-report-detail-meta"></p>
+            </div>
+            <div class="page-head-actions">
+              <button id="btn-report-clips" class="btn ghost hidden" type="button" title="查看本报告本地收藏的要点与片段">本地收藏</button>
+              <button id="btn-report-issue" class="btn danger hidden" type="button">上报 Issue</button>
+              <button id="btn-favorite-report" class="btn ghost favorite-btn" type="button" title="收藏后永久保留分析与聊天记录">☆ 收藏</button>
+            </div>
+          </header>
+          <div class="report-detail-split fill">
+            <div class="panel fill scroll report-detail-panel" id="monitored-report-analysis-panel">
+              <h3 class="pane-title" id="monitored-report-analysis-title">分析结果</h3>
+              <div id="monitored-report-detail-body" class="report-detail-body report-structured ui-selectable"></div>
+            </div>
+            <div class="panel fill scroll report-detail-msgs-panel">
+              <h3 class="pane-title" id="monitored-report-msgs-title">相关对话</h3>
+              <p class="field-hint" id="monitored-report-msgs-hint">分析窗口内的原始消息</p>
+              <div id="monitored-report-detail-msgs" class="messages report-detail-msgs"></div>
+            </div>
+          </div>
+        </div>
 
         <!-- 群列表 / 群详情 -->
         <section id="view-groups" class="view">
@@ -762,11 +791,11 @@
           <button type="button" class="btn ghost sm" data-ask-close="1">关闭</button>
         </div>
         <p id="report-ask-context" class="field-hint report-ask-context"></p>
-        <textarea id="report-ask-input" class="report-ask-input" rows="3" placeholder="输入你的问题…"></textarea>
+        <textarea id="report-ask-input" class="report-ask-input" rows="3" placeholder="可问概念、背景或群里怎么说… Enter 发送，Shift+Enter 换行"></textarea>
         <div class="report-ask-actions">
           <button id="btn-report-ask-send" class="btn" type="button">发送</button>
         </div>
-        <div id="report-ask-answer" class="report-ask-answer empty-hint">回答将显示在这里</div>
+        <div id="report-ask-answer" class="report-ask-answer empty-hint">回答将分段标注【来自群聊/报告】与【来自模型知识】</div>
       </div>
     </div>
 

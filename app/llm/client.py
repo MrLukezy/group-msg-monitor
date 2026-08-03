@@ -447,7 +447,11 @@ async def _openai_compatible(
     headers = {"Content-Type": "application/json"}
     if provider.api_key:
         headers["Authorization"] = f"Bearer {provider.api_key}"
-    messages: list[dict[str, str]] = [{"role": "system", "content": system}]
+    # 部分兼容接口要求 messages 中出现 "json" 才能启用 json_object
+    system_content = system
+    if force_json and "json" not in f"{system}\n{user}".lower():
+        system_content = f"{system}\n请以 JSON 对象格式输出（json）。"
+    messages: list[dict[str, str]] = [{"role": "system", "content": system_content}]
     for h in history or []:
         role = (h.get("role") or "").strip().lower()
         content = h.get("content") or ""
