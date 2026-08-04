@@ -68,15 +68,18 @@ DEFAULT_SYSTEM = (
 
 CONTEXT_CHECK_SYSTEM = (
     "你是群聊上下文完整性审查助手。"
-    "判断当前片段是否完整，是否还需要更早的前文才能理解（含被引用但未出现正文的消息）。"
+    "判断「当前分析窗口内的最新讨论」是否完整，是否还缺与该讨论直接相关的更早前文"
+    "（含被引用但未出现正文的消息）。"
     "必须输出合法 JSON："
     '{"enough":bool,"reason":string,"need_earlier":bool,'
     '"need_reply_ids":string[],"suggested_earlier_count":int}。'
-    "enough=true 表示可以开始正式分析；need_earlier=true 表示应再向前取聊天记录；"
+    "enough=true 表示可以开始正式分析；need_earlier=true 表示应再向前取相关前文；"
     "need_reply_ids 只填记录中已出现、但仍缺正文的引用 id；"
-    "suggested_earlier_count 建议再取多少条前文（10~40）。"
-    "若用户侧重点或片段中出现 GitHub 仓库 / AI·大模型相关讨论，"
-    "只要相关上下文可能跨多条消息，就应 need_earlier=true 并提高 suggested_earlier_count。"
+    "suggested_earlier_count 建议再取多少条（优先 8~20；仅明确断裂时才到 25）。"
+    "只补与窗口内最新话题直接相关的前文；不要为凑条数灌入无关闲聊或整段更早历史。"
+    "若出现 GitHub / AI·大模型相关讨论，也只向前补该主题相关段落，不要整窗无关消息。"
+    "多轮审查时：若本轮只给了「新补入前文」，请结合已说明的窗口讨论判断，"
+    "勿要求重复已持有内容。"
     "禁止编造 id 或臆测窗外具体内容。"
 )
 
@@ -98,7 +101,7 @@ TOPIC_DEEP_DIVE_RULES = (
     "若历史记录中出现 GitHub 仓库（含 github.com、gist、owner/repo、clone/PR/issue 等），"
     "或 AI 相关名词（大模型、LLM、GPT、Claude、Gemini、Cursor、Agent、Prompt、RAG、微调、"
     "OpenAI、Anthropic、通义、文心、DeepSeek 等），必须："
-    "1) 通过多轮向前补文尽量凑齐相关讨论上下文；"
+    "1) 通过多轮向前补文尽量凑齐该主题相关讨论上下文（勿灌入无关闲聊）；"
     "2) 为每个仓库/名词建立独立 key_point，并在该要点的 deep_dive 中深入分析、明显扩充篇幅；"
     "3) deep_dive.detail 写群内讨论观点与结论，deep_dive.knowledge 写背景知识"
     "（技术定位、常见用途、与讨论的关联；非聊天复述）；"
@@ -189,17 +192,17 @@ def limit_recent_rows(
 
 
 def sqlite_path() -> Path:
-    settings = load_app_settings()
-    # 兼容 .env STORAGE_SQLITE_PATH
+    from app.settings_store import DATA_DIR, ROOT_DIR
+
+    # 兼容 .env STORAGE_SQLITE_PATH；未配置时跟随可切换的 DATA_DIR
     env = ROOT_DIR / ".env"
-    path = ROOT_DIR / "data" / "messages.db"
+    path = DATA_DIR / "messages.db"
     if env.exists():
         for line in env.read_text(encoding="utf-8").splitlines():
             if line.startswith("STORAGE_SQLITE_PATH="):
                 raw = line.split("=", 1)[1].strip().strip('"')
                 p = Path(raw)
                 path = p if p.is_absolute() else ROOT_DIR / p
-    _ = settings
     return path
 
 
@@ -1097,6 +1100,135 @@ def _msg_ts(row: dict[str, Any]) -> int:
 
 def _msg_text(row: dict[str, Any]) -> str:
     return (row.get("content") or "").strip()
+
+
+_TOKEN_RE = re.compile(r"[A-Za-z0-9_./:@-]{3,}|[\u4e00-\u9fff]{2,}")
+_TOKEN_STOPWORDS = frozenset(
+    {
+        "这个",
+        "那个",
+        "什么",
+        "怎么",
+        "为什么",
+        "可以",
+        "不是",
+        "就是",
+        "还是",
+        "没有",
+        "我们",
+        "你们",
+        "他们",
+        "自己",
+        "现在",
+        "今天",
+        "明天",
+        "昨天",
+        "一个",
+        "一下",
+        "一样",
+        "然后",
+        "但是",
+        "不过",
+        "而且",
+        "因为",
+        "所以",
+        "如果",
+        "已经",
+        "可能",
+        "感觉",
+        "知道",
+        "觉得",
+        "哈哈",
+        "哈哈哈",
+        "谢谢",
+        "收到",
+        "好的",
+        "嗯嗯",
+        "http",
+        "https",
+        "www",
+        "com",
+        "the",
+        "and",
+        "for",
+        "with",
+        "you",
+        "are",
+    }
+)
+
+
+def _significant_tokens(text: str) -> set[str]:
+    out: set[str] = set()
+    for m in _TOKEN_RE.findall(text or ""):
+        tok = m.strip("./:@-").lower()
+        if len(tok) < 2 or tok in _TOKEN_STOPWORDS:
+            continue
+        if tok.isdigit():
+            continue
+        out.add(tok)
+    return out
+
+
+def filter_earlier_related_to_anchor(
+    earlier: list[dict[str, Any]],
+    anchor: list[dict[str, Any]],
+    *,
+    bridge_limit: int = 8,
+) -> list[dict[str, Any]]:
+    """只保留紧挨窗口的接话桥 + 与窗口最新讨论相关的更早消息。"""
+    if not earlier:
+        return []
+    if not anchor:
+        return list(earlier[-max(1, bridge_limit) :])
+
+    anchor_ids: set[str] = set()
+    anchor_reply_targets: set[str] = set()
+    anchor_tokens: set[str] = set()
+    for r in anchor:
+        mid = r.get("message_id")
+        if mid is not None and str(mid).strip():
+            anchor_ids.add(str(mid))
+        text = _msg_text(r)
+        anchor_reply_targets.update(extract_reply_ids(text))
+        anchor_tokens |= _significant_tokens(text)
+
+    bridge_n = max(0, int(bridge_limit))
+    bridge = list(earlier[-bridge_n:]) if bridge_n else []
+    bridge_keys = {_row_key(r) for r in bridge}
+    kept: list[dict[str, Any]] = list(bridge)
+
+    for r in earlier:
+        if _row_key(r) in bridge_keys:
+            continue
+        text = _msg_text(r)
+        mid = r.get("message_id")
+        mid_s = str(mid) if mid is not None else ""
+        reply_ids = extract_reply_ids(text)
+        related = False
+        if mid_s and mid_s in anchor_reply_targets:
+            related = True
+        elif any(rid in anchor_ids for rid in reply_ids):
+            related = True
+        else:
+            tokens = _significant_tokens(text)
+            overlap = tokens & anchor_tokens
+            if len(overlap) >= 2:
+                related = True
+            elif len(overlap) == 1:
+                tok = next(iter(overlap))
+                if len(tok) >= 5 or detect_focus_topics(tok)["hit"]:
+                    related = True
+            if not related and detect_focus_topics(text)["hit"] and detect_focus_topics(
+                " ".join(sorted(anchor_tokens))
+            )["hit"]:
+                # 两侧都含深挖主题词时保留（避免漏 GitHub/AI 相关前文）
+                if _significant_tokens(text) & anchor_tokens:
+                    related = True
+        if related:
+            kept.append(r)
+
+    return _merge_rows(kept)
 
 
 def _looks_like_continuation(row: dict[str, Any]) -> bool:
@@ -2203,8 +2335,8 @@ async def run_group_summary(
             window_end=end,
             configured_start=configured_start,
             max_rounds=2,
-            batch_size=30,
-            max_extra_messages=60,
+            batch_size=20,
+            max_extra_messages=40,
             max_extra_minutes=minutes,  # 启发式最多再扩 1 个配置窗
         )
         if look_meta.get("window_extended"):
@@ -2286,6 +2418,9 @@ async def run_group_summary(
     earlier_reasons: list[str] = []
     focus_forced_rounds = 0  # 检测到 GitHub/AI 时至少再向前补几轮
     context_round_limit = 0 if job_type == "manual" else MAX_LLM_CONTEXT_ROUNDS
+    # 多轮补文锚点：只围绕进入审查时的「最新窗口讨论」相关内容向前补
+    anchor_rows = [dict(r) for r in rows]
+    last_round_new_rows: list[dict[str, Any]] = []
 
     def _build_meta_block() -> str:
         block = (
@@ -2312,32 +2447,57 @@ async def run_group_summary(
 
     tokens = TokenUsage()
 
-    # —— LLM 多轮：先判断是否完整，不完整则再向前取记录（最多 5 轮）——
+    # —— LLM 多轮：先判断是否完整，不完整则再向前取「与最新讨论相关」的记录 ——
     for round_i in range(1, context_round_limit + 1):
-        transcript = format_transcript(rows)
-        focus = detect_focus_topics(transcript)
+        focus_src = (
+            format_transcript(anchor_rows, max_chars=8000)
+            if round_i > 1
+            else format_transcript(rows)
+        )
+        focus = detect_focus_topics(focus_src)
         if focus["hit"] and focus_forced_rounds == 0:
-            # 命中深挖主题：至少再强制向前审查/补文 2 轮（在上限内）
-            focus_forced_rounds = min(2, MAX_LLM_CONTEXT_ROUNDS - round_i + 1)
+            # 命中深挖主题：最多再强制向前审查/补文 1 轮（在上限内）
+            focus_forced_rounds = min(1, MAX_LLM_CONTEXT_ROUNDS - round_i + 1)
             source = f"{source}；检测到{'、'.join(focus['labels'])}，将多轮深挖"
         focus_hint = ""
         if focus["hit"]:
             focus_hint = (
                 f"当前片段已检测到：{'、'.join(focus['labels'])}。"
-                "若相关讨论可能跨越多条消息，必须 need_earlier=true，"
-                "suggested_earlier_count 建议 25~40。\n"
+                "若相关讨论可能跨越多条消息，可 need_earlier=true，"
+                "但只补该主题相关前文，suggested_earlier_count 建议 12~20。\n"
             )
         elif focus_forced_rounds > 0:
-            focus_hint = "仍在深挖主题补文阶段，优先 need_earlier=true。\n"
+            focus_hint = (
+                "仍在深挖主题补文阶段：仅在相关前文仍缺口时 need_earlier=true，"
+                "勿补无关闲聊。\n"
+            )
 
-        check_user = (
-            "请审查下列群聊是否完整、是否还需要更早前文才能理解。"
-            "若需要，请设置 need_earlier=true；若已可分析，enough=true。"
-            "只输出审查 JSON。\n\n"
-            f"{analysis_instructions}\n\n"
-            f"{focus_hint}"
-            f"{_build_meta_block()}\n聊天记录:\n{transcript}"
-        )
+        if round_i == 1 or not last_round_new_rows:
+            transcript = format_transcript(rows)
+            check_user = (
+                "请审查下列群聊是否完整、是否还需要与「窗口内最新讨论」直接相关的更早前文。"
+                "只补相关缺口；无关内容不要继续向前取。"
+                "若需要，请设置 need_earlier=true；若已可分析，enough=true。"
+                "只输出审查 JSON。\n\n"
+                f"{analysis_instructions}\n\n"
+                f"{focus_hint}"
+                f"{_build_meta_block()}\n聊天记录:\n{transcript}"
+            )
+        else:
+            # 第 2 轮起：只审查本轮新补入内容，避免把全部历史反复塞进会话
+            anchor_digest = format_transcript(anchor_rows, max_chars=6000)
+            new_transcript = format_transcript(last_round_new_rows, max_chars=8000)
+            check_user = (
+                "以下是上一轮新补入的前文。请判断：相对「窗口内最新讨论」，"
+                "相关上下文是否已够；只要求继续补与该讨论直接相关的缺口。"
+                "不要重复索要已持有内容；无关闲聊不必再取。"
+                "若已可分析，enough=true。只输出审查 JSON。\n\n"
+                f"{analysis_instructions}\n\n"
+                f"{focus_hint}"
+                f"{_build_meta_block()}\n"
+                f"【窗口内最新讨论（已持有，勿重复补）】\n{anchor_digest}\n\n"
+                f"【本轮新补入前文】\n{new_transcript}"
+            )
         try:
             check_raw, check_usage = await chat_complete(
                 provider,
@@ -2358,15 +2518,22 @@ async def run_group_summary(
             )
             break
 
+        # history 只保留精简结论，避免多轮把完整聊天记录反复累加
         history.extend(
             [
-                {"role": "user", "content": check_user},
+                {
+                    "role": "user",
+                    "content": (
+                        f"第{round_i}轮上下文审查：当前持有 {len(rows)} 条，"
+                        f"本轮审查新增前文 {len(last_round_new_rows)} 条。"
+                        "请判断是否还需与最新讨论相关的前文。"
+                    ),
+                },
                 {"role": "assistant", "content": check_raw},
             ]
         )
-        # 控制 history 长度，避免 prompt 无限膨胀
-        if len(history) > 8:
-            history = history[-8:]
+        if len(history) > 6:
+            history = history[-6:]
 
         enough = bool(check.get("enough"))
         need_earlier = bool(check.get("need_earlier")) and not enough
@@ -2391,7 +2558,6 @@ async def run_group_summary(
         if not need_earlier and not need_ids:
             break
 
-        added_this_round = 0
         batches: list[list[dict[str, Any]]] = [rows]
 
         if need_ids:
@@ -2404,44 +2570,59 @@ async def run_group_summary(
                 tagged.append(_mark_context_role(r, "reply"))
             if tagged:
                 batches.append(tagged)
-                added_this_round += len(tagged)
 
         if need_earlier or (not enough and not need_ids):
             suggest = check.get("suggested_earlier_count")
             try:
-                take = int(suggest) if suggest is not None else 25
+                take = int(suggest) if suggest is not None else 15
             except Exception:
-                take = 25
+                take = 15
             if focus["hit"] or focus_forced_rounds > 0:
-                take = max(take, 30)
-            take = max(10, min(40, take))
-            earlier = fetch_messages_before(group_id, first_ts, limit=take)
+                take = max(take, 15)
+            take = max(8, min(25, take))
+            # 多取一点再按相关性过滤，避免盲取整段无关闲聊
+            fetch_n = min(40, take * 2)
+            earlier = fetch_messages_before(group_id, first_ts, limit=fetch_n)
             kept = []
             for r in earlier:
                 ts = _msg_ts(r)
                 if ts and ts < min_allowed_ts:
                     continue
                 kept.append(_mark_context_role(r, "before"))
+            kept = filter_earlier_related_to_anchor(
+                kept,
+                anchor_rows,
+                bridge_limit=min(8, take),
+            )
+            # 相关性过滤后仍可能偏多，按建议条数从近到远截断
+            if len(kept) > take:
+                kept = kept[-take:]
             if kept:
                 batches.append(kept)
-                added_this_round += len(kept)
 
         new_rows = _merge_rows(*batches)
         if len(new_rows) <= len(rows):
             earlier_reasons.append(check.get("reason") or "未取到更多前文，结束补上下文")
             break
 
+        # 仅记录本轮真正新增的消息，供下一轮增量审查
+        prev_keys = {_row_key(r) for r in rows}
+        last_round_new_rows = [r for r in new_rows if _row_key(r) not in prev_keys]
         rows = new_rows
         start = min(start, _msg_ts(rows[0]) or start)
         end = max(end, _msg_ts(rows[-1]) or end)
         llm_context_rounds = round_i
-        earlier_added_total += added_this_round
+        earlier_added_total += len(last_round_new_rows)
         reason = (check.get("reason") or "模型判断需要更早前文").strip()
-        earlier_reasons.append(f"第{round_i}轮：{reason}（+{added_this_round}）")
+        earlier_reasons.append(
+            f"第{round_i}轮：{reason}（+{len(last_round_new_rows)}）"
+        )
         context_meta["window_extended"] = True
-        context_meta["lookback_messages"] = int(context_meta.get("lookback_messages") or 0) + added_this_round
+        context_meta["lookback_messages"] = int(
+            context_meta.get("lookback_messages") or 0
+        ) + len(last_round_new_rows)
         context_meta.setdefault("lookback_reasons", []).append(reason)
-        source = f"{source}；第{round_i}轮向前补了 {added_this_round} 条"
+        source = f"{source}；第{round_i}轮向前补了 {len(last_round_new_rows)} 条"
         if focus_forced_rounds > 0:
             focus_forced_rounds -= 1
 
@@ -2567,7 +2748,7 @@ async def run_group_summary(
     base_meta = _build_meta_block()
     if llm_context_rounds or earlier_added_total:
         base_meta += (
-            "说明: 已按多轮审查补充更早聊天记录（最多 "
+            "说明: 已按多轮审查补充与窗口内最新讨论相关的更早聊天记录（最多 "
             f"{MAX_LLM_CONTEXT_ROUNDS} 轮，时间跨度不超过配置窗口×{MAX_WINDOW_MULTIPLIER}）；"
             "正式分析时必须在 context_usage 中标明引用了更早内容。\n"
         )
@@ -2625,7 +2806,7 @@ async def run_group_summary(
             model=model_name,
             system=analysis_system,
             user=user_prompt,
-            history=history or None,
+            history=None,  # 正式分析只用合并后的完整记录，不重复带入多轮审查全文
             timeout_sec=300,
             max_tokens=final_max_tokens,
             retries=2,

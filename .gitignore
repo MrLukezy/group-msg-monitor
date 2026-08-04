@@ -14,6 +14,7 @@ data/app_settings.json
 data/group_configs/
 data/groups_cache.json
 data/monitor.lock
+data/monitor.stop
 data/telegram_session/
 data/telegram_qr_state.json
 data/telegram_login.pid
@@ -21,7 +22,10 @@ data/telegram_2fa_password.txt
 data/wechat_keys.json
 data/wechat_decrypted/
 data/wechat_poll_state.json
+data/gewechat_qr_state.json
+data/gewechat_login.pid
 data/media/
+data_dir.json
 logs/*.log
 logs/*.log.*
 logs/*.txt

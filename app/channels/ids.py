@@ -1,4 +1,4 @@
-"""跨通道群 ID 约定：QQ 保持纯数字兼容；微信 wx:；Telegram tg:。"""
+"""跨通道群 ID 约定：QQ 保持纯数字兼容；微信 wx:；GeWeChat gw:；Telegram tg:。"""
 
 from __future__ import annotations
 
@@ -16,6 +16,12 @@ def make_group_id(channel: str, raw_id: str | int) -> str:
         if rid.startswith("wx:"):
             return rid
         return f"wx:{rid}"
+    if ch in ("gewechat", "gewe", "gw"):
+        if rid.startswith("gw:"):
+            return rid
+        if rid.startswith("gewechat:") or rid.startswith("gewe:"):
+            return f"gw:{rid.split(':', 1)[1]}"
+        return f"gw:{rid}"
     if ch in ("telegram", "tg"):
         if rid.startswith("tg:"):
             return rid
@@ -31,6 +37,10 @@ def parse_group_id(group_id: str) -> tuple[str, str]:
         return "wechat", gid[3:]
     if gid.startswith("wechat:"):
         return "wechat", gid.split(":", 1)[1]
+    if gid.startswith("gw:"):
+        return "gewechat", gid[3:]
+    if gid.startswith("gewechat:") or gid.startswith("gewe:"):
+        return "gewechat", gid.split(":", 1)[1]
     if gid.startswith("tg:"):
         return "telegram", gid[3:]
     if gid.startswith("telegram:"):

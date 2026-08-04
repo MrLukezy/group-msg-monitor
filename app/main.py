@@ -11,7 +11,7 @@ import time
 from logging.handlers import RotatingFileHandler
 from typing import Any
 
-from app.channels.feature_flags import TELEGRAM_CHANNEL_ENABLED, WECHAT_CHANNEL_ENABLED
+from app.channels.feature_flags import TELEGRAM_CHANNEL_ENABLED, WECHAT_CHANNEL_ENABLED, GEWECHAT_CHANNEL_ENABLED
 from app.config import Settings, load_settings
 from app.filters import matched_keywords
 from app.handlers.alert_handler import AlertHandler
@@ -21,6 +21,7 @@ from app.llm.service import record_llm_failure, run_group_summary
 from app.models import GroupMessageEvent, try_parse_group_message
 from app.onebot_client import OneBotClient, build_ws_url
 from app.settings_store import (
+    DATA_DIR,
     ROOT_DIR,
     enabled_group_ids,
     list_group_configs,
@@ -61,7 +62,7 @@ def acquire_singleton_lock() -> Any:
     """确保同时只有一个监控进程。"""
     import atexit
 
-    lock_path = ROOT_DIR / "data" / "monitor.lock"
+    lock_path = DATA_DIR / "monitor.lock"
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     fh = open(lock_path, "a+", encoding="utf-8")
     try:
@@ -129,7 +130,7 @@ class MonitorApp:
         self._llm_queue: asyncio.Queue[str] = asyncio.Queue()
         self._llm_pending: set[str] = set()
         self._stop_event = asyncio.Event()
-        self._stop_file = ROOT_DIR / "data" / "monitor.stop"
+        self._stop_file = DATA_DIR / "monitor.stop"
         self._store_stop_task: asyncio.Task[None] | None = None
         self._received_count = 0
         self._background_tasks: set[asyncio.Task[Any]] = set()
@@ -137,6 +138,7 @@ class MonitorApp:
         self.qq_passive = None
         self.tg_adapter: Any | None = None
         self.wx_adapter: WechatLocalAdapter | None = None
+        self.gewe_adapter: Any | None = None
 
     def _allowed(self) -> set[str]:
         ids = enabled_group_ids()
@@ -287,6 +289,8 @@ class MonitorApp:
             self.tg_adapter.stop()
         if self.wx_adapter is not None:
             self.wx_adapter.stop()
+        if self.gewe_adapter is not None:
+            self.gewe_adapter.stop()
         if self.store_handler is not None and self._store_stop_task is None:
             try:
                 self._store_stop_task = asyncio.get_running_loop().create_task(
@@ -391,6 +395,31 @@ class MonitorApp:
                 )
         elif ch.wechat.bound and not WECHAT_CHANNEL_ENABLED:
             logger.info("微信通道已屏蔽，忽略绑定配置")
+
+        # GeWeChat（iPad 协议，只收不发）
+        if GEWECHAT_CHANNEL_ENABLED and ch.gewechat.bound:
+            from app.channels.gewechat import GeWeChatAdapter
+
+            if not ch.gewechat.base_url or not ch.gewechat.app_id:
+                logger.warning("GeWeChat 已绑定但缺少 base_url / app_id")
+            else:
+                self.gewe_adapter = GeWeChatAdapter(
+                    base_url=ch.gewechat.base_url,
+                    token=ch.gewechat.token,
+                    app_id=ch.gewechat.app_id,
+                    on_message=self.handle_group_event,
+                    callback_host=ch.gewechat.callback_host,
+                    callback_port=ch.gewechat.callback_port,
+                    wxid=ch.gewechat.wxid,
+                )
+                tasks.append(self.gewe_adapter.run_forever())
+                logger.info(
+                    "通道 GeWeChat 已启用 | app_id=%s label=%s",
+                    ch.gewechat.app_id,
+                    ch.gewechat.label or ch.gewechat.wxid or "",
+                )
+        elif ch.gewechat.bound and not GEWECHAT_CHANNEL_ENABLED:
+            logger.info("GeWeChat 通道已关闭，忽略绑定配置")
 
         if len(tasks) == 3:
             logger.warning("未绑定任何消息通道；请在总配置中绑定 QQ")

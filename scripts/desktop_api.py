@@ -31,13 +31,17 @@ from app.llm.service import (  # noqa: E402
 from app.settings_store import (  # noqa: E402
     AppSettings,
     GroupConfig,
+    describe_storage_paths,
     dump_public,
     list_group_configs,
     load_app_settings,
     load_group_config,
+    open_local_path,
+    pick_directory,
     provider_by_id,
     save_app_settings,
     save_group_config,
+    set_data_dir_override,
 )
 from app.channels.ids import channel_of_group_id  # noqa: E402
 from app.channels.telegram import (  # noqa: E402
@@ -60,13 +64,30 @@ from app.channels.wechat import (  # noqa: E402
     wechat_memory_scan_likely_broken,
 )
 from app.channels.feature_flags import (  # noqa: E402
+    GEWECHAT_CHANNEL_ENABLED,
+    GEWECHAT_DISABLED_MESSAGE,
     WECHAT_CHANNEL_ENABLED,
     WECHAT_DISABLED_MESSAGE,
+)
+from app.channels.gewechat import (  # noqa: E402
+    DEFAULT_BASE_URL,
+    DEFAULT_CALLBACK_PORT,
+    DEFAULT_REGION_ID,
+    cancel_qr_login as cancel_gewe_qr_login,
+    check_online_status as check_gewe_online,
+    guess_lan_ip,
+    list_gewechat_groups,
+    qr_status as gewe_qr_status,
+    start_qr_login_process as start_gewe_qr_login,
 )
 
 
 def _wechat_disabled_out() -> None:
     out({"ok": False, "message": WECHAT_DISABLED_MESSAGE, "disabled": True})
+
+
+def _gewechat_disabled_out() -> None:
+    out({"ok": False, "message": GEWECHAT_DISABLED_MESSAGE, "disabled": True})
 
 
 def out(data) -> None:
@@ -347,6 +368,7 @@ def cmd_save_settings(raw: str) -> None:
         qq = channels.get("qq") or {}
         wx = channels.get("wechat") or {}
         tg = channels.get("telegram") or {}
+        gw = channels.get("gewechat") or {}
         qq_src = qq if isinstance(qq, dict) else {}
         mode = (qq_src.get("mode") or "onebot").strip().lower()
         if mode not in ("onebot", "passive"):
@@ -354,6 +376,7 @@ def cmd_save_settings(raw: str) -> None:
         group_name_map = qq_src.get("groupNameMap") or qq_src.get("group_name_map") or {}
         if not isinstance(group_name_map, dict):
             group_name_map = {}
+        gw_src = gw if isinstance(gw, dict) else {}
         mapped["channels"] = {
             "qq": _ch(
                 qq_src,
@@ -395,6 +418,29 @@ def cmd_save_settings(raw: str) -> None:
                     "poll_timeout": int(tg.get("pollTimeout") or tg.get("poll_timeout") or 25),
                 },
             ),
+            "gewechat": _ch(
+                gw_src,
+                {
+                    "base_url": (
+                        gw_src.get("baseUrl") or gw_src.get("base_url") or DEFAULT_BASE_URL
+                    ).strip(),
+                    "token": (gw_src.get("token") or "").strip(),
+                    "app_id": (gw_src.get("appId") or gw_src.get("app_id") or "").strip(),
+                    "wxid": (gw_src.get("wxid") or "").strip(),
+                    "region_id": (
+                        gw_src.get("regionId") or gw_src.get("region_id") or DEFAULT_REGION_ID
+                    ).strip(),
+                    "proxy_ip": (gw_src.get("proxyIp") or gw_src.get("proxy_ip") or "").strip(),
+                    "callback_host": (
+                        gw_src.get("callbackHost") or gw_src.get("callback_host") or ""
+                    ).strip(),
+                    "callback_port": int(
+                        gw_src.get("callbackPort")
+                        or gw_src.get("callback_port")
+                        or DEFAULT_CALLBACK_PORT
+                    ),
+                },
+            ),
         }
 
     settings = AppSettings.model_validate(mapped)
@@ -402,8 +448,69 @@ def cmd_save_settings(raw: str) -> None:
     out({"ok": True})
 
 
+def cmd_get_storage_paths() -> None:
+    out(describe_storage_paths())
+
+
+def cmd_set_data_dir(raw: str) -> None:
+    data = json.loads(raw or "{}")
+    path = data.get("path")
+    if path is None:
+        path = data.get("dataDir") or data.get("data_dir")
+    migrate = bool(data.get("migrate", True))
+    reset = bool(data.get("reset") or data.get("useDefault") or data.get("use_default"))
+    try:
+        if reset:
+            info = set_data_dir_override(None, migrate=migrate)
+        else:
+            info = set_data_dir_override(str(path or ""), migrate=migrate)
+        out(info)
+    except Exception as e:
+        out({"ok": False, "error": str(e)})
+
+
+def cmd_open_local_path(raw: str) -> None:
+    data = json.loads(raw or "{}")
+    kind = str(data.get("kind") or "").strip().lower()
+    via = str(data.get("via") or "explorer").strip().lower()
+    paths = describe_storage_paths()
+    kind_map = {
+        "data": paths["data_dir"],
+        "data_dir": paths["data_dir"],
+        "media": paths["media_dir"],
+        "media_dir": paths["media_dir"],
+        "logs": paths["logs_dir"],
+        "logs_dir": paths["logs_dir"],
+        "db": paths["messages_db"],
+        "messages_db": paths["messages_db"],
+        "settings": paths["settings_path"],
+        "group_configs": paths["group_configs_dir"],
+    }
+    path = str(data.get("path") or "").strip()
+    if kind and kind in kind_map:
+        path = kind_map[kind]
+    if not path:
+        out({"ok": False, "error": "未指定要打开的路径"})
+        return
+    try:
+        out(open_local_path(path, via=via))
+    except Exception as e:
+        out({"ok": False, "error": str(e)})
+
+
+def cmd_pick_directory(raw: str = "{}") -> None:
+    data = json.loads(raw or "{}")
+    title = str(data.get("title") or "选择本地记录缓存目录").strip()
+    try:
+        out(pick_directory(title=title))
+    except Exception as e:
+        out({"ok": False, "error": str(e), "path": ""})
+
+
 def _cache_channel_groups(groups: list[dict], channel: str) -> int:
-    path = ROOT / "data" / "groups_cache.json"
+    from app.settings_store import DATA_DIR
+
+    path = DATA_DIR / "groups_cache.json"
     path.parent.mkdir(parents=True, exist_ok=True)
     existing: dict = {"groups": [], "login": None}
     if path.exists():
@@ -833,11 +940,251 @@ def cmd_unbind_channel(channel: str) -> None:
         settings.channels.telegram.label = ""
         settings.channels.telegram.last_error = ""
         # 保留 api_id/api_hash 与 session，方便重新绑定
+    elif ch in ("gewechat", "gewe", "gw"):
+        settings.channels.gewechat.bound = False
+        settings.channels.gewechat.label = ""
+        settings.channels.gewechat.last_error = ""
+        # 保留 base_url / app_id / token，方便重新绑定
     else:
         out({"ok": False, "message": f"未知通道: {channel}"})
         return
     save_app_settings(settings)
     out({"ok": True, "message": f"已解绑 {ch}", "channels": dump_public(settings.channels)})
+
+
+def _apply_gewechat_form(settings, data: dict) -> None:
+    gw = settings.channels.gewechat
+    base_url = (data.get("baseUrl") or data.get("base_url") or gw.base_url or DEFAULT_BASE_URL).strip()
+    token = (data.get("token") if "token" in data else None)
+    if token is None:
+        token = gw.token
+    app_id = data.get("appId") if "appId" in data else data.get("app_id")
+    if app_id is None:
+        app_id = gw.app_id
+    wxid = data.get("wxid") if "wxid" in data else gw.wxid
+    region_id = (
+        data.get("regionId") or data.get("region_id") or gw.region_id or DEFAULT_REGION_ID
+    ).strip()
+    proxy_ip = (data.get("proxyIp") or data.get("proxy_ip") or gw.proxy_ip or "").strip()
+    callback_host = (
+        data.get("callbackHost") or data.get("callback_host") or gw.callback_host or ""
+    ).strip()
+    callback_port = int(
+        data.get("callbackPort")
+        or data.get("callback_port")
+        or gw.callback_port
+        or DEFAULT_CALLBACK_PORT
+    )
+    gw.base_url = base_url or DEFAULT_BASE_URL
+    gw.token = str(token or "").strip()
+    gw.app_id = str(app_id or "").strip()
+    gw.wxid = str(wxid or "").strip()
+    gw.region_id = region_id or DEFAULT_REGION_ID
+    gw.proxy_ip = proxy_ip
+    gw.callback_host = callback_host
+    gw.callback_port = callback_port
+
+
+def cmd_bind_gewechat(raw: str) -> None:
+    if not GEWECHAT_CHANNEL_ENABLED:
+        _gewechat_disabled_out()
+        return
+    data = json.loads(raw or "{}")
+    settings = load_app_settings()
+    _apply_gewechat_form(settings, data)
+
+    # 扫码成功状态可补全 app_id / token / wxid / label
+    st = gewe_qr_status()
+    if st.get("status") == "authorized":
+        if st.get("app_id"):
+            settings.channels.gewechat.app_id = str(st.get("app_id") or "")
+        if st.get("token"):
+            settings.channels.gewechat.token = str(st.get("token") or "")
+        if st.get("wxid"):
+            settings.channels.gewechat.wxid = str(st.get("wxid") or "")
+        if st.get("label") and not data.get("label"):
+            data = {**data, "label": st.get("label")}
+
+    if not settings.channels.gewechat.base_url:
+        out({"ok": False, "message": "请填写 GeWeChat base_url"})
+        return
+    if not settings.channels.gewechat.app_id:
+        out(
+            {
+                "ok": False,
+                "message": "尚未扫码登录。请先点「扫码登录」，成功后再绑定",
+                "need_qr": True,
+            }
+        )
+        return
+
+    online = asyncio.run(
+        check_gewe_online(
+            settings.channels.gewechat.base_url,
+            settings.channels.gewechat.token,
+            settings.channels.gewechat.app_id,
+        )
+    )
+    if online.get("token"):
+        settings.channels.gewechat.token = str(online.get("token") or settings.channels.gewechat.token)
+
+    settings.channels.gewechat.bound = True
+    settings.channels.gewechat.label = (
+        data.get("label")
+        or settings.channels.gewechat.label
+        or settings.channels.gewechat.wxid
+        or settings.channels.gewechat.app_id
+    )
+    if online.get("online"):
+        settings.channels.gewechat.last_error = ""
+        msg = f"GeWeChat 已绑定（在线）· {settings.channels.gewechat.label}"
+    else:
+        settings.channels.gewechat.last_error = online.get("message") or "当前不在线，请重新扫码"
+        msg = (
+            f"GeWeChat 已绑定，但账号未在线：{settings.channels.gewechat.last_error}。"
+            "监听启动后仍会注册回调，建议重新扫码。"
+        )
+    save_app_settings(settings)
+
+    groups: list = []
+    try:
+        groups = asyncio.run(
+            list_gewechat_groups(
+                settings.channels.gewechat.base_url,
+                settings.channels.gewechat.token,
+                settings.channels.gewechat.app_id,
+            )
+        )
+        if groups:
+            _cache_channel_groups(groups, "gewechat")
+    except Exception as e:
+        out(
+            {
+                "ok": True,
+                "message": f"{msg}；拉群失败: {e}",
+                "channels": dump_public(settings.channels),
+                "online": bool(online.get("online")),
+            }
+        )
+        return
+    out(
+        {
+            "ok": True,
+            "message": msg if not groups else f"{msg}；已拉取 {len(groups)} 个群",
+            "channels": dump_public(settings.channels),
+            "groups": groups,
+            "online": bool(online.get("online")),
+        }
+    )
+
+
+def cmd_gewechat_qr_start(raw: str) -> None:
+    if not GEWECHAT_CHANNEL_ENABLED:
+        _gewechat_disabled_out()
+        return
+    data = json.loads(raw or "{}")
+    settings = load_app_settings()
+    _apply_gewechat_form(settings, data)
+    save_app_settings(settings)
+    result = start_gewe_qr_login(
+        base_url=settings.channels.gewechat.base_url,
+        token=settings.channels.gewechat.token,
+        app_id=settings.channels.gewechat.app_id,
+        region_id=settings.channels.gewechat.region_id,
+        proxy_ip=settings.channels.gewechat.proxy_ip,
+    )
+    out(result)
+
+
+def cmd_gewechat_qr_status() -> None:
+    if not GEWECHAT_CHANNEL_ENABLED:
+        _gewechat_disabled_out()
+        return
+    st = gewe_qr_status()
+    # 授权成功时把凭证写回设置，方便前端自动绑定
+    if st.get("status") == "authorized":
+        settings = load_app_settings()
+        changed = False
+        if st.get("app_id") and settings.channels.gewechat.app_id != st.get("app_id"):
+            settings.channels.gewechat.app_id = str(st.get("app_id") or "")
+            changed = True
+        if st.get("token") and settings.channels.gewechat.token != st.get("token"):
+            settings.channels.gewechat.token = str(st.get("token") or "")
+            changed = True
+        if st.get("wxid") and settings.channels.gewechat.wxid != st.get("wxid"):
+            settings.channels.gewechat.wxid = str(st.get("wxid") or "")
+            changed = True
+        if st.get("label") and not settings.channels.gewechat.label:
+            settings.channels.gewechat.label = str(st.get("label") or "")
+            changed = True
+        if changed:
+            save_app_settings(settings)
+        st["channels"] = dump_public(settings.channels)
+    out(st)
+
+
+def cmd_gewechat_qr_cancel() -> None:
+    if not GEWECHAT_CHANNEL_ENABLED:
+        _gewechat_disabled_out()
+        return
+    cancel_gewe_qr_login()
+    out({"ok": True, "message": "已取消扫码"})
+
+
+def cmd_test_gewechat() -> None:
+    if not GEWECHAT_CHANNEL_ENABLED:
+        _gewechat_disabled_out()
+        return
+    settings = load_app_settings()
+    gw = settings.channels.gewechat
+    if not gw.app_id:
+        out({"ok": False, "online": False, "message": "尚未扫码 / 缺少 appId", "latencyMs": 0})
+        return
+    t0 = time.perf_counter()
+    result = asyncio.run(check_gewe_online(gw.base_url, gw.token, gw.app_id))
+    latency = int((time.perf_counter() - t0) * 1000)
+    if result.get("token") and result.get("token") != gw.token:
+        gw.token = str(result.get("token") or "")
+        save_app_settings(settings)
+    out(
+        {
+            "ok": bool(result.get("online")),
+            "online": bool(result.get("online")),
+            "message": result.get("message") or "",
+            "latencyMs": latency,
+            "callbackHint": f"http://{(gw.callback_host or guess_lan_ip())}:{gw.callback_port}/gewechat/callback",
+        }
+    )
+
+
+def cmd_pull_gewechat_groups() -> None:
+    if not GEWECHAT_CHANNEL_ENABLED:
+        _gewechat_disabled_out()
+        return
+    settings = load_app_settings()
+    gw = settings.channels.gewechat
+    if not gw.bound:
+        out({"ok": False, "message": "请先绑定 GeWeChat"})
+        return
+    if not gw.app_id:
+        out({"ok": False, "message": "缺少 appId，请重新扫码"})
+        return
+    try:
+        groups = asyncio.run(list_gewechat_groups(gw.base_url, gw.token, gw.app_id))
+    except Exception as e:
+        out({"ok": False, "message": str(e)})
+        return
+    if groups:
+        _cache_channel_groups(groups, "gewechat")
+    out(
+        {
+            "ok": True,
+            "count": len(groups),
+            "groups": groups,
+            "message": f"已拉取 {len(groups)} 个微信群",
+            "channels": dump_public(settings.channels),
+        }
+    )
 
 
 def cmd_wechat_detect() -> None:
@@ -1473,6 +1820,13 @@ def main() -> None:
     sub.add_parser("get-settings")
     p3 = sub.add_parser("save-settings")
     p3.add_argument("--json", required=True)
+    sub.add_parser("get-storage-paths")
+    p_set_data = sub.add_parser("set-data-dir")
+    p_set_data.add_argument("--json", default="{}")
+    p_open_path = sub.add_parser("open-local-path")
+    p_open_path.add_argument("--json", default="{}")
+    p_pick_dir = sub.add_parser("pick-directory")
+    p_pick_dir.add_argument("--json", default="{}")
 
     p4 = sub.add_parser("get-group")
     p4.add_argument("--group-id", required=True)
@@ -1555,6 +1909,14 @@ def main() -> None:
     p_wx_import.add_argument("--json", default="{}")
     sub.add_parser("pull-telegram-groups")
     sub.add_parser("pull-wechat-groups")
+    p_bind_gw = sub.add_parser("bind-gewechat")
+    p_bind_gw.add_argument("--json", default="{}")
+    p_gw_qr = sub.add_parser("gewechat-qr-start")
+    p_gw_qr.add_argument("--json", default="{}")
+    sub.add_parser("gewechat-qr-status")
+    sub.add_parser("gewechat-qr-cancel")
+    sub.add_parser("test-gewechat")
+    sub.add_parser("pull-gewechat-groups")
 
     args = parser.parse_args()
     if args.cmd == "list-groups":
@@ -1565,6 +1927,14 @@ def main() -> None:
         cmd_get_settings()
     elif args.cmd == "save-settings":
         cmd_save_settings(args.json)
+    elif args.cmd == "get-storage-paths":
+        cmd_get_storage_paths()
+    elif args.cmd == "set-data-dir":
+        cmd_set_data_dir(args.json)
+    elif args.cmd == "open-local-path":
+        cmd_open_local_path(args.json)
+    elif args.cmd == "pick-directory":
+        cmd_pick_directory(getattr(args, "json", "{}"))
     elif args.cmd == "get-group":
         cmd_get_group(args.group_id)
     elif args.cmd == "save-group":
@@ -1640,6 +2010,18 @@ def main() -> None:
         cmd_pull_telegram_groups()
     elif args.cmd == "pull-wechat-groups":
         cmd_pull_wechat_groups()
+    elif args.cmd == "bind-gewechat":
+        cmd_bind_gewechat(args.json)
+    elif args.cmd == "gewechat-qr-start":
+        cmd_gewechat_qr_start(args.json)
+    elif args.cmd == "gewechat-qr-status":
+        cmd_gewechat_qr_status()
+    elif args.cmd == "gewechat-qr-cancel":
+        cmd_gewechat_qr_cancel()
+    elif args.cmd == "test-gewechat":
+        cmd_test_gewechat()
+    elif args.cmd == "pull-gewechat-groups":
+        cmd_pull_gewechat_groups()
 
 
 if __name__ == "__main__":

@@ -435,6 +435,7 @@
               <button class="settings-tab active" type="button" data-stab="channels">通道绑定</button>
               <button class="settings-tab" type="button" data-stab="llm">语言模型</button>
               <button class="settings-tab" type="button" data-stab="appearance">外观</button>
+              <button class="settings-tab" type="button" data-stab="storage">数据与缓存</button>
             </div>
 
             <div id="stab-channels" class="settings-body">
@@ -508,10 +509,7 @@
                   <input id="s-wx-keys" placeholder="例如 D:\tools\wechat-decrypt\all_keys.json" disabled />
                 </div>
                 <p class="settings-desc" id="wechat-disabled-note">
-                  微信通道代码仍保留，但功能开关已关闭。恢复时请将
-                  <code>app/channels/feature_flags.py</code> 中
-                  <code>WECHAT_CHANNEL_ENABLED</code> 设为 <code>True</code>，并去掉本卡片的
-                  <code>hidden</code>。
+                  微信本地库通道已关闭（≥4.1.10 无法稳定取 key）。
                 </p>
                 <div class="channel-actions">
                   <button id="btn-bind-wechat" class="btn primary" type="button" disabled>绑定微信</button>
@@ -522,6 +520,54 @@
                   <button id="btn-pull-wechat-groups" class="btn ghost" type="button" disabled>拉取微信群</button>
                 </div>
                 <div id="wechat-bind-result" class="test-result" hidden></div>
+              </div>
+
+              <!-- GeWeChat 暂不支持：保留配置 DOM，功能开关恢复后可直接重新启用。 -->
+              <div class="channel-card is-disabled" data-channel="gewechat" hidden>
+                <div class="channel-card-head">
+                  <div>
+                    <h3 class="channel-title">微信 · GeWeChat（已暂时屏蔽）</h3>
+                    <p class="channel-status" id="ch-gw-status">自建服务取码不稳定，绑定与监听已停用</p>
+                  </div>
+                  <span class="channel-badge" id="ch-gw-badge">已屏蔽</span>
+                </div>
+                <div class="setting-item">
+                  <label>GeWeChat API 地址</label>
+                  <input id="s-gw-base-url" placeholder="http://127.0.0.1:2531/v2/api" disabled />
+                </div>
+                <div class="setting-item">
+                  <label>Token（可空，首次会自动获取并保存）</label>
+                  <input id="s-gw-token" type="password" placeholder="留空则自动 getTokenId" disabled />
+                </div>
+                <div class="setting-item">
+                  <label>登录地区 regionId</label>
+                  <input id="s-gw-region" placeholder="440000=广东，建议选同省" disabled />
+                </div>
+                <div class="setting-item">
+                  <label>回调 Host（可空=自动局域网 IP；勿填 127.0.0.1）</label>
+                  <input id="s-gw-callback-host" placeholder="例如 192.168.1.8" disabled />
+                </div>
+                <div class="setting-item">
+                  <label>回调端口</label>
+                  <input id="s-gw-callback-port" placeholder="9919" disabled />
+                </div>
+                <p class="settings-desc">
+                  GeWeChat 扫码通道已暂时屏蔽（自建取码常失败）。代码保留，恢复时打开功能开关即可。
+                </p>
+                <div id="gw-qr-box" class="tg-qr-box hidden">
+                  <img id="gw-qr-img" alt="GeWeChat 登录二维码" />
+                  <p id="gw-qr-hint" class="field-hint">等待扫码…</p>
+                  <p id="gw-verify-url" class="field-hint hidden"></p>
+                </div>
+                <div class="channel-actions">
+                  <button id="btn-gw-qr-start" class="btn primary" type="button" disabled>扫码登录</button>
+                  <button id="btn-gw-qr-cancel" class="btn" type="button" disabled>取消扫码</button>
+                  <button id="btn-bind-gewechat" class="btn primary" type="button" disabled>绑定</button>
+                  <button id="btn-unbind-gewechat" class="btn" type="button" disabled>解绑</button>
+                  <button id="btn-test-gewechat" class="btn ghost" type="button" disabled>检测在线</button>
+                  <button id="btn-pull-gewechat-groups" class="btn ghost" type="button" disabled>拉取微信群</button>
+                </div>
+                <div id="gewechat-test-result" class="test-result" hidden></div>
               </div>
 
               <!-- Telegram 暂不支持：保留配置 DOM，功能开关恢复后可直接重新启用。 -->
@@ -729,6 +775,59 @@
                   </div>
                   <p class="field-hint">面板越大越不透明；调低可更清楚地看见壁纸。</p>
                 </div>
+              </div>
+            </div>
+
+            <div id="stab-storage" class="settings-body hidden">
+              <p class="settings-desc">
+                本地聊天记录、媒体图片、群配置与 LLM 报告默认保存在项目
+                <code>data/</code> 目录。可改到其他磁盘路径；修改后需重启桌面端与监听服务生效。
+              </p>
+
+              <div class="channel-card">
+                <div class="channel-card-head">
+                  <div>
+                    <h3 class="channel-title">本地记录缓存路径</h3>
+                    <p class="channel-status" id="storage-path-status">读取中…</p>
+                  </div>
+                  <span class="channel-badge" id="storage-path-badge">默认</span>
+                </div>
+                <div class="setting-item">
+                  <label>缓存目录</label>
+                  <div class="path-row">
+                    <input id="s-data-dir" type="text" placeholder="例如 D:\group-msg-cache" spellcheck="false" />
+                    <button id="btn-pick-data-dir" class="btn" type="button">浏览…</button>
+                  </div>
+                  <p class="field-hint" id="storage-default-hint">默认路径将在加载后显示</p>
+                </div>
+                <div class="setting-item">
+                  <label class="check">
+                    <input id="s-data-dir-migrate" type="checkbox" checked />
+                    应用时把旧目录中的记录/媒体复制到新目录（不覆盖已有文件）
+                  </label>
+                </div>
+                <div class="channel-actions">
+                  <button id="btn-apply-data-dir" class="btn primary" type="button">应用路径</button>
+                  <button id="btn-reset-data-dir" class="btn" type="button">恢复默认</button>
+                </div>
+              </div>
+
+              <div class="channel-card">
+                <div class="channel-card-head">
+                  <div>
+                    <h3 class="channel-title">打开本地位置</h3>
+                    <p class="channel-status">用资源管理器或系统默认浏览器打开缓存相关目录</p>
+                  </div>
+                </div>
+                <div class="channel-actions storage-open-actions">
+                  <button id="btn-open-data-dir" class="btn primary" type="button">打开数据目录</button>
+                  <button id="btn-open-media-dir" class="btn" type="button">打开媒体目录</button>
+                  <button id="btn-open-logs-dir" class="btn" type="button">打开日志目录</button>
+                  <button id="btn-open-db-dir" class="btn" type="button">定位数据库</button>
+                  <button id="btn-browse-data-dir" class="btn ghost" type="button">浏览器打开数据目录</button>
+                </div>
+                <p class="field-hint">「浏览器打开」使用系统默认浏览器访问 <code>file://</code> 本地目录。</p>
+                <div class="storage-path-grid" id="storage-path-grid"></div>
               </div>
             </div>
           </div>

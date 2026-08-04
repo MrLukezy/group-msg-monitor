@@ -80,6 +80,7 @@ type LlmProvider = {
 
 const WECHAT_CHANNEL_ENABLED = false;
 const TELEGRAM_CHANNEL_ENABLED = false;
+const GEWECHAT_CHANNEL_ENABLED = false;
 
 type ChannelBindQQ = {
   bound: boolean;
@@ -109,6 +110,19 @@ type ChannelBindTelegram = {
   botToken?: string;
   pollTimeout?: number;
 };
+type ChannelBindGewechat = {
+  bound: boolean;
+  label?: string;
+  lastError?: string;
+  baseUrl?: string;
+  token?: string;
+  appId?: string;
+  wxid?: string;
+  regionId?: string;
+  proxyIp?: string;
+  callbackHost?: string;
+  callbackPort?: number;
+};
 
 type AppSettings = {
   onebotWsUrl: string;
@@ -117,6 +131,7 @@ type AppSettings = {
     qq?: ChannelBindQQ;
     wechat?: ChannelBindWechat;
     telegram?: ChannelBindTelegram;
+    gewechat?: ChannelBindGewechat;
   };
   llm: {
     providers: LlmProvider[];
@@ -1469,6 +1484,7 @@ function switchTab(name: string) {
 function channelLabel(ch?: string) {
   const c = (ch || "qq").toLowerCase();
   if (c === "wechat" || c === "wx") return "微信";
+  if (c === "gewechat" || c === "gewe" || c === "gw") return "微信";
   if (c === "telegram" || c === "tg") return "TG";
   return "QQ";
 }
@@ -1476,6 +1492,8 @@ function channelLabel(ch?: string) {
 function guessChannel(groupId: string, explicit?: string) {
   if (explicit) return explicit;
   if (groupId.startsWith("wx:") || groupId.startsWith("wechat:")) return "wechat";
+  if (groupId.startsWith("gw:") || groupId.startsWith("gewechat:") || groupId.startsWith("gewe:"))
+    return "gewechat";
   if (groupId.startsWith("tg:") || groupId.startsWith("telegram:")) return "telegram";
   return "qq";
 }
@@ -1490,6 +1508,11 @@ function switchSettingsTab(name: string) {
   if (onebotEl) onebotEl.classList.toggle("hidden", true);
   $("stab-llm").classList.toggle("hidden", name !== "llm");
   $("stab-appearance").classList.toggle("hidden", name !== "appearance");
+  const storageEl = document.getElementById("stab-storage");
+  if (storageEl) storageEl.classList.toggle("hidden", name !== "storage");
+  if (name === "storage") {
+    refreshStoragePaths().catch((e) => toast(String(e), true));
+  }
 }
 
 function renderChannelBindings(settings?: AppSettings | null) {
@@ -1497,11 +1520,14 @@ function renderChannelBindings(settings?: AppSettings | null) {
   const qq = s?.channels?.qq;
   const wx = s?.channels?.wechat;
   const tg = s?.channels?.telegram;
+  const gw = s?.channels?.gewechat;
 
   const wxCard = document.querySelector<HTMLElement>('.channel-card[data-channel="wechat"]');
   if (wxCard) wxCard.hidden = !WECHAT_CHANNEL_ENABLED;
   const tgCard = document.querySelector<HTMLElement>('.channel-card[data-channel="telegram"]');
   if (tgCard) tgCard.hidden = !TELEGRAM_CHANNEL_ENABLED;
+  const gwCard = document.querySelector<HTMLElement>('.channel-card[data-channel="gewechat"]');
+  if (gwCard) gwCard.hidden = !GEWECHAT_CHANNEL_ENABLED;
 
   const setBadge = (id: string, bound: boolean) => {
     const el = document.getElementById(id);
@@ -1520,6 +1546,9 @@ function renderChannelBindings(settings?: AppSettings | null) {
     }
   }
   setBadge("ch-tg-badge", TELEGRAM_CHANNEL_ENABLED && !!tg?.bound);
+  if (GEWECHAT_CHANNEL_ENABLED) {
+    setBadge("ch-gw-badge", !!gw?.bound);
+  }
 
   const qqStatus = document.getElementById("ch-qq-status");
   if (qqStatus) {
@@ -1531,7 +1560,7 @@ function renderChannelBindings(settings?: AppSettings | null) {
   const wxStatus = document.getElementById("ch-wx-status");
   if (wxStatus) {
     if (!WECHAT_CHANNEL_ENABLED) {
-      wxStatus.textContent = "已屏蔽 · Windows ≥4.1.10 暂无稳定取 key 方案";
+      wxStatus.textContent = "已屏蔽 · 请使用 GeWeChat 扫码通道";
     } else if (!wx?.bound) {
       wxStatus.textContent = "未绑定 · 需本机 PC 微信保持登录";
     } else if (wx.lastError) {
@@ -1545,6 +1574,18 @@ function renderChannelBindings(settings?: AppSettings | null) {
     tgStatus.textContent = TELEGRAM_CHANNEL_ENABLED && tg?.bound
       ? `已绑定${tg.label ? ` · ${tg.label}` : ""} · 用户账号`
       : "暂不支持";
+  }
+  const gwStatus = document.getElementById("ch-gw-status");
+  if (gwStatus) {
+    if (!GEWECHAT_CHANNEL_ENABLED) {
+      gwStatus.textContent = "自建服务取码不稳定，绑定与监听已停用";
+    } else if (!gw?.bound) {
+      gwStatus.textContent = "未绑定 · 部署 GeWeChat 后扫码登录";
+    } else if (gw.lastError) {
+      gwStatus.textContent = `已绑定${gw.label ? ` · ${gw.label}` : ""} · ${gw.lastError}`;
+    } else {
+      gwStatus.textContent = `已绑定${gw.label ? ` · ${gw.label}` : ""} · 只收不发`;
+    }
   }
 }
 
@@ -2251,8 +2292,103 @@ function collectReportKnownUserNames(
   return normalizeKnownUserNames(names);
 }
 
-function reportProseHtml(text: string): string {
+/** 匹配文中标号：1) 2． 3. 4、 （1） (2) 等 */
+const PROSE_NUM_MARKER_RE =
+  /(?:^|(?<=[：:。；！？\n\s]))(?:(\d+)[)）．.、]|[（(](\d+)[）)])(?=\s*\S)/g;
+
+/** 列表末项后常见的新话题起句，用于把尾随段落拆出去 */
+const PROSE_LIST_TRAIL_RE =
+  /。(?=(?:实际|此外|另外|同时|总之|因此|不过|但是|技术|应用|综上|补充|需要注意|值得|参考))/;
+
+function paintProseSegment(text: string): string {
   return highlightUserNames(text, reportKnownUserNames).replace(/\n/g, "<br>");
+}
+
+/**
+ * 将「核心方案是：1) …。2) …。3) …」这类挤在一段里的标号内容
+ * 拆成导语 + 竖排列表 + 可选尾段，便于阅读。
+ */
+function structureNumberedProse(raw: string): string | null {
+  const text = raw.trim();
+  if (!text) return null;
+
+  const markers: { start: number; end: number; num: number }[] = [];
+  PROSE_NUM_MARKER_RE.lastIndex = 0;
+  let m: RegExpExecArray | null;
+  while ((m = PROSE_NUM_MARKER_RE.exec(text))) {
+    markers.push({
+      start: m.index,
+      end: m.index + m[0].length,
+      num: Number(m[1] || m[2]),
+    });
+  }
+  if (markers.length < 2) return null;
+
+  // 取最长连续递增标号序列（至少两项，如 1→2→3）
+  let bestStart = 0;
+  let bestLen = 1;
+  let runStart = 0;
+  for (let i = 1; i < markers.length; i++) {
+    if (markers[i].num === markers[i - 1].num + 1) {
+      const len = i - runStart + 1;
+      if (len > bestLen) {
+        bestLen = len;
+        bestStart = runStart;
+      }
+    } else {
+      runStart = i;
+    }
+  }
+  if (bestLen < 2) return null;
+
+  const list = markers.slice(bestStart, bestStart + bestLen);
+  const lead = text.slice(0, list[0].start).trim();
+  const items: string[] = [];
+  let trail = "";
+
+  for (let i = 0; i < list.length; i++) {
+    const from = list[i].end;
+    const to = i + 1 < list.length ? list[i + 1].start : text.length;
+    let body = text.slice(from, to).trim();
+    if (i === list.length - 1) {
+      const splitAt = body.search(PROSE_LIST_TRAIL_RE);
+      if (splitAt >= 0) {
+        trail = body.slice(splitAt + 1).trim();
+        body = body.slice(0, splitAt + 1).trim();
+      }
+    }
+    body = body.replace(/\s+$/u, "");
+    if (body) items.push(body);
+  }
+  if (items.length < 2) return null;
+
+  const leadHtml = lead
+    ? `<div class="report-prose-lead">${paintProseSegment(lead)}</div>`
+    : "";
+  const itemsHtml = items
+    .map(
+      (item, idx) =>
+        `<li class="report-prose-li" data-num="${list[idx].num}"><span class="report-prose-li-body">${paintProseSegment(
+          item,
+        )}</span></li>`,
+    )
+    .join("");
+  const trailHtml = trail
+    ? `<div class="report-prose-trail">${paintProseSegment(trail)}</div>`
+    : "";
+
+  return `${leadHtml}<ol class="report-prose-ol" start="${list[0].num}">${itemsHtml}</ol>${trailHtml}`;
+}
+
+function reportProseHtml(text: string): string {
+  return paintProseSegment(text);
+}
+
+/** 深入分析等长文：有标号时自动拆成竖排列表 */
+function reportDeepProseHtml(text: string): string {
+  const structured = structureNumberedProse(text);
+  if (structured) return structured;
+  return paintProseSegment(text);
 }
 
 function loadAnalysisFavorites(): AnalysisFavorite[] {
@@ -2485,7 +2621,7 @@ function renderDeepDiveBlock(dive: {
         <h5 class="report-block-subtitle">群内观点</h5>
         <div class="report-prose">${
           detail
-            ? reportProseHtml(detail)
+            ? reportDeepProseHtml(detail)
             : `<span class="report-empty-hint">（暂无群内观点分析）</span>`
         }</div>
         ${
@@ -2673,7 +2809,7 @@ function renderPointsSummary(report: ReportRow): string {
         ${p.summary ? `<p class="key-point-summary">${reportProseHtml(p.summary)}</p>` : ""}
         ${
           dive.detail
-            ? `<div class="report-prose muted"><span class="report-mini-label">群内观点</span>${reportProseHtml(
+            ? `<div class="report-prose muted"><span class="report-mini-label">群内观点</span>${reportDeepProseHtml(
                 dive.detail,
               )}</div>`
             : ""
@@ -4312,6 +4448,32 @@ async function persistSettingsSnapshot(): Promise<AppSettings> {
         botToken: "",
         pollTimeout: prev.telegram?.pollTimeout ?? 25,
       },
+      gewechat: {
+        bound: GEWECHAT_CHANNEL_ENABLED ? !!prev.gewechat?.bound : false,
+        label: GEWECHAT_CHANNEL_ENABLED ? prev.gewechat?.label || "" : "",
+        lastError: GEWECHAT_CHANNEL_ENABLED
+          ? prev.gewechat?.lastError || ""
+          : "微信 · GeWeChat 通道已暂时屏蔽",
+        baseUrl:
+          $<HTMLInputElement>("s-gw-base-url")?.value.trim() ||
+          prev.gewechat?.baseUrl ||
+          "http://127.0.0.1:2531/v2/api",
+        token: $<HTMLInputElement>("s-gw-token")?.value.trim() || prev.gewechat?.token || "",
+        appId: prev.gewechat?.appId || "",
+        wxid: prev.gewechat?.wxid || "",
+        regionId:
+          $<HTMLInputElement>("s-gw-region")?.value.trim() || prev.gewechat?.regionId || "440000",
+        proxyIp: prev.gewechat?.proxyIp || "",
+        callbackHost:
+          $<HTMLInputElement>("s-gw-callback-host")?.value.trim() ||
+          prev.gewechat?.callbackHost ||
+          "",
+        callbackPort: Number(
+          $<HTMLInputElement>("s-gw-callback-port")?.value ||
+            prev.gewechat?.callbackPort ||
+            9919,
+        ),
+      },
     },
     llm: {
       activeProviderId: globalProviderId,
@@ -4544,12 +4706,136 @@ async function loadSettingsView() {
   $<HTMLInputElement>("s-wx-keys").value = "";
   $<HTMLInputElement>("s-tg-api-id").value = String(settingsCache.channels?.telegram?.apiId || "");
   $<HTMLInputElement>("s-tg-api-hash").value = settingsCache.channels?.telegram?.apiHash || "";
+  const gwBase = document.getElementById("s-gw-base-url") as HTMLInputElement | null;
+  if (gwBase) {
+    gwBase.value =
+      settingsCache.channels?.gewechat?.baseUrl || "http://127.0.0.1:2531/v2/api";
+  }
+  const gwToken = document.getElementById("s-gw-token") as HTMLInputElement | null;
+  if (gwToken) gwToken.value = settingsCache.channels?.gewechat?.token || "";
+  const gwRegion = document.getElementById("s-gw-region") as HTMLInputElement | null;
+  if (gwRegion) gwRegion.value = settingsCache.channels?.gewechat?.regionId || "440000";
+  const gwHost = document.getElementById("s-gw-callback-host") as HTMLInputElement | null;
+  if (gwHost) gwHost.value = settingsCache.channels?.gewechat?.callbackHost || "";
+  const gwPort = document.getElementById("s-gw-callback-port") as HTMLInputElement | null;
+  if (gwPort) gwPort.value = String(settingsCache.channels?.gewechat?.callbackPort || 9919);
   applyThemeFromSettings(settingsCache);
   renderChannelBindings(settingsCache);
   syncReportKeepSlider(settingsCache.llm?.reportKeepLimit ?? 100);
   fillGlobalDefaultConfig();
   renderProviderList();
   switchSettingsTab("channels");
+  refreshStoragePaths().catch(() => {
+    /* 非当前页失败可忽略 */
+  });
+}
+
+type StoragePathsInfo = {
+  rootDir?: string;
+  dataDir?: string;
+  defaultDataDir?: string;
+  isDefault?: boolean;
+  overridePath?: string;
+  settingsPath?: string;
+  groupConfigsDir?: string;
+  mediaDir?: string;
+  messagesDb?: string;
+  logsDir?: string;
+  pointerPath?: string;
+};
+
+let storagePathsCache: StoragePathsInfo | null = null;
+
+function renderStoragePaths(info: StoragePathsInfo) {
+  storagePathsCache = info;
+  const input = document.getElementById("s-data-dir") as HTMLInputElement | null;
+  if (input && document.activeElement !== input) {
+    input.value = info.dataDir || "";
+  }
+  const status = document.getElementById("storage-path-status");
+  if (status) {
+    status.textContent = info.isDefault
+      ? "当前使用项目默认 data 目录"
+      : "当前使用自定义缓存目录（需重启后完全生效）";
+  }
+  const badge = document.getElementById("storage-path-badge");
+  if (badge) {
+    badge.textContent = info.isDefault ? "默认" : "自定义";
+    badge.classList.toggle("on", !info.isDefault);
+  }
+  const hint = document.getElementById("storage-default-hint");
+  if (hint) {
+    hint.textContent = `默认路径：${info.defaultDataDir || "-"}`;
+  }
+  const grid = document.getElementById("storage-path-grid");
+  if (grid) {
+    const rows: [string, string | undefined][] = [
+      ["数据目录", info.dataDir],
+      ["媒体目录", info.mediaDir],
+      ["消息数据库", info.messagesDb],
+      ["群配置", info.groupConfigsDir],
+      ["日志目录", info.logsDir],
+      ["设置文件", info.settingsPath],
+    ];
+    grid.innerHTML = rows
+      .map(
+        ([label, path]) => `
+      <div class="storage-path-item">
+        <strong>${escapeHtml(label)}</strong>
+        <code>${escapeHtml(path || "-")}</code>
+      </div>`,
+      )
+      .join("");
+  }
+}
+
+async function refreshStoragePaths(): Promise<StoragePathsInfo> {
+  const info = await invoke<StoragePathsInfo>("api_get_storage_paths");
+  renderStoragePaths(info);
+  return info;
+}
+
+async function openStorageLocation(kind: string, via: "explorer" | "browser" = "explorer") {
+  const res = await invoke<{ ok?: boolean; error?: string; path?: string }>(
+    "api_open_local_path",
+    { payload: { kind, via } },
+  );
+  if (res?.ok === false) throw new Error(res.error || "打开失败");
+  toast(via === "browser" ? `已用浏览器打开：${res.path || kind}` : `已打开：${res.path || kind}`);
+}
+
+async function pickAndFillDataDir() {
+  const res = await invoke<{ ok?: boolean; path?: string; error?: string }>(
+    "api_pick_directory",
+    { payload: { title: "选择本地记录缓存目录" } },
+  );
+  if (res?.ok === false) throw new Error(res.error || "选择目录失败");
+  if (!res.path) return;
+  const input = document.getElementById("s-data-dir") as HTMLInputElement | null;
+  if (input) input.value = res.path;
+}
+
+async function applyDataDir(reset = false) {
+  const migrateEl = document.getElementById("s-data-dir-migrate") as HTMLInputElement | null;
+  const migrate = !!migrateEl?.checked;
+  const path = ($<HTMLInputElement>("s-data-dir").value || "").trim();
+  const payload = reset
+    ? { reset: true, migrate }
+    : { path, migrate };
+  const res = await invoke<{
+    ok?: boolean;
+    error?: string;
+    message?: string;
+    data_dir?: string;
+    dataDir?: string;
+    migrated?: string[];
+  }>("api_set_data_dir", { payload });
+  if (res?.ok === false) throw new Error(res.error || "应用路径失败");
+  await refreshStoragePaths();
+  const migrated = res.migrated?.length || 0;
+  toast(
+    `${res.message || "缓存目录已更新"}${migrated ? `（已复制 ${migrated} 项）` : ""}`,
+  );
 }
 
 function startIndependentRefreshLoops() {
@@ -4942,6 +5228,31 @@ window.addEventListener("DOMContentLoaded", async () => {
     };
   });
 
+  document.getElementById("btn-pick-data-dir")?.addEventListener("click", () => {
+    pickAndFillDataDir().catch((e) => toast(String(e), true));
+  });
+  document.getElementById("btn-apply-data-dir")?.addEventListener("click", () => {
+    applyDataDir(false).catch((e) => toast(String(e), true));
+  });
+  document.getElementById("btn-reset-data-dir")?.addEventListener("click", () => {
+    applyDataDir(true).catch((e) => toast(String(e), true));
+  });
+  document.getElementById("btn-open-data-dir")?.addEventListener("click", () => {
+    openStorageLocation("data").catch((e) => toast(String(e), true));
+  });
+  document.getElementById("btn-open-media-dir")?.addEventListener("click", () => {
+    openStorageLocation("media").catch((e) => toast(String(e), true));
+  });
+  document.getElementById("btn-open-logs-dir")?.addEventListener("click", () => {
+    openStorageLocation("logs").catch((e) => toast(String(e), true));
+  });
+  document.getElementById("btn-open-db-dir")?.addEventListener("click", () => {
+    openStorageLocation("db").catch((e) => toast(String(e), true));
+  });
+  document.getElementById("btn-browse-data-dir")?.addEventListener("click", () => {
+    openStorageLocation("data", "browser").catch((e) => toast(String(e), true));
+  });
+
   document.querySelectorAll<HTMLButtonElement>(".pill[data-key]").forEach((pill) => {
     pill.onclick = () => repairStatus(pill.dataset.key || "").catch((e) => toast(String(e), true));
   });
@@ -5100,6 +5411,10 @@ window.addEventListener("DOMContentLoaded", async () => {
       if (TELEGRAM_CHANNEL_ENABLED && settingsCache?.channels?.telegram?.bound) {
         const res = await invoke<{ ok?: boolean; message?: string }>("api_pull_telegram_groups");
         parts.push(res.message || (res.ok ? "TG 群已拉取" : "TG 拉取失败"));
+      }
+      if (GEWECHAT_CHANNEL_ENABLED && settingsCache?.channels?.gewechat?.bound) {
+        const res = await invoke<{ ok?: boolean; message?: string }>("api_pull_gewechat_groups");
+        parts.push(res.message || (res.ok ? "微信群已拉取" : "微信拉取失败"));
       }
       toast(parts.filter(Boolean).join("；") || "请先在总配置绑定通道");
       await refreshGroups();
@@ -5558,6 +5873,195 @@ window.addEventListener("DOMContentLoaded", async () => {
       toast(String(e), true);
     }
   };
+
+  const gewePayload = () => ({
+    baseUrl: $<HTMLInputElement>("s-gw-base-url")?.value.trim() || "",
+    token: $<HTMLInputElement>("s-gw-token")?.value.trim() || "",
+    regionId: $<HTMLInputElement>("s-gw-region")?.value.trim() || "440000",
+    callbackHost: $<HTMLInputElement>("s-gw-callback-host")?.value.trim() || "",
+    callbackPort: Number($<HTMLInputElement>("s-gw-callback-port")?.value || 9919),
+  });
+
+  if (GEWECHAT_CHANNEL_ENABLED) {
+  $("btn-bind-gewechat").onclick = async () => {
+    try {
+      await persistSettingsFromForm();
+      const res = await invoke<{
+        ok?: boolean;
+        message?: string;
+        need_qr?: boolean;
+        channels?: AppSettings["channels"];
+      }>("api_bind_gewechat", { payload: gewePayload() });
+      if (res.channels && settingsCache) settingsCache.channels = res.channels;
+      renderChannelBindings(settingsCache);
+      showTestResult("gewechat-test-result", !!res.ok, res.message || "");
+      toast(res.message || "GeWeChat 已绑定", !res.ok);
+      if (res.ok) await refreshGroups();
+    } catch (e) {
+      toast(String(e), true);
+    }
+  };
+  $("btn-unbind-gewechat").onclick = async () => {
+    try {
+      const res = await invoke<{ ok?: boolean; message?: string; channels?: AppSettings["channels"] }>(
+        "api_unbind_channel",
+        { channel: "gewechat" },
+      );
+      if (res.channels && settingsCache) settingsCache.channels = res.channels;
+      renderChannelBindings(settingsCache);
+      toast(res.message || "已解绑 GeWeChat", !res.ok);
+    } catch (e) {
+      toast(String(e), true);
+    }
+  };
+  let gwQrTimer = 0;
+  const stopGwQrPoll = () => {
+    if (gwQrTimer) {
+      window.clearInterval(gwQrTimer);
+      gwQrTimer = 0;
+    }
+  };
+  const applyGwQrStatus = (st: {
+    status?: string;
+    message?: string;
+    qr_png_base64?: string;
+    verify_url?: string;
+    channels?: AppSettings["channels"];
+  }) => {
+    const box = $("gw-qr-box");
+    const img = $<HTMLImageElement>("gw-qr-img");
+    const hint = $("gw-qr-hint");
+    const verifyEl = $("gw-verify-url");
+    const status = st.status || "idle";
+    if (
+      status === "waiting_scan" ||
+      status === "starting" ||
+      status === "need_verify" ||
+      status === "authorized"
+    ) {
+      box.classList.remove("hidden");
+    }
+    if (st.qr_png_base64) {
+      img.src = `data:image/png;base64,${st.qr_png_base64}`;
+      img.hidden = false;
+    } else if (status === "starting") {
+      img.hidden = true;
+    }
+    hint.textContent = st.message || status;
+    if (st.verify_url) {
+      verifyEl.classList.remove("hidden");
+      verifyEl.textContent = `验证链接：${st.verify_url}`;
+    } else {
+      verifyEl.classList.add("hidden");
+      verifyEl.textContent = "";
+    }
+    if (st.channels && settingsCache) {
+      settingsCache.channels = st.channels;
+      const tokenEl = $<HTMLInputElement>("s-gw-token");
+      if (tokenEl && st.channels.gewechat?.token) tokenEl.value = st.channels.gewechat.token;
+    }
+    if (status === "authorized") {
+      showTestResult("gewechat-test-result", true, st.message || "扫码成功");
+      stopGwQrPoll();
+      invoke<{ ok?: boolean; message?: string; channels?: AppSettings["channels"] }>(
+        "api_bind_gewechat",
+        { payload: gewePayload() },
+      )
+        .then((res) => {
+          if (res.channels && settingsCache) settingsCache.channels = res.channels;
+          renderChannelBindings(settingsCache);
+          showTestResult(
+            "gewechat-test-result",
+            !!res.ok,
+            res.message || st.message || "已绑定",
+          );
+          toast(res.message || "GeWeChat 已绑定", !res.ok);
+          if (res.ok) refreshGroups().catch(() => undefined);
+        })
+        .catch((e) => toast(String(e), true));
+    } else if (status === "error") {
+      showTestResult("gewechat-test-result", false, st.message || "扫码失败");
+      stopGwQrPoll();
+    }
+  };
+  $("btn-gw-qr-start").onclick = async () => {
+    try {
+      await persistSettingsFromForm();
+      stopGwQrPoll();
+      $("gw-qr-box").classList.remove("hidden");
+      $("gw-qr-hint").textContent = "正在启动扫码…";
+      const res = await invoke<{ ok?: boolean; message?: string }>("api_gewechat_qr_start", {
+        payload: gewePayload(),
+      });
+      if (!res.ok) {
+        showTestResult("gewechat-test-result", false, res.message || "启动失败");
+        toast(res.message || "启动扫码失败", true);
+        return;
+      }
+      toast("请用手机微信扫码");
+      gwQrTimer = window.setInterval(() => {
+        invoke<{
+          status?: string;
+          message?: string;
+          qr_png_base64?: string;
+          verify_url?: string;
+          channels?: AppSettings["channels"];
+        }>("api_gewechat_qr_status")
+          .then(applyGwQrStatus)
+          .catch(() => undefined);
+      }, 1200);
+    } catch (e) {
+      toast(String(e), true);
+    }
+  };
+  $("btn-gw-qr-cancel").onclick = async () => {
+    try {
+      stopGwQrPoll();
+      await invoke("api_gewechat_qr_cancel");
+      $("gw-qr-hint").textContent = "已取消";
+      toast("已取消扫码");
+    } catch (e) {
+      toast(String(e), true);
+    }
+  };
+  $("btn-test-gewechat").onclick = async () => {
+    try {
+      await persistSettingsFromForm();
+      const res = await invoke<{
+        ok?: boolean;
+        message?: string;
+        latencyMs?: number;
+        callbackHint?: string;
+      }>("api_test_gewechat");
+      const latency = res.latencyMs != null ? `（${res.latencyMs} ms）` : "";
+      showTestResult(
+        "gewechat-test-result",
+        !!res.ok,
+        `${res.ok ? "在线" : "未在线"} ${latency}\n${res.message || ""}\n回调预估: ${res.callbackHint || ""}`,
+      );
+      toast(res.ok ? "GeWeChat 在线" : res.message || "未在线，请扫码", !res.ok);
+    } catch (e) {
+      toast(String(e), true);
+    }
+  };
+  $("btn-pull-gewechat-groups").onclick = async () => {
+    try {
+      const res = await invoke<{
+        ok?: boolean;
+        message?: string;
+        channels?: AppSettings["channels"];
+      }>("api_pull_gewechat_groups");
+      if (res.channels && settingsCache) settingsCache.channels = res.channels;
+      renderChannelBindings(settingsCache);
+      showTestResult("gewechat-test-result", !!res.ok, res.message || "");
+      toast(res.message || "已拉取", !res.ok);
+      if (res.ok) await refreshGroups();
+    } catch (e) {
+      toast(String(e), true);
+    }
+  };
+  }
+
   $("btn-back-groups").onclick = () => {
     $("group-detail").classList.add("hidden");
     $("groups-master").classList.remove("hidden");

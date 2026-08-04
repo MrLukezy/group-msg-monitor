@@ -1823,6 +1823,66 @@ input::placeholder, textarea::placeholder {
   color: var(--text-dim);
   font-size: 15px;
 }
+.report-prose-lead,
+.report-prose-trail {
+  margin: 0;
+  line-height: 1.8;
+}
+.report-prose-trail {
+  margin-top: 10px;
+  color: var(--text-dim);
+}
+.report-prose-ol {
+  margin: 10px 0 0;
+  padding: 0;
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.report-prose-li {
+  position: relative;
+  display: grid;
+  grid-template-columns: 1.75rem 1fr;
+  gap: 10px;
+  align-items: start;
+  margin: 0;
+  padding: 10px 12px;
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--bg) 55%, transparent);
+  border: 1px solid color-mix(in srgb, var(--border) 70%, transparent);
+}
+.report-prose-li::before {
+  content: attr(data-num);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 1.75rem;
+  height: 1.75rem;
+  border-radius: 8px;
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 0;
+  color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 14%, transparent);
+  border: 1px solid color-mix(in srgb, var(--accent) 28%, transparent);
+  flex-shrink: 0;
+}
+.report-prose-li-body {
+  min-width: 0;
+  line-height: 1.75;
+}
+.report-prose.muted .report-prose-li {
+  background: color-mix(in srgb, var(--bg-2) 40%, transparent);
+}
+.report-prose.muted .report-prose-trail {
+  color: inherit;
+  opacity: 0.92;
+}
+.report-prose:has(.report-prose-ol) > .report-mini-label {
+  display: block;
+  margin: 0 0 8px;
+}
 .report-evidence {
   margin: 0;
   padding: 12px 14px;
@@ -2353,6 +2413,42 @@ input::placeholder, textarea::placeholder {
   flex-wrap: wrap;
   gap: 8px;
   margin-top: 4px;
+}
+.path-row {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+.path-row input {
+  flex: 1;
+  min-width: 0;
+}
+.storage-open-actions {
+  margin-bottom: 8px;
+}
+.storage-path-grid {
+  display: grid;
+  gap: 8px;
+  margin-top: 12px;
+}
+.storage-path-item {
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--bg-1) 80%, transparent);
+}
+.storage-path-item strong {
+  display: block;
+  font-size: 12px;
+  color: var(--muted);
+  font-weight: 600;
+  margin-bottom: 4px;
+}
+.storage-path-item code {
+  display: block;
+  font-size: 12px;
+  word-break: break-all;
+  color: var(--text);
 }
 .channel-tag {
   display: inline-block;

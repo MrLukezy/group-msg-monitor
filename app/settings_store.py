@@ -9,9 +9,219 @@ from typing import Any
 from pydantic import BaseModel, Field, field_validator
 
 ROOT_DIR = Path(__file__).resolve().parent.parent
-DATA_DIR = ROOT_DIR / "data"
+# 自定义数据目录指针（固定在项目根，避免鸡生蛋问题）
+DATA_DIR_POINTER = ROOT_DIR / "data_dir.json"
+
+
+def default_data_dir() -> Path:
+    return (ROOT_DIR / "data").resolve()
+
+
+def _read_data_dir_override() -> Path | None:
+    if not DATA_DIR_POINTER.exists():
+        return None
+    try:
+        raw = json.loads(DATA_DIR_POINTER.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    if not isinstance(raw, dict):
+        return None
+    text = str(raw.get("data_dir") or "").strip()
+    if not text:
+        return None
+    path = Path(text)
+    if not path.is_absolute():
+        path = (ROOT_DIR / path).resolve()
+    else:
+        path = path.resolve()
+    return path
+
+
+def resolve_data_dir() -> Path:
+    return (_read_data_dir_override() or default_data_dir()).resolve()
+
+
+def apply_resolved_data_dir() -> Path:
+    """根据指针刷新模块级 DATA_DIR / SETTINGS_PATH / GROUP_DIR。"""
+    global DATA_DIR, SETTINGS_PATH, GROUP_DIR
+    DATA_DIR = resolve_data_dir()
+    SETTINGS_PATH = DATA_DIR / "app_settings.json"
+    GROUP_DIR = DATA_DIR / "group_configs"
+    return DATA_DIR
+
+
+DATA_DIR = default_data_dir()
 SETTINGS_PATH = DATA_DIR / "app_settings.json"
 GROUP_DIR = DATA_DIR / "group_configs"
+apply_resolved_data_dir()
+
+
+def describe_storage_paths() -> dict[str, Any]:
+    """返回当前本地记录/缓存相关绝对路径，供桌面配置页展示。"""
+    data = resolve_data_dir()
+    default = default_data_dir()
+    override = _read_data_dir_override()
+    logs = (ROOT_DIR / "logs").resolve()
+    return {
+        "root_dir": str(ROOT_DIR.resolve()),
+        "data_dir": str(data),
+        "default_data_dir": str(default),
+        "is_default": data == default,
+        "override_path": str(override) if override else "",
+        "settings_path": str((data / "app_settings.json").resolve()),
+        "group_configs_dir": str((data / "group_configs").resolve()),
+        "media_dir": str((data / "media").resolve()),
+        "messages_db": str((data / "messages.db").resolve()),
+        "logs_dir": str(logs),
+        "pointer_path": str(DATA_DIR_POINTER.resolve()),
+    }
+
+
+def _migrate_data_dir(src: Path, dst: Path) -> list[str]:
+    """把关键本地记录从旧目录复制到新目录（不覆盖已有文件）。"""
+    import shutil
+
+    copied: list[str] = []
+    if not src.exists() or src.resolve() == dst.resolve():
+        return copied
+    dst.mkdir(parents=True, exist_ok=True)
+    for name in (
+        "app_settings.json",
+        "groups_cache.json",
+        "messages.db",
+        "messages.db-wal",
+        "messages.db-shm",
+        "telegram_qr_state.json",
+        "wechat_keys.json",
+        "wechat_poll_state.json",
+    ):
+        s = src / name
+        d = dst / name
+        if s.is_file() and not d.exists():
+            shutil.copy2(s, d)
+            copied.append(name)
+    for dirname in ("group_configs", "media", "telegram_session", "wechat_decrypted"):
+        s = src / dirname
+        d = dst / dirname
+        if not s.is_dir():
+            continue
+        if not d.exists():
+            shutil.copytree(s, d)
+            copied.append(f"{dirname}/")
+        else:
+            for child in s.rglob("*"):
+                if not child.is_file():
+                    continue
+                rel = child.relative_to(s)
+                target = d / rel
+                if target.exists():
+                    continue
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(child, target)
+                copied.append(f"{dirname}/{rel.as_posix()}")
+    return copied
+
+
+def set_data_dir_override(
+    path: str | None,
+    *,
+    migrate: bool = False,
+) -> dict[str, Any]:
+    """
+    设置或清除本地记录缓存目录。
+    path 为空则恢复默认 data/；migrate=True 时尽量把旧目录关键文件复制到新目录。
+    生效需重启应用/监听服务。
+    """
+    old = resolve_data_dir()
+    text = (path or "").strip()
+    if not text:
+        if DATA_DIR_POINTER.exists():
+            DATA_DIR_POINTER.unlink()
+        new = default_data_dir()
+    else:
+        new = Path(text)
+        if not new.is_absolute():
+            new = (ROOT_DIR / new).resolve()
+        else:
+            new = new.resolve()
+        if new.exists() and not new.is_dir():
+            raise ValueError(f"目标路径不是目录：{new}")
+        new.mkdir(parents=True, exist_ok=True)
+        DATA_DIR_POINTER.write_text(
+            json.dumps({"data_dir": str(new)}, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+
+    migrated: list[str] = []
+    if migrate:
+        migrated = _migrate_data_dir(old, new)
+
+    apply_resolved_data_dir()
+    _ensure_dirs()
+    info = describe_storage_paths()
+    info.update(
+        {
+            "ok": True,
+            "old_data_dir": str(old),
+            "migrated": migrated,
+            "restart_required": True,
+            "message": "缓存目录已更新，请重启桌面端与监听服务后生效",
+        }
+    )
+    return info
+
+
+def open_local_path(path: str, *, via: str = "explorer") -> dict[str, Any]:
+    """用资源管理器或系统默认浏览器打开本地路径。"""
+    import os
+    import subprocess
+    import sys
+    import webbrowser
+
+    target = Path(path).expanduser()
+    if not target.is_absolute():
+        target = (ROOT_DIR / target).resolve()
+    else:
+        target = target.resolve()
+    if not target.exists():
+        target.mkdir(parents=True, exist_ok=True)
+
+    mode = (via or "explorer").strip().lower()
+    if mode in ("browser", "web", "webbrowser"):
+        webbrowser.open(target.as_uri())
+        return {"ok": True, "path": str(target), "via": "browser"}
+
+    if sys.platform == "win32":
+        # explorer 选中文件时用 /select,
+        if target.is_file():
+            subprocess.run(["explorer", f"/select,{target}"], check=False)
+        else:
+            os.startfile(str(target))  # type: ignore[attr-defined]
+    elif sys.platform == "darwin":
+        subprocess.run(["open", str(target)], check=False)
+    else:
+        subprocess.run(["xdg-open", str(target)], check=False)
+    return {"ok": True, "path": str(target), "via": "explorer"}
+
+
+def pick_directory(title: str = "选择本地记录缓存目录") -> dict[str, Any]:
+    """弹出系统目录选择框。"""
+    import tkinter as tk
+    from tkinter import filedialog
+
+    root = tk.Tk()
+    root.withdraw()
+    try:
+        root.attributes("-topmost", True)
+    except Exception:
+        pass
+    initial = str(resolve_data_dir())
+    path = filedialog.askdirectory(title=title, initialdir=initial, mustexist=False)
+    try:
+        root.destroy()
+    except Exception:
+        pass
+    return {"ok": True, "path": path or ""}
 
 
 class LlmProvider(BaseModel):
@@ -170,10 +380,27 @@ class TelegramChannelSettings(BaseModel):
     poll_timeout: int = 25
 
 
+class GewechatChannelSettings(BaseModel):
+    """GeWeChat iPad 协议：扫码登录 + 回调只读监听。"""
+
+    bound: bool = False
+    label: str = ""
+    last_error: str = ""
+    base_url: str = "http://127.0.0.1:2531/v2/api"
+    token: str = ""
+    app_id: str = ""
+    wxid: str = ""
+    region_id: str = "440000"
+    proxy_ip: str = ""
+    callback_host: str = ""
+    callback_port: int = 9919
+
+
 class ChannelsSettings(BaseModel):
     qq: QqChannelSettings = Field(default_factory=QqChannelSettings)
     wechat: WechatChannelSettings = Field(default_factory=WechatChannelSettings)
     telegram: TelegramChannelSettings = Field(default_factory=TelegramChannelSettings)
+    gewechat: GewechatChannelSettings = Field(default_factory=GewechatChannelSettings)
 
 
 class AppSettings(BaseModel):
@@ -248,7 +475,7 @@ def resolve_llm_timing(
 class GroupConfig(BaseModel):
     group_id: str
     group_name: str = ""
-    channel: str = "qq"  # qq | wechat | telegram
+    channel: str = "qq"  # qq | wechat | telegram | gewechat
     enabled: bool = False
     basic: GroupBasicConfig = Field(default_factory=GroupBasicConfig)
     keyword_monitor: KeywordMonitorConfig = Field(default_factory=KeywordMonitorConfig)
@@ -294,6 +521,8 @@ def default_app_settings() -> AppSettings:
 def _migrate_channel_defaults(settings: AppSettings) -> AppSettings:
     """兼容旧配置，并强制关闭当前未支持的通道。"""
     from app.channels.feature_flags import (
+        GEWECHAT_CHANNEL_ENABLED,
+        GEWECHAT_DISABLED_MESSAGE,
         TELEGRAM_CHANNEL_ENABLED,
         TELEGRAM_DISABLED_MESSAGE,
         WECHAT_CHANNEL_ENABLED,
@@ -327,6 +556,13 @@ def _migrate_channel_defaults(settings: AppSettings) -> AppSettings:
             tg.label = ""
             tg.last_error = TELEGRAM_DISABLED_MESSAGE
             changed = True
+    if not GEWECHAT_CHANNEL_ENABLED:
+        gw = settings.channels.gewechat
+        if gw.bound or gw.label or gw.last_error != GEWECHAT_DISABLED_MESSAGE:
+            gw.bound = False
+            gw.label = ""
+            gw.last_error = GEWECHAT_DISABLED_MESSAGE
+            changed = True
     if changed:
         save_app_settings(settings)
     return settings
@@ -359,6 +595,8 @@ def load_app_settings() -> AppSettings:
 
 def save_app_settings(settings: AppSettings) -> None:
     from app.channels.feature_flags import (
+        GEWECHAT_CHANNEL_ENABLED,
+        GEWECHAT_DISABLED_MESSAGE,
         TELEGRAM_CHANNEL_ENABLED,
         TELEGRAM_DISABLED_MESSAGE,
         WECHAT_CHANNEL_ENABLED,
@@ -375,6 +613,10 @@ def save_app_settings(settings: AppSettings) -> None:
         settings.channels.telegram.bound = False
         settings.channels.telegram.label = ""
         settings.channels.telegram.last_error = TELEGRAM_DISABLED_MESSAGE
+    if not GEWECHAT_CHANNEL_ENABLED:
+        settings.channels.gewechat.bound = False
+        settings.channels.gewechat.label = ""
+        settings.channels.gewechat.last_error = GEWECHAT_DISABLED_MESSAGE
     settings.llm.report_keep_limit = clamp_report_keep_limit(settings.llm.report_keep_limit)
     _ensure_dirs()
     SETTINGS_PATH.write_text(
@@ -390,7 +632,9 @@ def save_app_settings(settings: AppSettings) -> None:
 
 
 def group_config_path(group_id: str) -> Path:
-    return GROUP_DIR / f"{group_id}.json"
+    # Windows 文件名不能含 ':'；wx:/tg:/gw: 等前缀需转义
+    safe = str(group_id).replace(":", "__")
+    return GROUP_DIR / f"{safe}.json"
 
 
 def load_group_config(group_id: str) -> GroupConfig:

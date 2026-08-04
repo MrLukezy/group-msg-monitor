@@ -26,6 +26,30 @@ fn project_root() -> PathBuf {
     p
 }
 
+fn default_data_dir() -> PathBuf {
+    project_root().join("data")
+}
+
+fn data_dir() -> PathBuf {
+    let pointer = project_root().join("data_dir.json");
+    if let Ok(raw) = fs::read_to_string(&pointer) {
+        if let Ok(v) = serde_json::from_str::<Value>(&raw) {
+            if let Some(p) = v.get("data_dir").and_then(|x| x.as_str()) {
+                let text = p.trim();
+                if !text.is_empty() {
+                    let path = PathBuf::from(text);
+                    return if path.is_absolute() {
+                        path
+                    } else {
+                        project_root().join(path)
+                    };
+                }
+            }
+        }
+    }
+    default_data_dir()
+}
+
 fn current_github_repo() -> Result<String, String> {
     let output = Command::new("git")
         .args(["remote", "get-url", "origin"])
@@ -86,7 +110,7 @@ fn read_webui_port() -> u16 {
 }
 
 fn read_onebot_endpoint() -> (String, u16) {
-    let url = fs::read_to_string(project_root().join("data").join("app_settings.json"))
+    let url = fs::read_to_string(data_dir().join("app_settings.json"))
         .ok()
         .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
         .and_then(|v| {
@@ -247,11 +271,11 @@ fn py_api_json(args: &[&str]) -> Result<Value, String> {
 }
 
 fn monitor_lock_path() -> PathBuf {
-    project_root().join("data").join("monitor.lock")
+    data_dir().join("monitor.lock")
 }
 
 fn monitor_stop_path() -> PathBuf {
-    project_root().join("data").join("monitor.stop")
+    data_dir().join("monitor.stop")
 }
 
 fn pid_alive(pid: u32) -> bool {
@@ -351,7 +375,7 @@ struct StatusInfo {
 }
 
 fn qq_mode_from_settings() -> String {
-    fs::read_to_string(project_root().join("data").join("app_settings.json"))
+    fs::read_to_string(data_dir().join("app_settings.json"))
         .ok()
         .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
         .and_then(|v| {
@@ -366,7 +390,7 @@ fn qq_mode_from_settings() -> String {
 }
 
 fn qq_passive_meta_from_settings() -> (String, bool) {
-    let Some(qq) = fs::read_to_string(project_root().join("data").join("app_settings.json"))
+    let Some(qq) = fs::read_to_string(data_dir().join("app_settings.json"))
         .ok()
         .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
         .and_then(|v| v.get("channels")?.get("qq").cloned())
@@ -771,11 +795,11 @@ fn api_live_messages_since(group_id: String, after_id: i64, limit: i64) -> Resul
 }
 
 fn messages_db_path() -> PathBuf {
-    project_root().join("data").join("messages.db")
+    data_dir().join("messages.db")
 }
 
 fn blocked_group_ids_from_disk() -> std::collections::HashSet<String> {
-    let dir = project_root().join("data").join("group_configs");
+    let dir = data_dir().join("group_configs");
     let mut out = std::collections::HashSet::new();
     let entries = match fs::read_dir(&dir) {
         Ok(e) => e,
@@ -1077,6 +1101,43 @@ fn api_get_settings() -> Result<Value, String> {
     let v = py_api_json(&["get-settings"])?;
     // 转成前端 camelCase
     Ok(settings_to_camel(v))
+}
+
+#[tauri::command]
+fn api_get_storage_paths() -> Result<Value, String> {
+    let v = py_api_json(&["get-storage-paths"])?;
+    Ok(serde_json::json!({
+        "rootDir": v.get("root_dir").cloned().unwrap_or(Value::Null),
+        "dataDir": v.get("data_dir").cloned().unwrap_or(Value::Null),
+        "defaultDataDir": v.get("default_data_dir").cloned().unwrap_or(Value::Null),
+        "isDefault": v.get("is_default").cloned().unwrap_or(Value::Bool(true)),
+        "overridePath": v.get("override_path").cloned().unwrap_or(Value::String(String::new())),
+        "settingsPath": v.get("settings_path").cloned().unwrap_or(Value::Null),
+        "groupConfigsDir": v.get("group_configs_dir").cloned().unwrap_or(Value::Null),
+        "mediaDir": v.get("media_dir").cloned().unwrap_or(Value::Null),
+        "messagesDb": v.get("messages_db").cloned().unwrap_or(Value::Null),
+        "logsDir": v.get("logs_dir").cloned().unwrap_or(Value::Null),
+        "pointerPath": v.get("pointer_path").cloned().unwrap_or(Value::Null),
+    }))
+}
+
+#[tauri::command]
+fn api_set_data_dir(payload: Value) -> Result<Value, String> {
+    let raw = serde_json::to_string(&payload).map_err(|e| e.to_string())?;
+    py_api_json(&["set-data-dir", "--json", &raw])
+}
+
+#[tauri::command]
+fn api_open_local_path(payload: Value) -> Result<Value, String> {
+    let raw = serde_json::to_string(&payload).map_err(|e| e.to_string())?;
+    py_api_json(&["open-local-path", "--json", &raw])
+}
+
+#[tauri::command]
+fn api_pick_directory(payload: Option<Value>) -> Result<Value, String> {
+    let raw = serde_json::to_string(&payload.unwrap_or_else(|| serde_json::json!({})))
+        .map_err(|e| e.to_string())?;
+    py_api_json(&["pick-directory", "--json", &raw])
 }
 
 #[tauri::command]
@@ -1660,6 +1721,41 @@ fn api_pull_wechat_groups() -> Result<Value, String> {
     Ok(channels_result_to_camel(v))
 }
 
+#[tauri::command]
+fn api_bind_gewechat(payload: Value) -> Result<Value, String> {
+    let raw = payload.to_string();
+    let v = py_api_json(&["bind-gewechat", "--json", &raw])?;
+    Ok(channels_result_to_camel(v))
+}
+
+#[tauri::command]
+fn api_gewechat_qr_start(payload: Value) -> Result<Value, String> {
+    let raw = payload.to_string();
+    py_api_json(&["gewechat-qr-start", "--json", &raw])
+}
+
+#[tauri::command]
+fn api_gewechat_qr_status() -> Result<Value, String> {
+    let v = py_api_json(&["gewechat-qr-status"])?;
+    Ok(channels_result_to_camel(v))
+}
+
+#[tauri::command]
+fn api_gewechat_qr_cancel() -> Result<Value, String> {
+    py_api_json(&["gewechat-qr-cancel"])
+}
+
+#[tauri::command]
+fn api_test_gewechat() -> Result<Value, String> {
+    py_api_json(&["test-gewechat"])
+}
+
+#[tauri::command]
+fn api_pull_gewechat_groups() -> Result<Value, String> {
+    let v = py_api_json(&["pull-gewechat-groups"])?;
+    Ok(channels_result_to_camel(v))
+}
+
 fn channels_result_to_camel(v: Value) -> Value {
     let mut obj = v.as_object().cloned().unwrap_or_default();
     if let Some(ch) = obj.remove("channels") {
@@ -1790,9 +1886,9 @@ fn fetch_image_data_url(url: String) -> Result<FetchedImage, String> {
     };
 
     if let Some(rel) = local_rel {
-        let path = project_root().join("data").join(&rel);
+        let path = data_dir().join(&rel);
         // 防路径穿越：必须落在 data/media 下
-        let media_root = project_root().join("data").join("media");
+        let media_root = data_dir().join("media");
         let canon = path
             .canonicalize()
             .map_err(|e| format!("本地图片不存在: {rel} ({e})"))?;
@@ -1912,6 +2008,10 @@ pub fn run() {
             api_messages_in_window,
             api_get_settings,
             api_save_settings,
+            api_get_storage_paths,
+            api_set_data_dir,
+            api_open_local_path,
+            api_pick_directory,
             api_get_group,
             api_save_group,
             api_run_llm,
@@ -1943,13 +2043,19 @@ pub fn run() {
             api_wechat_import_keys,
             api_pull_telegram_groups,
             api_pull_wechat_groups,
+            api_bind_gewechat,
+            api_gewechat_qr_start,
+            api_gewechat_qr_status,
+            api_gewechat_qr_cancel,
+            api_test_gewechat,
+            api_pull_gewechat_groups,
             pull_onebot_groups,
             fetch_image_data_url
         ])
         .setup(|_| {
-            let _ = fs::create_dir_all(project_root().join("data"));
-            let _ = fs::create_dir_all(project_root().join("data").join("group_configs"));
-            let _ = fs::create_dir_all(project_root().join("data").join("media"));
+            let _ = fs::create_dir_all(data_dir());
+            let _ = fs::create_dir_all(data_dir().join("group_configs"));
+            let _ = fs::create_dir_all(data_dir().join("media"));
             let _ = fs::create_dir_all(project_root().join("logs"));
             Ok(())
         })
